@@ -1,0 +1,331 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 urtorrent contributors
+
+//! TCP and UDP over io_uring. Socket creation, `setsockopt`, `bind` and
+//! `listen` are one-time setup and use blocking libc calls (allowed off the
+//! ring, AGENTS.md 5.3); `connect`/`accept`/`send`/`recv`/`close` go through
+//! the ring. Separate v4 and v6 sockets, `IPV6_V6ONLY=1` (AGENTS.md 5.5).
+
+use std::io;
+use std::marker::PhantomData;
+use std::mem;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::RawFd;
+use std::rc::Rc;
+
+use crate::bufpool::Buffer;
+use crate::error::Result;
+use crate::reactor::{self, accept, close_fd_detached, connect, recv, send};
+
+/// A raw sockaddr with its length, kept alive across an async `connect`.
+pub(crate) struct RawSockAddr {
+    storage: libc::sockaddr_storage,
+    len: libc::socklen_t,
+}
+
+impl RawSockAddr {
+    fn from(addr: SocketAddr) -> RawSockAddr {
+        // SAFETY: zeroed sockaddr_storage is a valid all-zero POD; we then fill
+        // the family-specific prefix and report its exact length.
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let len = match addr {
+            SocketAddr::V4(v4) => {
+                // SAFETY: sockaddr_storage is large enough for sockaddr_in and
+                // correctly aligned; we write only the sockaddr_in prefix.
+                let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
+                sin.sin_family = libc::AF_INET as libc::sa_family_t;
+                sin.sin_port = v4.port().to_be();
+                sin.sin_addr = libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                };
+                mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+            }
+            SocketAddr::V6(v6) => {
+                // SAFETY: as above for sockaddr_in6.
+                let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
+                sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                sin6.sin6_port = v6.port().to_be();
+                sin6.sin6_addr = libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                };
+                sin6.sin6_scope_id = v6.scope_id();
+                mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+            }
+        };
+        RawSockAddr { storage, len }
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const libc::sockaddr {
+        &self.storage as *const _ as *const libc::sockaddr
+    }
+    pub(crate) fn len(&self) -> libc::socklen_t {
+        self.len
+    }
+}
+
+fn last_os_error() -> io::Error {
+    io::Error::last_os_error()
+}
+
+/// Create a non-blocking-agnostic TCP or UDP socket for `addr`'s family, with
+/// `SO_REUSEADDR`, and `IPV6_V6ONLY=1` for v6 (never use v4-mapped addresses).
+fn make_socket(addr: &SocketAddr, ty: libc::c_int) -> io::Result<RawFd> {
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: plain libc socket creation; the returned fd is checked.
+    let fd = unsafe { libc::socket(domain, ty | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(last_os_error());
+    }
+    let one: libc::c_int = 1;
+    // SAFETY: setsockopt with a valid fd and an int-sized option value.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const libc::c_void,
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if addr.is_ipv6() {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &one as *const _ as *const libc::c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    Ok(fd)
+}
+
+fn bind_socket(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
+    let raw = RawSockAddr::from(*addr);
+    // SAFETY: `raw` outlives the call; ptr/len describe a valid sockaddr.
+    let r = unsafe { libc::bind(fd, raw.as_ptr(), raw.len()) };
+    if r < 0 { Err(last_os_error()) } else { Ok(()) }
+}
+
+fn local_addr_of(fd: RawFd) -> io::Result<SocketAddr> {
+    // SAFETY: getsockname fills `storage` up to `len`; both are valid and sized.
+    let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let r =
+        unsafe { libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) };
+    if r < 0 {
+        return Err(last_os_error());
+    }
+    sockaddr_to_std(&storage).ok_or_else(|| io::Error::other("unknown address family"))
+}
+
+fn sockaddr_to_std(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            // SAFETY: family is AF_INET, so the storage holds a sockaddr_in.
+            let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            // `s_addr` is stored in network byte order; its bytes are the octets
+            // in order, so build the address from those bytes directly.
+            let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+            Some(SocketAddr::new(IpAddr::V4(ip), u16::from_be(sin.sin_port)))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: family is AF_INET6, so the storage holds a sockaddr_in6.
+            let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            Some(SocketAddr::new(
+                IpAddr::V6(ip),
+                u16::from_be(sin6.sin6_port),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// An owned socket fd that closes through the ring on drop.
+struct OwnedFd {
+    fd: RawFd,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl OwnedFd {
+    fn new(fd: RawFd) -> OwnedFd {
+        OwnedFd {
+            fd,
+            _not_send: PhantomData,
+        }
+    }
+    fn raw(&self) -> RawFd {
+        self.fd
+    }
+}
+
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        close_fd_detached(self.fd);
+    }
+}
+
+/// A TCP connection. All data transfer goes through io_uring.
+pub struct TcpStream {
+    fd: OwnedFd,
+}
+
+impl TcpStream {
+    /// Connect to `addr` over io_uring.
+    pub async fn connect(addr: SocketAddr) -> Result<TcpStream> {
+        let fd = make_socket(&addr, libc::SOCK_STREAM)?;
+        let owned = OwnedFd::new(fd);
+        connect(fd, RawSockAddr::from(addr)).await?;
+        Ok(TcpStream { fd: owned })
+    }
+
+    /// Connect, binding the local endpoint to `local` first (used to present a
+    /// specific source address in the dual-stack matrix).
+    pub async fn connect_from(local: IpAddr, addr: SocketAddr) -> Result<TcpStream> {
+        let fd = make_socket(&addr, libc::SOCK_STREAM)?;
+        let owned = OwnedFd::new(fd);
+        bind_socket(fd, &SocketAddr::new(local, 0))?;
+        connect(fd, RawSockAddr::from(addr)).await?;
+        Ok(TcpStream { fd: owned })
+    }
+
+    fn from_fd(fd: RawFd) -> TcpStream {
+        TcpStream {
+            fd: OwnedFd::new(fd),
+        }
+    }
+
+    /// The raw fd (for tests / diagnostics).
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.fd.raw()
+    }
+
+    /// Local address.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(local_addr_of(self.fd.raw())?)
+    }
+
+    /// Send `buf`. Returns the number of bytes accepted and the buffer back
+    /// (owned-buffer discipline). Fewer than `buf.len()` bytes may be sent.
+    pub async fn send(&self, buf: Buffer) -> (Result<u32>, Buffer) {
+        let (r, b) = send(self.fd.raw(), buf).await;
+        (r.map_err(Into::into), b)
+    }
+
+    /// Send all of `buf`, resubmitting on short writes.
+    pub async fn send_all(&self, buf: Buffer) -> Result<Buffer> {
+        let total = buf.len();
+        let mut sent = 0usize;
+        let mut data = buf.into_vec();
+        while sent < total {
+            let chunk = Buffer::from_vec(data[sent..].to_vec());
+            let (r, _b) = send(self.fd.raw(), chunk).await;
+            match r {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                Ok(n) => sent += n as usize,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        data.truncate(total);
+        Ok(Buffer::from_vec(data))
+    }
+
+    /// Receive into `buf` (sized to its length). Returns bytes read and the
+    /// buffer (truncated to that many bytes). `Ok(0)` means the peer closed.
+    pub async fn recv(&self, buf: Buffer) -> (Result<u32>, Buffer) {
+        let (r, b) = recv(self.fd.raw(), buf).await;
+        (r.map_err(Into::into), b)
+    }
+
+    /// Graceful close through the ring (awaits the CQE).
+    pub async fn close(self) -> Result<()> {
+        let fd = self.fd.raw();
+        mem::forget(self.fd); // avoid the detached close in Drop
+        reactor::close(fd).await.map_err(Into::into)
+    }
+}
+
+/// A TCP listener. `accept` goes through the ring.
+pub struct TcpListener {
+    fd: OwnedFd,
+    local: SocketAddr,
+}
+
+impl TcpListener {
+    /// Bind and listen on `addr` (v4 or v6; v6 is v6-only).
+    pub fn bind(addr: SocketAddr) -> Result<TcpListener> {
+        let fd = make_socket(&addr, libc::SOCK_STREAM)?;
+        let owned = OwnedFd::new(fd);
+        bind_socket(fd, &addr)?;
+        // SAFETY: valid listening fd; backlog is a small positive constant.
+        if unsafe { libc::listen(fd, 1024) } < 0 {
+            return Err(last_os_error().into());
+        }
+        let local = local_addr_of(fd)?;
+        Ok(TcpListener { fd: owned, local })
+    }
+
+    /// The bound local address (with the real port when 0 was requested).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// Accept one connection over the ring.
+    pub async fn accept(&self) -> Result<TcpStream> {
+        let fd = accept(self.fd.raw()).await?;
+        Ok(TcpStream::from_fd(fd))
+    }
+}
+
+/// A UDP socket. `recv`/`send` go through the ring (used for the UDP tracker
+/// and LSD; the listen port's UDP socket is owned here per AGENTS.md 4).
+pub struct UdpSocket {
+    fd: OwnedFd,
+    local: SocketAddr,
+}
+
+impl UdpSocket {
+    /// Bind a UDP socket to `addr`.
+    pub fn bind(addr: SocketAddr) -> Result<UdpSocket> {
+        let fd = make_socket(&addr, libc::SOCK_DGRAM)?;
+        let owned = OwnedFd::new(fd);
+        bind_socket(fd, &addr)?;
+        let local = local_addr_of(fd)?;
+        Ok(UdpSocket { fd: owned, local })
+    }
+
+    /// The bound local address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// Connect the socket so `send`/`recv` target one peer (simplest path;
+    /// `recvmsg`/`sendmsg` for unconnected multi-peer use land with the UDP
+    /// tracker in M5).
+    pub fn connect(&self, addr: SocketAddr) -> Result<()> {
+        let raw = RawSockAddr::from(addr);
+        // SAFETY: valid fd and sockaddr for the socket's family.
+        let r = unsafe { libc::connect(self.fd.raw(), raw.as_ptr(), raw.len()) };
+        if r < 0 {
+            Err(last_os_error().into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Send a datagram to the connected peer.
+    pub async fn send(&self, buf: Buffer) -> (Result<u32>, Buffer) {
+        let (r, b) = send(self.fd.raw(), buf).await;
+        (r.map_err(Into::into), b)
+    }
+
+    /// Receive one datagram from the connected peer.
+    pub async fn recv(&self, buf: Buffer) -> (Result<u32>, Buffer) {
+        let (r, b) = recv(self.fd.raw(), buf).await;
+        (r.map_err(Into::into), b)
+    }
+}

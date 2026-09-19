@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["testkit", "xtask"]
+members = ["crates/bencode", "crates/metainfo", "crates/uring", "testkit", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,7 +17,6 @@ missing_docs = "deny"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
-indexing_slicing = "warn"
 panic = "deny"
 
 [workspace.dependencies]

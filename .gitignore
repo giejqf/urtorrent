@@ -5,3 +5,4 @@
 !/fuzz/corpus/*/seed_*
 /testkit/runs/
 *.pcap
+/fuzz/target

@@ -1,0 +1,18 @@
+[package]
+name = "bencode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zero-copy bencode decoding and canonical encoding for urtorrent, preserving raw info-dict bytes"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

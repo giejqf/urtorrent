@@ -30,6 +30,7 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 deny = [
     # Reactors and runtimes that could quietly take over I/O.
     { crate = "mio", reason = "epoll reactor (AGENTS.md rule 4)" },

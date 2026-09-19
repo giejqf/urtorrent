@@ -51,6 +51,129 @@ fn root() -> PathBuf {
         .to_path_buf()
 }
 
+/// AGENTS.md 5.3 enforcement #4: run a data-path exercise under strace and fail
+/// if the library issues any epoll/kqueue-style reactor syscall, or any
+/// off-ring socket/file data syscall. Socket and torrent-file fds are tracked
+/// from `socket()`/`openat()` so that startup noise (ld.so, stdio) is ignored.
+fn syscalls() -> Result<()> {
+    if !have("strace") {
+        bail!("strace is required for `xtask syscalls` (apt install strace)");
+    }
+    // Build and locate the self-contained uring data-path probe.
+    run(
+        cargo().args(["build", "-q", "-p", "uring", "--bin", "syscall-probe"]),
+        "build syscall-probe",
+    )?;
+    let probe = root().join("target/debug/syscall-probe");
+    if !probe.exists() {
+        bail!("syscall-probe binary not found at {}", probe.display());
+    }
+    let trace = std::env::temp_dir().join(format!("urt-syscalls-{}.txt", std::process::id()));
+    let status = Command::new("strace")
+        .args(["-f", "-y", "-e", "trace=%net,%desc,epoll_create,epoll_create1,epoll_ctl,epoll_wait,epoll_pwait,poll,ppoll,select,pselect6,io_uring_enter,io_uring_setup,io_uring_register", "-o"])
+        .arg(&trace)
+        .arg(&probe)
+        .status()
+        .context("running strace")?;
+    if !status.success() {
+        bail!("syscall-probe failed under strace (exit {status})");
+    }
+    let text = std::fs::read_to_string(&trace).context("reading strace output")?;
+    let report = analyze_syscalls(&text);
+    let _ = std::fs::remove_file(&trace);
+
+    println!("io_uring_enter calls: {}", report.io_uring_enter);
+    if report.io_uring_enter == 0 {
+        bail!("no io_uring_enter observed: the data path did not use io_uring");
+    }
+    if report.violations.is_empty() {
+        println!(
+            "syscalls: OK — no epoll/poll/select or off-ring socket/file data syscalls on the data path"
+        );
+        Ok(())
+    } else {
+        for v in &report.violations {
+            println!("  VIOLATION {v}");
+        }
+        bail!(
+            "{} banned data-path syscall(s) detected (AGENTS.md rule 4)",
+            report.violations.len()
+        )
+    }
+}
+
+struct SyscallReport {
+    io_uring_enter: usize,
+    violations: Vec<String>,
+}
+
+/// Parse strace `-y` output (which annotates fds like `3<socket:[...]>` or
+/// `5</tmp/...>`). Flags: any epoll_*/select/pselect6 (global); any socket data
+/// op (recv*/send*/connect/accept*) — all of ours are on-ring; and any
+/// read/write/pread/pwrite/poll/ppoll whose fd is annotated as a socket or a
+/// file under a temp/data path (a torrent file), since those must go through
+/// the ring.
+fn analyze_syscalls(text: &str) -> SyscallReport {
+    // Reactor syscalls that must never appear at all.
+    const GLOBAL_BAN: &[&str] = &[
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_wait",
+        "epoll_pwait",
+        "select",
+        "pselect6",
+    ];
+    // Socket data / connection ops that are always on-ring for us.
+    const SOCKET_BAN: &[&str] = &[
+        "connect", "accept", "accept4", "recvfrom", "sendto", "recvmsg", "sendmsg", "recvmmsg",
+        "sendmmsg", "recv", "send",
+    ];
+    // Ambiguous ops: banned only when their fd is a socket or a torrent file.
+    const FD_SENSITIVE: &[&str] = &[
+        "read", "write", "pread64", "pwrite64", "readv", "writev", "poll", "ppoll",
+    ];
+
+    let mut io_uring_enter = 0usize;
+    let mut violations = Vec::new();
+    for line in text.lines() {
+        // Lines look like: "1234 syscall(args...) = ret" (with -f pid prefix).
+        let Some(rest) = line.split_once(' ').map(|x| x.1) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let name = rest.split(['(', ' ']).next().unwrap_or("");
+        if name == "io_uring_enter" {
+            io_uring_enter += 1;
+            continue;
+        }
+        if GLOBAL_BAN.contains(&name) {
+            violations.push(format!("{name}: {}", line.trim()));
+            continue;
+        }
+        if SOCKET_BAN.contains(&name) {
+            violations.push(format!("{name}: {}", line.trim()));
+            continue;
+        }
+        if FD_SENSITIVE.contains(&name) {
+            // With -y, the first arg's fd carries an annotation in <...>.
+            let args = rest.split_once('(').map(|x| x.1).unwrap_or("");
+            let first = args.split(',').next().unwrap_or("");
+            let is_socket =
+                first.contains("socket:") || first.contains("TCP:") || first.contains("UDP:");
+            let is_torrent_file = (first.contains("/tmp/") || first.contains("urt-"))
+                && !first.contains("urt-syscalls-");
+            if is_socket || is_torrent_file {
+                violations.push(format!("{name} on {}: {}", first.trim(), line.trim()));
+            }
+        }
+    }
+    SyscallReport {
+        io_uring_enter,
+        violations,
+    }
+}
+
 fn usage() -> ExitCode {
     eprintln!(
         "usage: cargo xtask <command>
@@ -79,7 +202,7 @@ fn main() -> ExitCode {
         "capture" => testkit(&["capture"], rest),
         "diff" => testkit(&["diff"], rest),
         "fuzz" => fuzz(rest),
-        "syscalls" => testkit(&["syscalls"], rest),
+        "syscalls" => syscalls(),
         _ => return usage(),
     };
     match r {
@@ -235,12 +358,18 @@ fn fuzz(args: &[String]) -> Result<()> {
     if !root().join("fuzz").exists() {
         bail!("no fuzz/ directory yet (arrives with the first parser crate)");
     }
+    // cargo-fuzz defaults to a musl target that lacks a prebuilt sanitizer
+    // runtime here; pin the gnu host triple.
+    let host = "x86_64-unknown-linux-gnu";
     let mut c = cargo();
-    c.current_dir(root().join("fuzz"));
     c.args([
         "+nightly",
         "fuzz",
         "run",
+        "--fuzz-dir",
+        "fuzz",
+        "--target",
+        host,
         target,
         "--",
         &format!("-max_total_time={secs}"),

@@ -1,0 +1,43 @@
+[package]
+name = "urtorrent-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bencode = { path = "../crates/bencode" }
+metainfo = { path = "../crates/metainfo" }
+
+[[bin]]
+name = "bencode_decode"
+path = "fuzz_targets/bencode_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bencode_roundtrip"
+path = "fuzz_targets/bencode_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metainfo_parse"
+path = "fuzz_targets/metainfo_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "magnet_parse"
+path = "fuzz_targets/magnet_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
