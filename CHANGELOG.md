@@ -24,4 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Enforcement: `compile_error!` off Linux, `cargo-deny` reactor/tokio bans,
     the `xtask check` tokio-feature audit, and `xtask syscalls` (strace) proving
     the data path is io_uring-only.
-  - `cargo-fuzz` targets for bencode, metainfo and magnet parsers.
+  - `storage`: bitfield, dedicated SHA-1 hashing pool, the piece
+    read/write/verify path over io_uring (multi-file spans, BEP 47 padding),
+    force-recheck, and crash-safe versioned resume data (tmp + fsync + rename +
+    dir fsync).
+  - `cargo-fuzz` targets for bencode, metainfo, magnet and resume-data parsers.

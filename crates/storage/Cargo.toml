@@ -1,0 +1,20 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Disk layout, preallocation, hashing pipeline and crash-safe resume data for urtorrent"
+
+[lints]
+workspace = true
+
+[dependencies]
+metainfo = { path = "../metainfo", version = "0.1.0" }
+uring = { path = "../uring", version = "0.1.0" }
+bencode = { path = "../bencode", version = "0.1.0" }
+sha1.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

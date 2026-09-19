@@ -14,7 +14,7 @@ oracle-vs-BEP disagreements in [docs/quirks.md](docs/quirks.md).
 | Milestone | State |
 |---|---|
 | M0 Harness | done: netns lab, pinned oracle, opentracker, tap-tracker, tap-peer, first golden captures |
-| M1 Foundations | done: `bencode`, `metainfo`, `uring` (reactor + probe + enforcement), fuzz targets |
+| M1 Foundations | done: `bencode`, `metainfo`, `uring` (reactor + probe + enforcement), `storage` (hashing + resume), fuzz targets |
 | M2 Leech | next |
 
 ## Developer commands
