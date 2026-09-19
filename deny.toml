@@ -1,0 +1,53 @@
+# cargo-deny configuration (AGENTS.md 5.3, enforcement #2).
+#
+# The library dependency graph must never contain an epoll/kqueue/IOCP reactor,
+# and tokio may only be present with `default-features = false, features = ["sync"]`.
+# `xtask check` complements this with a `cargo tree -e features` audit that
+# fails if any tokio runtime feature is enabled under a library crate.
+
+[graph]
+# Only the library crates are policed; testkit/xtask are dev tooling and may
+# use anything (they drive the library from a normal tokio runtime).
+exclude = ["testkit", "xtask"]
+all-features = false
+exclude-dev = true
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # Reactors and runtimes that could quietly take over I/O.
+    { crate = "mio", reason = "epoll reactor (AGENTS.md rule 4)" },
+    { crate = "polling", reason = "epoll/kqueue reactor (AGENTS.md rule 4)" },
+    { crate = "async-io", reason = "epoll/kqueue reactor (AGENTS.md rule 4)" },
+    { crate = "async-std", reason = "runtime with its own reactor (AGENTS.md rule 4)" },
+    { crate = "smol", reason = "runtime with its own reactor (AGENTS.md rule 4)" },
+    { crate = "calloop", reason = "epoll event loop (AGENTS.md rule 4)" },
+    { crate = "nix", reason = "not needed; keep the tree small" },
+    # TLS: rustls only (maintainer decision).
+    { crate = "openssl", reason = "TLS is pure Rust: rustls (AGENTS.md 5.3)" },
+    { crate = "openssl-sys", reason = "TLS is pure Rust: rustls (AGENTS.md 5.3)" },
+    { crate = "native-tls", reason = "TLS is pure Rust: rustls (AGENTS.md 5.3)" },
+    # Blanket error type is for tooling only.
+    { crate = "anyhow", reason = "libraries use thiserror enums (AGENTS.md 9)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

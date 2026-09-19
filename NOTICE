@@ -1,0 +1,11 @@
+urtorrent
+Copyright (c) 2026 urtorrent contributors
+
+This product is licensed under the Apache License, Version 2.0.
+
+Portions of this software are ported from libtorrent-rasterbar
+(https://github.com/arvidn/libtorrent), Copyright (c) Arvid Norberg and
+contributors, licensed under the BSD-3-Clause license. Files containing ported
+logic carry the original copyright notice; the list is maintained here:
+
+  (none yet)

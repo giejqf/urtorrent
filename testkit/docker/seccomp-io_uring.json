@@ -1,0 +1,41 @@
+{
+  "_comment": "Docker seccomp profile for containers running urtorrent: Docker's default profile blocks io_uring_setup/io_uring_enter/io_uring_register. Use with `--security-opt seccomp=testkit/docker/seccomp-io_uring.json`. Everything else follows the default 'allow the usual, block the dangerous' shape via a permissive default action scoped to the syscalls the library actually needs plus the container baseline.",
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "archMap": [
+    { "architecture": "SCMP_ARCH_X86_64", "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"] },
+    { "architecture": "SCMP_ARCH_AARCH64", "subArchitectures": ["SCMP_ARCH_ARM"] }
+  ],
+  "syscalls": [
+    {
+      "names": ["io_uring_setup", "io_uring_enter", "io_uring_register"],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": [
+        "accept", "accept4", "access", "arch_prctl", "bind", "brk", "capget", "capset", "chdir", "chmod", "chown",
+        "clock_getres", "clock_gettime", "clock_nanosleep", "clone", "clone3", "close", "close_range", "connect",
+        "copy_file_range", "dup", "dup2", "dup3", "epoll_create", "epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_wait",
+        "eventfd", "eventfd2", "execve", "execveat", "exit", "exit_group", "faccessat", "faccessat2", "fadvise64",
+        "fallocate", "fchdir", "fchmod", "fchmodat", "fchown", "fchownat", "fcntl", "fdatasync", "flock", "fork",
+        "fstat", "fstatfs", "fsync", "ftruncate", "futex", "futex_waitv", "getcwd", "getdents", "getdents64", "getegid",
+        "geteuid", "getgid", "getgroups", "getpeername", "getpgid", "getpgrp", "getpid", "getppid", "getpriority",
+        "getrandom", "getresgid", "getresuid", "getrlimit", "getrusage", "getsid", "getsockname", "getsockopt", "gettid",
+        "gettimeofday", "getuid", "ioctl", "kill", "link", "linkat", "listen", "lseek", "lstat", "madvise", "membarrier",
+        "memfd_create", "mkdir", "mkdirat", "mlock", "mlock2", "mmap", "mprotect", "mremap", "msync", "munlock", "munmap",
+        "nanosleep", "newfstatat", "open", "openat", "openat2", "pipe", "pipe2", "poll", "ppoll", "prctl", "pread64",
+        "preadv", "preadv2", "prlimit64", "pselect6", "pwrite64", "pwritev", "pwritev2", "read", "readlink", "readlinkat",
+        "readv", "recvfrom", "recvmmsg", "recvmsg", "rename", "renameat", "renameat2", "restart_syscall", "rmdir",
+        "rseq", "rt_sigaction", "rt_sigpending", "rt_sigprocmask", "rt_sigqueueinfo", "rt_sigreturn", "rt_sigsuspend",
+        "rt_sigtimedwait", "sched_getaffinity", "sched_setaffinity", "sched_yield", "select", "sendfile", "sendmmsg",
+        "sendmsg", "sendto", "set_robust_list", "set_tid_address", "setgid", "setgroups", "setitimer", "setpgid",
+        "setpriority", "setrlimit", "setsid", "setsockopt", "setuid", "shutdown", "sigaltstack", "socket", "socketpair",
+        "splice", "stat", "statfs", "statx", "symlink", "symlinkat", "sync", "sync_file_range", "syncfs", "sysinfo",
+        "tgkill", "time", "timer_create", "timer_delete", "timer_gettime", "timer_settime", "timerfd_create",
+        "timerfd_gettime", "timerfd_settime", "times", "tkill", "truncate", "umask", "uname", "unlink", "unlinkat",
+        "utimensat", "vfork", "wait4", "waitid", "write", "writev"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}

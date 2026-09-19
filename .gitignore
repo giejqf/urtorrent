@@ -1,0 +1,7 @@
+/target
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus/*/
+!/fuzz/corpus/*/seed_*
+/testkit/runs/
+*.pcap

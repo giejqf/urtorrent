@@ -1,0 +1,21 @@
+# The pinned oracle. Bumping anything here is a deliberate PR that regenerates
+# every golden capture under testkit/golden/.
+#
+# Source: https://github.com/userdocs/qbittorrent-nox-static (static musl builds)
+
+[oracle]
+qbittorrent = "5.2.3"
+
+[[oracle.binary]]
+libtorrent = "2.0.14"
+primary = true
+tag = "release-5.2.3_v2.0.14"
+url = "https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-5.2.3_v2.0.14/x86_64-qbittorrent-nox"
+sha256 = "c1839caf9b7dbddee09e9a4394bb5b17dc70ecd7c3a9b45e84331d5a1389a645"
+
+[[oracle.binary]]
+libtorrent = "1.2.20"
+primary = false
+tag = "release-5.2.3_v1.2.20"
+url = "https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-5.2.3_v1.2.20/x86_64-qbittorrent-nox"
+sha256 = "0d3b7f4879b2a8b0413c6e76a471eeccfc5895d318bc615d76a7a17346767d34"

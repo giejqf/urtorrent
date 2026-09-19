@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: xtask check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: |
+          set -euo pipefail
+          V=0.20.2
+          curl -sSL -o cd.tgz "https://github.com/EmbarkStudios/cargo-deny/releases/download/${V}/cargo-deny-${V}-x86_64-unknown-linux-musl.tar.gz"
+          tar xzf cd.tgz && install -m755 "cargo-deny-${V}-x86_64-unknown-linux-musl/cargo-deny" ~/.cargo/bin/
+      - run: cargo xtask check
+
+  semver:
+    name: semver-checks
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-semver-checks
+        run: |
+          set -euo pipefail
+          curl -sSL -o csc.tgz https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.50.0/cargo-semver-checks-x86_64-unknown-linux-musl.tar.gz
+          tar xzf csc.tgz && install -m755 cargo-semver-checks ~/.cargo/bin/
+      - name: Check the facade crate against the base branch
+        run: |
+          if [ -f crates/urtorrent/Cargo.toml ]; then
+            cargo semver-checks --package urtorrent --baseline-rev "${{ github.event.pull_request.base.sha }}" || true
+          else
+            echo "facade crate not published yet"
+          fi
+
+  integration:
+    name: xtask it (netns lab)
+    # Needs a real kernel with io_uring and passwordless sudo for `ip netns`;
+    # GitHub's ubuntu runners provide both.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Install lab tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q opentracker transmission-daemon transmission-cli tcpdump strace jq
+          sudo systemctl disable --now opentracker || true
+      - name: Cache oracle binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/urtorrent/oracle
+          key: oracle-${{ hashFiles('testkit/oracle.lock') }}
+      - run: cargo xtask doctor
+      - run: cargo xtask it
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testkit-runs
+          path: |
+            testkit/runs/**/*.jsonl
+            testkit/runs/**/*.log
+          retention-days: 7
