@@ -15,6 +15,7 @@ storage = { path = "../crates/storage" }
 wire = { path = "../crates/wire" }
 tracker = { path = "../crates/tracker" }
 profile = { path = "../crates/profile" }
+mse = { path = "../crates/mse" }
 
 [[bin]]
 name = "bencode_decode"
@@ -82,6 +83,27 @@ bench = false
 [[bin]]
 name = "http_response"
 path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mse_responder"
+path = "fuzz_targets/mse_responder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_reply"
+path = "fuzz_targets/udp_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scrape_response"
+path = "fuzz_targets/scrape_response.rs"
 test = false
 doc = false
 bench = false

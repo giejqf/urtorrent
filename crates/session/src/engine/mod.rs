@@ -61,6 +61,8 @@ pub struct EngineConfig {
     pub unchoke_slots: usize,
     /// Extra CA certificates (PEM bundles) trusted for HTTPS trackers.
     pub extra_roots: Vec<Vec<u8>>,
+    /// MSE policy.
+    pub encryption: crate::api::EncryptionMode,
 }
 
 impl Default for EngineConfig {
@@ -78,6 +80,7 @@ impl Default for EngineConfig {
             download_rate: 0,
             unchoke_slots: choker::DEFAULT_SLOTS,
             extra_roots: Vec::new(),
+            encryption: crate::api::EncryptionMode::Enabled,
         }
     }
 }
@@ -190,6 +193,25 @@ impl Ctx {
     /// A random 32-bit announce key.
     pub fn new_announce_key(&self) -> u32 {
         (self.rng.next_u64() >> 32) as u32
+    }
+
+    /// Every torrent we serve (for the MSE responder's stream-key lookup).
+    pub fn info_hashes(&self) -> Vec<InfoHash> {
+        self.by_hash.borrow().keys().copied().collect()
+    }
+
+    /// 20 random bytes for a DH exponent.
+    pub fn dh_private(&self) -> [u8; 20] {
+        let mut k = [0u8; 20];
+        if getrandom::fill(&mut k).is_err() {
+            // Fall back to the engine RNG rather than fail the connection;
+            // MSE is obfuscation, not a security boundary.
+            for chunk in k.chunks_mut(8) {
+                let v = self.rng.next_u64().to_le_bytes();
+                chunk.copy_from_slice(&v[..chunk.len()]);
+            }
+        }
+        k
     }
 
     /// The peer id for a new torrent: fresh per torrent or the session's,

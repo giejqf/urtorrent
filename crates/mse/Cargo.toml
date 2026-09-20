@@ -1,0 +1,27 @@
+[package]
+name = "mse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Sans-IO Message Stream Encryption (MSE/PE) handshake and RC4 stream for urtorrent"
+
+[lints]
+workspace = true
+
+[dependencies]
+metainfo = { path = "../metainfo", version = "0.1.0" }
+profile = { path = "../profile", version = "0.1.0" }
+sha1.workspace = true
+# Audited crypto primitives (AGENTS.md 9): RC4 from RustCrypto, the 768-bit
+# DH modpow from num-bigint (arbitrary precision, widely used; the exchange
+# is not secret-strength critical: MSE only obfuscates).
+rc4 = "0.1"
+num-bigint = { version = "0.4", default-features = false, features = ["std"] }
+num-traits = { version = "0.2", default-features = false }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -18,6 +18,19 @@ use tokio::sync::{mpsc, oneshot};
 use crate::Error;
 use crate::engine::{self, Command, EngineConfig};
 
+/// Message Stream Encryption policy (qBittorrent's "Allow" / "Require" /
+/// "Disable").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionMode {
+    /// Plaintext only; encrypted incoming connections are refused.
+    Disabled,
+    /// Accept both; connect out in plaintext first and retry with MSE when
+    /// that fails (libtorrent's behaviour, docs/quirks.md Q3).
+    Enabled,
+    /// RC4 required both ways.
+    Forced,
+}
+
 /// Identifies a torrent within a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TorrentId(pub u64);
@@ -195,6 +208,8 @@ pub struct PeerInfo {
     pub am_interested: bool,
     /// Outstanding requests to the peer.
     pub outstanding: usize,
+    /// The connection is RC4-encrypted (MSE).
+    pub encrypted: bool,
 }
 
 /// Session-wide counters.
@@ -397,6 +412,12 @@ impl SessionBuilder {
     /// Session-wide number of unchoke slots.
     pub fn unchoke_slots(mut self, n: usize) -> Self {
         self.cfg.unchoke_slots = n;
+        self
+    }
+
+    /// Encryption policy (default: `Enabled`, like the oracle's default).
+    pub fn encryption(mut self, mode: EncryptionMode) -> Self {
+        self.cfg.encryption = mode;
         self
     }
 

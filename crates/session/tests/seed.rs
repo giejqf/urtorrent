@@ -182,3 +182,88 @@ fn seed_to_second_engine_with_rate_limit_recheck_and_pause() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// MSE policies between two engines: forced <-> enabled negotiates RC4 after
+/// the plaintext attempt is refused (Q3 retry); forced <-> disabled never
+/// connects.
+#[test]
+fn encryption_modes() {
+    use session::EncryptionMode;
+    let dir = std::env::temp_dir().join(format!("urt-session-mse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let size = 512 * 1024 + 9;
+    let piece_len = 64 * 1024;
+    let (_, data) = make_torrent("mse.bin", size, piece_len, "http://placeholder/");
+
+    let mk = |mode: EncryptionMode| {
+        block_on(
+            Session::builder()
+                .listen_port(0)
+                .listen_v4(Some(Ipv4Addr::LOCALHOST))
+                .listen_v6(None)
+                .profile(profile::Profile::qbt_5_2_3_lt2_0_14())
+                .encryption(mode)
+                .build(),
+        )
+        .unwrap()
+    };
+    for (seed_mode, leech_mode, expect_ok) in [
+        (EncryptionMode::Forced, EncryptionMode::Enabled, true),
+        (EncryptionMode::Enabled, EncryptionMode::Forced, true),
+        (EncryptionMode::Forced, EncryptionMode::Forced, true),
+        (EncryptionMode::Disabled, EncryptionMode::Enabled, true),
+        (EncryptionMode::Forced, EncryptionMode::Disabled, false),
+        (EncryptionMode::Disabled, EncryptionMode::Forced, false),
+    ] {
+        let case = dir.join(format!("{seed_mode:?}-{leech_mode:?}"));
+        std::fs::create_dir_all(case.join("a")).unwrap();
+        std::fs::create_dir_all(case.join("b")).unwrap();
+        std::fs::write(case.join("a").join("mse.bin"), &data).unwrap();
+        let a = mk(seed_mode);
+        let a_addr: SocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), a.listen_port());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let announce = spawn_tracker(a_addr, log.clone());
+        let (torrent_bytes, _) = make_torrent("mse.bin", size, piece_len, &announce);
+        let a_id =
+            block_on(a.add_torrent(AddTorrent::metainfo(torrent_bytes.clone(), case.join("a"))))
+                .unwrap();
+        wait_state(&a, a_id, TorrentState::Seeding, 10);
+        let b = mk(leech_mode);
+        let b_id =
+            block_on(b.add_torrent(AddTorrent::metainfo(torrent_bytes, case.join("b")))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(if expect_ok { 30 } else { 6 });
+        let mut done = false;
+        while Instant::now() < deadline {
+            let st = block_on(b.status(b_id)).unwrap();
+            if st.complete {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            done, expect_ok,
+            "{seed_mode:?} seed vs {leech_mode:?} leech"
+        );
+        if expect_ok {
+            let peers = block_on(a.peers(a_id)).unwrap();
+            let sa = block_on(a.status(a_id)).unwrap();
+            assert_eq!(sa.uploaded, size as u64);
+            let rc4_expected = matches!(seed_mode, EncryptionMode::Forced)
+                || matches!(leech_mode, EncryptionMode::Forced);
+            // The seeder may already have dropped the peer (both seeds); if it
+            // is still there, its encryption flag must match.
+            for p in &peers {
+                assert_eq!(
+                    p.encrypted, rc4_expected,
+                    "{seed_mode:?}/{leech_mode:?}: {p:?}"
+                );
+            }
+            let on_disk = std::fs::read(case.join("b").join("mse.bin")).unwrap();
+            assert!(on_disk == data);
+        }
+        block_on(a.shutdown()).unwrap();
+        block_on(b.shutdown()).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -6,8 +6,10 @@
 //! fixture), a leecher (downloading and verifying), or stay silent after the
 //! handshake to observe what the other side does on its own.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+
+use super::cipher::CipherStream;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,9 +52,35 @@ pub enum Misbehaviour {
     ProtocolViolation,
 }
 
+/// MSE policy of the tap-peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TapEncryption {
+    /// Plaintext only; encrypted connections are recorded as `not_plaintext`.
+    Disabled,
+    /// Accept both; connect out in plaintext. `prefer_rc4` steers the select.
+    Allowed { prefer_rc4: bool },
+    /// Require RC4 both ways; connect out with an MSE handshake.
+    Forced,
+}
+
+/// What the tap saw of an MSE handshake.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MseView {
+    pub role: String,
+    pub method: String,
+    pub pad_after_key: Option<usize>,
+    pub pad_crypto: Option<usize>,
+    pub crypto_field: Option<u32>,
+    pub ia_len: Option<usize>,
+}
+
 /// Tap-peer configuration.
 #[derive(Clone)]
 pub struct TapPeerConfig {
+    pub encryption: TapEncryption,
+    /// Start outgoing connections with an MSE handshake even when not
+    /// forced (to observe the peer's `crypto_select` for `provide = both`).
+    pub initiate_mse: bool,
     pub listen: Vec<SocketAddr>,
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
@@ -90,6 +118,8 @@ impl TapPeerConfig {
         ext.insert("v", Value::str("tap-peer 0.1"));
         ext.insert("reqq", Value::Int(250));
         TapPeerConfig {
+            encryption: TapEncryption::Disabled,
+            initiate_mse: false,
             listen: Vec::new(),
             info_hash,
             peer_id,
@@ -136,6 +166,14 @@ impl TapPeerConfig {
     }
     pub fn ext_handshake(mut self, v: Option<Value>) -> Self {
         self.ext_handshake = v;
+        self
+    }
+    pub fn encryption(mut self, e: TapEncryption) -> Self {
+        self.encryption = e;
+        self
+    }
+    pub fn initiate_mse(mut self, on: bool) -> Self {
+        self.initiate_mse = on;
         self
     }
 }
@@ -206,6 +244,9 @@ pub struct PeerCapture {
     /// (an MSE attempt, or garbage).
     pub not_plaintext: bool,
     pub first_bytes_hex: String,
+    /// The MSE handshake, when one was completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mse: Option<MseView>,
     pub events: Vec<PeerEvent>,
     /// Pieces fully downloaded and verified (leecher role).
     pub pieces_ok: u32,
@@ -388,6 +429,7 @@ impl PeerCapture {
             our_handshake: None,
             not_plaintext: false,
             first_bytes_hex: String::new(),
+            mse: None,
             events: Vec::new(),
             pieces_ok: 0,
             pieces_bad: 0,
@@ -395,11 +437,24 @@ impl PeerCapture {
     }
 }
 
+/// A small PRNG for pads and DH exponents (the tap-peer is a test tool).
+struct TapRng(u64);
+
+impl profile::Rng for TapRng {
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) as u32
+    }
+}
+
 /// Per-connection state while the script runs.
 struct Conn<'a> {
     sh: &'a Shared,
     cap: PeerCapture,
-    stream: TcpStream,
+    stream: CipherStream,
     reader: FramedReader,
     their_hs: Option<Handshake>,
     their_ext: Option<Value>,
@@ -440,6 +495,7 @@ impl Shared {
             our_handshake: None,
             not_plaintext: false,
             first_bytes_hex: String::new(),
+            mse: None,
             events: Vec::new(),
             pieces_ok: 0,
             pieces_bad: 0,
@@ -447,7 +503,7 @@ impl Shared {
         let mut conn = Conn {
             sh: self,
             cap,
-            stream,
+            stream: CipherStream::plain(stream),
             reader: FramedReader::new(),
             their_hs: None,
             their_ext: None,
@@ -467,7 +523,7 @@ impl Shared {
         };
         conn.cap.close_reason = reason;
         conn.cap.closed_ms = Some(self.ms());
-        let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+        let _ = conn.stream.inner().shutdown(std::net::Shutdown::Both);
         if let Ok(mut c) = self.captures.lock() {
             c.push(conn.cap);
         }
@@ -538,15 +594,25 @@ impl Conn<'_> {
         if head.is_empty() {
             return Ok(false);
         }
+        if head.len() >= 20
+            && (head[0] != 19 || &head[1..20] != peerwire::PSTR)
+            && self.sh.config.encryption != TapEncryption::Disabled
+        {
+            // An MSE initiator: run the responder over the raw stream, then
+            // continue in plaintext terms on the ciphered stream.
+            let consumed = self.reader.take_pending();
+            return self.mse_respond(consumed);
+        }
         if head.len() < 20 || head[0] != 19 || &head[1..20] != peerwire::PSTR {
             // Not plaintext: read whatever arrives for a moment, then give up.
             let _ = self
                 .stream
+                .inner()
                 .set_read_timeout(Some(Duration::from_millis(800)));
             let mut extra = vec![0u8; 4096];
             let mut got = head.clone();
             loop {
-                match self.stream.read(&mut extra) {
+                match self.stream.read_raw(&mut extra) {
                     Ok(0) => break,
                     Ok(n) => {
                         got.extend_from_slice(&extra[..n]);
@@ -577,6 +643,170 @@ impl Conn<'_> {
         self.cap.events.push(PeerEvent { ts_ms: self.sh.ms(), dir: "recv".into(), kind: "handshake".into(), len: raw.len(), detail: serde_json::json!({ "reserved": reserved::describe(&hs.reserved), "peer_id": String::from_utf8_lossy(&hs.peer_id) }), raw_hex: Some(bencode::hex(&raw)) });
         self.their_hs = Some(hs);
         Ok(true)
+    }
+
+    fn rng(&self) -> TapRng {
+        TapRng(
+            (self.sh.ms().wrapping_mul(0x9E37_79B9) ^ u64::from(self.cap.id))
+                .wrapping_add(u64::from(std::process::id())),
+        )
+    }
+
+    fn private_key(&self) -> [u8; 20] {
+        let mut k = [0u8; 20];
+        let mut r = self.rng();
+        for chunk in k.chunks_mut(4) {
+            let v = profile::Rng::next_u32(&mut r).to_le_bytes();
+            chunk.copy_from_slice(&v[..chunk.len()]);
+        }
+        k
+    }
+
+    fn allowed(&self) -> (u32, bool) {
+        match self.sh.config.encryption {
+            TapEncryption::Disabled => (1, false),
+            TapEncryption::Allowed { prefer_rc4 } => (3, prefer_rc4),
+            TapEncryption::Forced => (2, true),
+        }
+    }
+
+    fn record_mse(&mut self, role: &str, o: &mse::Outcome) {
+        self.cap.mse = Some(MseView {
+            role: role.into(),
+            method: format!("{:?}", o.method).to_lowercase(),
+            pad_after_key: o.observed.pad_after_key,
+            pad_crypto: o.observed.pad_crypto,
+            crypto_field: o.observed.crypto_field,
+            ia_len: o.observed.ia_len,
+        });
+        self.cap.events.push(PeerEvent {
+            ts_ms: self.sh.ms(),
+            dir: "recv".into(),
+            kind: "mse".into(),
+            len: 0,
+            detail: serde_json::to_value(self.cap.mse.as_ref().unwrap()).unwrap_or_default(),
+            raw_hex: None,
+        });
+    }
+
+    /// Run the MSE responder; `initial` are raw bytes already read.
+    fn mse_respond(&mut self, initial: Vec<u8>) -> io::Result<bool> {
+        let (allowed, prefer_rc4) = self.allowed();
+        let mut resp = mse::Responder::new(self.private_key(), allowed, prefer_rc4);
+        let mut rng = self.rng();
+        let torrents = [self.sh.config.info_hash];
+        let mut pending = initial;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match resp.receive(&pending, &torrents, &mut rng) {
+                Ok(Some(outcome)) => {
+                    let out = resp.take_outbound();
+                    self.stream.write_raw(&out)?;
+                    self.record_mse("responder", &outcome);
+                    let mse::Outcome {
+                        encrypt,
+                        decrypt,
+                        plaintext,
+                        ..
+                    } = outcome;
+                    self.stream.install(encrypt, decrypt, plaintext);
+                    break;
+                }
+                Ok(None) => {
+                    let out = resp.take_outbound();
+                    if !out.is_empty() {
+                        self.stream.write_raw(&out)?;
+                    }
+                }
+                Err(e) => {
+                    self.cap.not_plaintext = true;
+                    self.cap.close_reason = format!("mse: {e}");
+                    return Ok(false);
+                }
+            }
+            let n = self.stream.read_raw(&mut buf)?;
+            if n == 0 {
+                return Ok(false);
+            }
+            pending = buf[..n].to_vec();
+        }
+        // Now read the peer's (decrypted) handshake normally.
+        let Some((hs, raw)) = self.reader.read_handshake(&mut self.stream)? else {
+            return Ok(false);
+        };
+        self.cap.first_bytes_hex = bencode::hex(&raw[..raw.len().min(68)]);
+        self.cap.handshake = Some(HandshakeView::from(&hs, &raw));
+        self.cap.events.push(PeerEvent {
+            ts_ms: self.sh.ms(),
+            dir: "recv".into(),
+            kind: "handshake".into(),
+            len: raw.len(),
+            detail: serde_json::json!({ "reserved": reserved::describe(&hs.reserved), "peer_id": String::from_utf8_lossy(&hs.peer_id), "encrypted": true }),
+            raw_hex: Some(bencode::hex(&raw)),
+        });
+        self.their_hs = Some(hs);
+        Ok(true)
+    }
+
+    /// Run the MSE initiator with our handshake as IA (forced mode, outgoing).
+    fn mse_initiate(&mut self) -> io::Result<bool> {
+        let cfg = &self.sh.config;
+        let hs = Handshake::new(cfg.info_hash, cfg.peer_id, cfg.reserved);
+        let raw = hs.encode();
+        self.cap.our_handshake = Some(HandshakeView::from(&hs, &raw));
+        let (allowed, _) = self.allowed();
+        let mut rng = self.rng();
+        let mut init = mse::Initiator::new(
+            cfg.info_hash,
+            self.private_key(),
+            raw.clone(),
+            allowed,
+            &mut rng,
+        );
+        self.stream.write_raw(&init.take_outbound())?;
+        self.cap.events.push(PeerEvent {
+            ts_ms: self.sh.ms(),
+            dir: "send".into(),
+            kind: "handshake".into(),
+            len: raw.len(),
+            detail: serde_json::json!({ "encrypted": true }),
+            raw_hex: Some(bencode::hex(&raw)),
+        });
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = self.stream.read_raw(&mut buf)?;
+            if n == 0 {
+                self.cap.close_reason = "closed during mse".into();
+                return Ok(false);
+            }
+            match init.receive(&buf[..n], &mut rng) {
+                Ok(Some(outcome)) => {
+                    let out = init.take_outbound();
+                    if !out.is_empty() {
+                        self.stream.write_raw(&out)?;
+                    }
+                    self.record_mse("initiator", &outcome);
+                    let mse::Outcome {
+                        encrypt,
+                        decrypt,
+                        plaintext,
+                        ..
+                    } = outcome;
+                    self.stream.install(encrypt, decrypt, plaintext);
+                    return Ok(true);
+                }
+                Ok(None) => {
+                    let out = init.take_outbound();
+                    if !out.is_empty() {
+                        self.stream.write_raw(&out)?;
+                    }
+                }
+                Err(e) => {
+                    self.cap.close_reason = format!("mse: {e}");
+                    return Ok(false);
+                }
+            }
+        }
     }
 
     fn both_ltep(&self) -> bool {
@@ -654,7 +884,13 @@ impl Conn<'_> {
     fn run(&mut self, initiator: bool) -> Result<String> {
         let cfg = self.sh.config.clone();
         if initiator {
-            self.send_handshake()?;
+            if cfg.encryption == TapEncryption::Forced || cfg.initiate_mse {
+                if !self.mse_initiate()? {
+                    return Ok(self.cap.close_reason.clone());
+                }
+            } else {
+                self.send_handshake()?;
+            }
             if !self.recv_handshake()? {
                 return Ok(if self.cap.not_plaintext {
                     "not plaintext".into()
@@ -718,6 +954,7 @@ impl Conn<'_> {
         let mut linger_until: Option<Instant> = None;
         let _ = self
             .stream
+            .inner()
             .set_read_timeout(Some(Duration::from_millis(250)));
         loop {
             if self.sh.stop.load(Ordering::Relaxed) {

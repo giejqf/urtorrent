@@ -24,6 +24,8 @@ pub struct ClientConfig {
     /// Bytes per second, 0 = unlimited.
     pub upload_limit: u64,
     pub download_limit: u64,
+    /// `disabled` / `enabled` / `forced`.
+    pub encryption: String,
     /// Extra environment (e.g. `RUST_LOG`).
     pub env: Vec<(String, String)>,
 }
@@ -38,6 +40,7 @@ impl Default for ClientConfig {
             exit_when_complete: false,
             upload_limit: 0,
             download_limit: 0,
+            encryption: "enabled".into(),
             env: vec![("RUST_LOG".into(), "debug".into())],
         }
     }
@@ -54,6 +57,10 @@ impl ClientConfig {
     }
     pub fn download_limit(mut self, bytes_per_sec: u64) -> Self {
         self.download_limit = bytes_per_sec;
+        self
+    }
+    pub fn encryption(mut self, mode: &str) -> Self {
+        self.encryption = mode.into();
         self
     }
     pub fn env(mut self, k: &str, v: &str) -> Self {
@@ -136,6 +143,8 @@ pub struct ClientPeer {
     pub is_seed: bool,
     #[serde(default)]
     pub peer_id: Option<String>,
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 /// A running client.
@@ -198,6 +207,7 @@ impl UrtClient {
         if config.exit_when_complete {
             cmd.arg("--exit-when-complete");
         }
+        cmd.arg("--encryption").arg(&config.encryption);
         if config.upload_limit > 0 {
             cmd.arg("--upload-limit")
                 .arg(config.upload_limit.to_string());

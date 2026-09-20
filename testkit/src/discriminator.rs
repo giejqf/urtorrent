@@ -87,12 +87,42 @@ pub struct UdpFingerprint {
     pub port_is_source: Option<bool>,
 }
 
+/// What a tap sees of a client's MSE handshake in one role (pads are
+/// random and only range-checked).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MseFingerprint {
+    /// `initiator` or `responder` (the tap's role, i.e. the client's inverse).
+    pub tap_role: String,
+    /// `crypto_provide` (client initiated) or `crypto_select` (client answered).
+    pub crypto_field: Option<u32>,
+    /// `len(IA)` the client announced (client initiated).
+    pub ia_len: Option<usize>,
+    /// Negotiated method.
+    pub method: String,
+    /// Both pads within 0..=512.
+    pub pads_in_range: bool,
+}
+
+/// Build an MSE fingerprint from a tap-peer capture.
+pub fn mse_fingerprint(c: &PeerCapture) -> Option<MseFingerprint> {
+    let m = c.mse.as_ref()?;
+    Some(MseFingerprint {
+        tap_role: m.role.clone(),
+        crypto_field: m.crypto_field,
+        ia_len: m.ia_len,
+        method: m.method.clone(),
+        pads_in_range: m.pad_after_key.is_none_or(|p| p <= 512)
+            && m.pad_crypto.is_none_or(|p| p <= 512),
+    })
+}
+
 /// A client's observable identity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fingerprint {
     pub tracker: Option<TrackerFingerprint>,
     pub peer: Option<PeerFingerprint>,
     pub udp: Option<UdpFingerprint>,
+    pub mse: Option<MseFingerprint>,
 }
 
 /// Build a UDP fingerprint from the datagrams sent by `ips`.
@@ -362,6 +392,34 @@ pub fn diff(a: &Fingerprint, b: &Fingerprint) -> Vec<String> {
         (None, None) => {}
         _ => out.push("udp observation missing on one side".into()),
     }
+    match (&a.mse, &b.mse) {
+        (Some(x), Some(y)) => {
+            if x.tap_role != y.tap_role {
+                out.push(format!(
+                    "mse: different roles observed ({} vs {})",
+                    x.tap_role, y.tap_role
+                ));
+            } else {
+                if x.crypto_field != y.crypto_field {
+                    out.push(format!(
+                        "L2 mse crypto field: {:?} vs {:?}",
+                        x.crypto_field, y.crypto_field
+                    ));
+                }
+                if x.ia_len != y.ia_len {
+                    out.push(format!("L2 mse len(IA): {:?} vs {:?}", x.ia_len, y.ia_len));
+                }
+                if x.method != y.method {
+                    out.push(format!("L2 mse method: {} vs {}", x.method, y.method));
+                }
+                if x.pads_in_range != y.pads_in_range {
+                    out.push("L2 mse pad range".into());
+                }
+            }
+        }
+        (None, None) => {}
+        _ => out.push("mse observation missing on one side".into()),
+    }
     match (&a.peer, &b.peer) {
         (Some(x), Some(y)) => {
             macro_rules! cmp {
@@ -500,12 +558,14 @@ mod tests {
             tracker: tracker_fingerprint(&[tr], &["10.0.0.11".parse().unwrap()]),
             peer: None,
             udp: None,
+            mse: None,
         };
         let d = diff(
             &Fingerprint {
                 tracker: oracle.tracker.clone(),
                 peer: None,
                 udp: None,
+                mse: None,
             },
             &fp,
         );
@@ -572,12 +632,14 @@ mod tests {
             tracker: tracker_fingerprint(&[ev], &["10.0.0.11".parse().unwrap()]),
             peer: None,
             udp: None,
+            mse: None,
         };
         let d = diff(
             &Fingerprint {
                 tracker: oracle.tracker.clone(),
                 peer: None,
                 udp: None,
+                mse: None,
             },
             &fp,
         );

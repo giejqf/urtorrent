@@ -18,6 +18,9 @@ profile = { path = "../profile", version = "0.1.0" }
 wire = { path = "../wire", version = "0.1.0" }
 tracker = { path = "../tracker", version = "0.1.0" }
 picker = { path = "../picker", version = "0.1.0" }
+mse = { path = "../mse", version = "0.1.0" }
+# DH exponents for MSE (the getrandom syscall; not on the io_uring data path).
+getrandom = "0.3"
 uring = { path = "../uring", version = "0.1.0" }
 storage = { path = "../storage", version = "0.1.0" }
 thiserror.workspace = true

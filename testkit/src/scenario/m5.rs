@@ -33,6 +33,18 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             run: capture_scrape,
         },
         ScenarioDef {
+            name: "capture_peer_forced",
+            shapes: &[Shape::V4],
+            tags: &[Tag::Capture],
+            run: capture_peer_forced,
+        },
+        ScenarioDef {
+            name: "capture_peer_allow_mse",
+            shapes: &[Shape::V4],
+            tags: &[Tag::Capture],
+            run: capture_peer_allow_mse,
+        },
+        ScenarioDef {
             name: "udp_tracker",
             shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It],
@@ -43,6 +55,18 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             shapes: &[Shape::V4],
             tags: &[Tag::It],
             run: http_scrape,
+        },
+        ScenarioDef {
+            name: "encryption_matrix",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It],
+            run: encryption_matrix,
+        },
+        ScenarioDef {
+            name: "mse_shape",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It, Tag::Diff],
+            run: mse_shape,
         },
     ]
 }
@@ -395,4 +419,289 @@ fn http_scrape(ctx: &mut Ctx) -> Result<()> {
     ));
     client.shutdown()?;
     Ok(())
+}
+
+/// Oracle in "force encryption" mode: its outgoing MSE handshake to a tap
+/// seeder (provide, pads, IA), and its responder side to a tap initiator
+/// (select, pads).
+fn capture_peer_forced(ctx: &mut Ctx) -> Result<()> {
+    super::m0::run_peer_capture(
+        ctx,
+        OracleConfig::primary().encryption(crate::oracle::Encryption::Force),
+        "forced",
+        crate::tap::peer::TapEncryption::Allowed { prefer_rc4: true },
+        true,
+    )
+}
+
+/// Oracle in "allow encryption" mode answering a tap initiator that offers
+/// both methods: reveals `prefer_rc4`.
+fn capture_peer_allow_mse(ctx: &mut Ctx) -> Result<()> {
+    super::m0::run_peer_capture(
+        ctx,
+        OracleConfig::primary().encryption(crate::oracle::Encryption::Prefer),
+        "allow-mse",
+        crate::tap::peer::TapEncryption::Allowed { prefer_rc4: false },
+        true,
+    )
+}
+
+/// Every encryption mode on each side against the oracle: forced-vs-disabled
+/// never connects, everything else transfers. Also checks that a "forced"
+/// pairing actually negotiated RC4.
+fn encryption_matrix(ctx: &mut Ctx) -> Result<()> {
+    use crate::oracle::Encryption;
+    let tracker = tap_tracker_http(ctx)?;
+    let mut results = Vec::new();
+    for (oracle_mode, ours, expect) in [
+        (Encryption::Disable, "disabled", true),
+        (Encryption::Disable, "enabled", true),
+        (Encryption::Disable, "forced", false),
+        (Encryption::Prefer, "disabled", true),
+        (Encryption::Prefer, "enabled", true),
+        (Encryption::Prefer, "forced", true),
+        (Encryption::Force, "disabled", false),
+        (Encryption::Force, "enabled", true),
+        (Encryption::Force, "forced", true),
+    ] {
+        let fx = Arc::new(Fixture::generate(
+            FixtureSpec::small(&format!("enc-{oracle_mode:?}-{ours}.bin"))
+                .with_size(512 << 10)
+                .with_piece_length(64 << 10)
+                .with_seed(0xE0 + oracle_mode as u64 * 4 + ours.len() as u64)
+                .with_tracker(&tracker.http_url(0)),
+        ));
+        let h = fx.info_hash_hex();
+        let name = format!(
+            "seeder-{}-{ours}",
+            format!("{oracle_mode:?}").to_lowercase()
+        );
+        let seeder = ctx.oracle(
+            &name,
+            OracleConfig::primary().encryption(oracle_mode).lsd(false),
+        )?;
+        fx.write_data(&seeder.save_path)?;
+        seeder.api.add_torrent(
+            &AddTorrent::file(&fx.torrent).save_path(&seeder.save_path.to_string_lossy()),
+            &h,
+        )?;
+        seeder
+            .api
+            .wait_for(&h, Duration::from_secs(60), "seeder checked", |t| {
+                t.is_seeding()
+            })?;
+        // Our first announce must already see the seeder (we re-announce
+        // only after the 5-minute clamp).
+        let hh = h.clone();
+        ensure!(
+            tracker.wait_for(Duration::from_secs(30), |ev| ev.iter().any(|e| {
+                e.kind == "announce"
+                    && e.http.as_ref().is_some_and(|hv| {
+                        hv.query.iter().any(|(k, v)| {
+                            k == "info_hash"
+                                && crate::bencode::hex(&crate::http::percent_decode(v.as_bytes()))
+                                    == hh
+                        })
+                    })
+            })),
+            "seeder never announced"
+        );
+        let torrent_path = ctx.file(&format!("enc-{name}.torrent"));
+        std::fs::write(&torrent_path, &fx.torrent)?;
+        let mut client = ctx.client(
+            &format!("urt-{}-{ours}", format!("{oracle_mode:?}").to_lowercase()),
+            crate::client::ClientConfig::default()
+                .profile("qbt")
+                .encryption(ours),
+            &torrent_path,
+        )?;
+        let deadline =
+            std::time::Instant::now() + Duration::from_secs(if expect { 60 } else { 12 });
+        let mut done = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(st) = client.status()
+                && st.complete
+            {
+                done = Some(st);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let ok = done.is_some();
+        results.push(format!(
+            "oracle {oracle_mode:?} / us {ours}: {}",
+            if ok { "transferred" } else { "no transfer" }
+        ));
+        ensure!(
+            ok == expect,
+            "oracle {oracle_mode:?} vs us {ours}: expected {expect}, got {ok}"
+        );
+        if let Some(st) = done {
+            fx.verify_data(&client.save_path)?
+                .map_err(|e| anyhow::anyhow!("data mismatch: {e}"))?;
+            let rc4 = matches!(oracle_mode, Encryption::Force) || ours == "forced";
+            let peer = st.peers_seen.iter().find(|p| {
+                p.client
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("qBittorrent"))
+            });
+            ensure!(
+                peer.is_some_and(|p| p.encrypted == rc4),
+                "oracle {oracle_mode:?} / us {ours}: encrypted flag {:?}, expected {rc4}",
+                peer.map(|p| p.encrypted)
+            );
+        }
+        client.shutdown()?;
+        drop(seeder);
+    }
+    for r in results {
+        ctx.note(r);
+    }
+    Ok(())
+}
+
+/// Our MSE handshake shape vs the oracle's (golden `capture_peer_forced`):
+/// as initiator (provide, len(IA)) and as responder (select for provide=3).
+fn mse_shape(ctx: &mut Ctx) -> Result<()> {
+    use crate::tap::peer::{Role, TapEncryption, TapPeer, TapPeerConfig};
+    let tracker = tap_tracker_http(ctx)?;
+    let seed_ip = ctx.host_alias(2)?;
+    let leech_ip = ctx.host_alias(3)?;
+    let seed_addr = SocketAddr::new(seed_ip, 6890);
+    // A: we (forced) leech from a tap seeder that allows both.
+    let fx_a = Arc::new(Fixture::generate(
+        FixtureSpec::small("mse-a.bin")
+            .with_size(512 << 10)
+            .with_piece_length(64 << 10)
+            .with_tracker(&tracker.http_url(0)),
+    ));
+    tracker.inject_peer(fx_a.info_hash, seed_addr, 0);
+    let tap_seed = TapPeer::start(
+        TapPeerConfig::new(fx_a.info_hash, Role::Seeder)
+            .listen(vec![seed_addr])
+            .fixture(fx_a.clone())
+            .encryption(TapEncryption::Allowed { prefer_rc4: true })
+            .linger(Duration::from_secs(30)),
+    )?;
+    let torrent_a = ctx.file("mse-a.torrent");
+    std::fs::write(&torrent_a, &fx_a.torrent)?;
+    let mut client = ctx.client(
+        "urt",
+        crate::client::ClientConfig::default()
+            .profile("qbt")
+            .encryption("forced"),
+        &torrent_a,
+    )?;
+    client.wait_for(
+        Duration::from_secs(60),
+        "forced download from tap seeder",
+        |s| s.complete,
+    )?;
+    ensure!(
+        tap_seed.wait_for(Duration::from_secs(10), |c| c
+            .iter()
+            .any(|c| c.mse.is_some())),
+        "tap seeder recorded no mse handshake"
+    );
+    let ours_init = tap_seed
+        .captures()
+        .into_iter()
+        .find(|c| c.mse.is_some())
+        .unwrap();
+    ctx.note(format!(
+        "our initiator as seen by the tap: {:?}",
+        ours_init.mse
+    ));
+    // The oracle's initiator view from the golden capture.
+    let golden = crate::scenario::golden_file(
+        "capture_peer_forced",
+        crate::lab::Shape::V4,
+        "tap-peer-forced-oracle-initiator.jsonl",
+    );
+    if let Some(p) = golden {
+        let caps: Vec<crate::tap::peer::PeerCapture> = std::fs::read_to_string(p)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        let oracle = caps.iter().find(|c| c.mse.is_some()).unwrap();
+        let d = crate::discriminator::diff(
+            &Fingerprint {
+                mse: crate::discriminator::mse_fingerprint(oracle),
+                ..Default::default()
+            },
+            &Fingerprint {
+                mse: crate::discriminator::mse_fingerprint(&ours_init),
+                ..Default::default()
+            },
+        );
+        ctx.note(format!("mse initiator tells: {d:?}"));
+        ensure!(d.is_empty(), "mse initiator tells: {d:?}");
+    } else {
+        ctx.note("no golden capture_peer_forced; initiator comparison skipped");
+    }
+    client.shutdown()?;
+    // B: a tap initiator offering both connects to us (enabled) seeding:
+    // our select must be RC4 (prefer_rc4), as the oracle's was.
+    let fx_b = Arc::new(Fixture::generate(
+        FixtureSpec::small("mse-b.bin")
+            .with_size(256 << 10)
+            .with_piece_length(64 << 10)
+            .with_seed(11)
+            .with_tracker(&tracker.http_url(0)),
+    ));
+    let torrent_b = ctx.file("mse-b.torrent");
+    std::fs::write(&torrent_b, &fx_b.torrent)?;
+    let actor = ctx.actor("urt-seed")?;
+    fx_b.write_data(&actor.log_dir.join("data"))?;
+    let mut seeder = crate::client::UrtClient::launch(
+        &actor,
+        crate::client::ClientConfig::default()
+            .profile("qbt")
+            .encryption("enabled"),
+        &torrent_b,
+    )?;
+    seeder.wait_for(Duration::from_secs(60), "seeding", |s| s.complete)?;
+    let tap_leech = TapPeer::start(
+        TapPeerConfig::new(fx_b.info_hash, Role::Leecher)
+            .fixture(fx_b.clone())
+            .encryption(TapEncryption::Allowed { prefer_rc4: false })
+            .initiate_mse(true)
+            .linger(Duration::from_secs(3))
+            .bind_addr(leech_ip),
+    )?;
+    let cap = tap_leech.connect(SocketAddr::new(actor.addr(), 6881))?;
+    ctx.note(format!(
+        "our responder as seen by the tap: {:?} pieces_ok={}",
+        cap.mse, cap.pieces_ok
+    ));
+    let m = cap
+        .mse
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no mse handshake with our seeder: {}", cap.close_reason))?;
+    ensure!(
+        m.crypto_field == Some(2),
+        "we selected {:?}, the oracle selects RC4 for provide=3",
+        m.crypto_field
+    );
+    ensure!(
+        cap.pieces_ok as usize == fx_b.piece_count(),
+        "leeched {} pieces over rc4",
+        cap.pieces_ok
+    );
+    seeder.shutdown()?;
+    Ok(())
+}
+
+fn tap_tracker_http(ctx: &Ctx) -> Result<TapTracker> {
+    let http: Vec<SocketAddr> = ctx
+        .host_addrs()
+        .into_iter()
+        .map(|a| SocketAddr::new(a, 7070))
+        .collect();
+    TapTracker::start(TapTrackerConfig {
+        http,
+        interval: 30,
+        ..Default::default()
+    })
 }

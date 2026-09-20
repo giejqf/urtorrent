@@ -295,7 +295,7 @@ fn diff_identity(ctx: &mut Ctx) -> Result<()> {
         Fingerprint {
             tracker: discriminator::tracker_fingerprint(events, ips),
             peer,
-            udp: None,
+            ..Default::default()
         }
     };
 

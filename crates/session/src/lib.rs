@@ -25,8 +25,8 @@ mod api;
 mod engine;
 
 pub use api::{
-    AddTorrent, Event, EventStream, PeerInfo, Session, SessionBuilder, SessionStats, TorrentId,
-    TorrentSource, TorrentState, TorrentStatus, TrackerStatus,
+    AddTorrent, EncryptionMode, Event, EventStream, PeerInfo, Session, SessionBuilder,
+    SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus, TrackerStatus,
 };
 pub use profile::Profile;
 

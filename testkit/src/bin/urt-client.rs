@@ -37,6 +37,7 @@ struct Args {
     sequential: bool,
     upload_limit: u64,
     download_limit: u64,
+    encryption: String,
 }
 
 fn parse_args() -> Result<Args> {
@@ -56,6 +57,7 @@ fn parse_args() -> Result<Args> {
         sequential: false,
         upload_limit: 0,
         download_limit: 0,
+        encryption: "enabled".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -76,6 +78,7 @@ fn parse_args() -> Result<Args> {
             "--sequential" => a.sequential = true,
             "--upload-limit" => a.upload_limit = val()?.parse()?,
             "--download-limit" => a.download_limit = val()?.parse()?,
+            "--encryption" => a.encryption = val()?,
             other => bail!("unknown argument {other}"),
         }
     }
@@ -92,6 +95,7 @@ fn peer_json(p: &urtorrent::PeerInfo) -> serde_json::Value {
         "addr": p.addr.to_string(), "client": p.client, "incoming": p.incoming,
         "downloaded": p.downloaded, "uploaded": p.uploaded, "is_seed": p.is_seed,
         "peer_id": p.peer_id.map(|id| String::from_utf8_lossy(&id).into_owned()),
+        "encrypted": p.encrypted,
     })
 }
 
@@ -108,9 +112,16 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     let profile = Profile::by_name(&args.profile)
         .with_context(|| format!("unknown profile {}", args.profile))?;
+    let encryption = match args.encryption.as_str() {
+        "disabled" => urtorrent::EncryptionMode::Disabled,
+        "enabled" => urtorrent::EncryptionMode::Enabled,
+        "forced" => urtorrent::EncryptionMode::Forced,
+        other => bail!("unknown encryption mode {other}"),
+    };
     let mut builder = Session::builder()
         .listen_port(args.listen_port)
         .profile(profile)
+        .encryption(encryption)
         .upload_limit(args.upload_limit)
         .download_limit(args.download_limit);
     if args.no_v4 {
@@ -184,6 +195,7 @@ async fn main() -> Result<()> {
                     "last_error": t.last_error, "seeders": t.seeders, "leechers": t.leechers,
                 })).collect::<Vec<_>>(),
                 "peer_list": peers.iter().map(peer_json).collect::<Vec<_>>(),
+                "encryption": args.encryption,
                 "peers_seen": peers_seen.values().cloned().collect::<Vec<_>>(),
                 "events": event_log,
             });

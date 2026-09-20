@@ -23,7 +23,7 @@ use super::Ctx;
 use super::local::{Either, Flag, Notify, select2};
 use super::rate::Limiter;
 use super::torrent::{self, INACTIVITY_TIMEOUT, KEEPALIVE_AFTER, REQUEST_TIMEOUT, Torrent};
-use crate::api::{Event, PeerInfo};
+use crate::api::{EncryptionMode, Event, PeerInfo};
 
 /// Time allowed for an incoming peer to send its handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -59,6 +59,17 @@ pub struct PeerHandle {
     drained: Rc<Notify>,
     /// When we last unchoked this peer (choker rotation).
     pub last_unchoke: Cell<Option<Instant>>,
+    /// MSE RC4 streams, when negotiated.
+    cipher: RefCell<Cipher>,
+    /// Negotiated encryption, for `PeerInfo`.
+    pub encrypted: Cell<bool>,
+}
+
+/// The RC4 layer between the socket and `wire` (absent for plaintext).
+#[derive(Default)]
+pub struct Cipher {
+    pub enc: Option<mse::Rc4Stream>,
+    pub dec: Option<mse::Rc4Stream>,
 }
 
 /// Outbound bytes queued beyond which the uploader waits for the writer.
@@ -97,6 +108,8 @@ impl PeerHandle {
             upload_notify: Notify::new(),
             drained: Notify::new(),
             last_unchoke: Cell::new(None),
+            cipher: RefCell::new(Cipher::default()),
+            encrypted: Cell::new(false),
         }
     }
 
@@ -159,6 +172,7 @@ impl PeerHandle {
             peer_choking: conn.peer_choking(),
             am_interested: conn.am_interested(),
             outstanding: conn.outstanding().len(),
+            encrypted: self.encrypted.get(),
         }
     }
 
@@ -304,14 +318,77 @@ fn connection_params(
     }
 }
 
+/// MSE `allowed` mask for the session's policy.
+fn allowed_mask(ctx: &Ctx) -> u32 {
+    match ctx.cfg.encryption {
+        EncryptionMode::Disabled => 0,
+        EncryptionMode::Enabled => mse::allowed_mask(true, true),
+        EncryptionMode::Forced => mse::allowed_mask(false, true),
+    }
+}
+
+/// Run the MSE initiator over a fresh socket. `ia` is our BitTorrent
+/// handshake (sent inside the crypto handshake). Returns the cipher and any
+/// plaintext that followed pe4.
+async fn mse_initiate(
+    ctx: &Rc<Ctx>,
+    stream: &TcpStream,
+    info_hash: metainfo::InfoHash,
+    ia: Vec<u8>,
+) -> Result<(Cipher, Vec<u8>), String> {
+    let mut rng = super::rng::RngRef(&ctx.rng);
+    let mut init =
+        mse::Initiator::new(info_hash, ctx.dh_private(), ia, allowed_mask(ctx), &mut rng);
+    stream
+        .send_all(Buffer::from_vec(init.take_outbound()))
+        .await
+        .map_err(|e| format!("send: {e}"))?;
+    loop {
+        let (r, buf) = stream.recv(Buffer::from_vec(vec![0u8; 4096])).await;
+        match r {
+            Ok(0) => return Err("closed during mse handshake".into()),
+            Err(e) => return Err(format!("recv: {e}")),
+            Ok(_) => {}
+        }
+        match init.receive(buf.as_slice(), &mut rng) {
+            Ok(Some(outcome)) => {
+                let out = init.take_outbound();
+                if !out.is_empty() {
+                    stream
+                        .send_all(Buffer::from_vec(out))
+                        .await
+                        .map_err(|e| format!("send: {e}"))?;
+                }
+                return Ok((
+                    Cipher {
+                        enc: outcome.encrypt,
+                        dec: outcome.decrypt,
+                    },
+                    outcome.plaintext,
+                ));
+            }
+            Ok(None) => {
+                let out = init.take_outbound();
+                if !out.is_empty() {
+                    stream
+                        .send_all(Buffer::from_vec(out))
+                        .await
+                        .map_err(|e| format!("send: {e}"))?;
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
 /// Connect out to `addr` for `torrent` and run the connection.
 pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: SocketAddr) {
     let connected = uring::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
-    let stream = {
+    let (stream, use_mse) = {
         let mut t = torrent.borrow_mut();
         t.half_open = t.half_open.saturating_sub(1);
         t.connecting.remove(&addr);
-        match connected {
+        let stream = match connected {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 tracing::debug!(%addr, "connect failed: {e}");
@@ -323,37 +400,174 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
                 t.note_disconnect(addr, Instant::now());
                 return;
             }
-        }
+        };
+        // Q3: "enabled" connects out in plaintext first and retries with MSE
+        // after a failed attempt (libtorrent toggles `pe_support` per peer).
+        let use_mse = match ctx.cfg.encryption {
+            EncryptionMode::Disabled => false,
+            EncryptionMode::Forced => true,
+            EncryptionMode::Enabled => t.mse_retry.contains(&addr),
+        };
+        (stream, use_mse)
     };
-    let conn = {
+    let (mut conn, info_hash) = {
         let t = torrent.borrow();
         if t.closing.is_set() || !t.is_running() || t.has_peer_ip(addr.ip()) {
             return;
         }
-        Connection::new(connection_params(&ctx, &t, Role::Initiator, addr.ip()))
+        (
+            Connection::new(connection_params(&ctx, &t, Role::Initiator, addr.ip())),
+            t.info.info_hash,
+        )
     };
     let _ = stream.set_nodelay(true);
-    run_connection(ctx, torrent, stream, conn, addr, false, Vec::new()).await;
-}
-
-/// An accepted socket: read the handshake, find the torrent, run.
-pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
-    let Ok(addr) = stream.peer_addr() else { return };
-    let mut buf: Vec<u8> = Vec::with_capacity(wire::HANDSHAKE_LEN);
-    let hs = loop {
-        let chunk = Buffer::from_vec(vec![0u8; 1024]);
-        match uring::timeout(HANDSHAKE_TIMEOUT, stream.recv(chunk)).await {
-            Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => return,
-            Ok((Ok(_), b)) => buf.extend_from_slice(b.as_slice()),
-        }
-        match Handshake::parse(&buf) {
-            Ok(Some(hs)) => break hs,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::debug!(%addr, "incoming: {e}");
+    let mut cipher = Cipher::default();
+    let mut initial = Vec::new();
+    if use_mse {
+        // The connection queued our handshake; it travels as IA.
+        let ia = conn.take_outbound();
+        match uring::timeout(
+            HANDSHAKE_TIMEOUT,
+            mse_initiate(&ctx, &stream, info_hash, ia),
+        )
+        .await
+        {
+            Ok(Ok((c, rest))) => {
+                cipher = c;
+                initial = rest;
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(%addr, "mse initiator failed: {e}");
+                let mut t = torrent.borrow_mut();
+                t.mse_retry.remove(&addr);
+                t.note_disconnect(addr, Instant::now());
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(%addr, "mse handshake timed out");
+                let mut t = torrent.borrow_mut();
+                t.mse_retry.remove(&addr);
+                t.note_disconnect(addr, Instant::now());
                 return;
             }
         }
+    }
+    run_connection(ctx, torrent, stream, conn, addr, false, initial, cipher).await;
+}
+
+/// An accepted socket: read the handshake (plaintext, or through an MSE
+/// responder handshake), find the torrent, run.
+pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
+    let Ok(addr) = stream.peer_addr() else { return };
+    let mut raw: Vec<u8> = Vec::with_capacity(wire::HANDSHAKE_LEN);
+    let mut cipher = Cipher::default();
+    // Read until we can tell plaintext from MSE (20 bytes), then finish the
+    // respective handshake.
+    let hs = loop {
+        let chunk = Buffer::from_vec(vec![0u8; 4096]);
+        match uring::timeout(HANDSHAKE_TIMEOUT, stream.recv(chunk)).await {
+            Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => return,
+            Ok((Ok(_), b)) => raw.extend_from_slice(b.as_slice()),
+        }
+        if raw.len() < 20 {
+            continue;
+        }
+        let plaintext_head = Handshake::parse(&raw[..20.min(raw.len())]).is_ok();
+        if plaintext_head {
+            if ctx.cfg.encryption == EncryptionMode::Forced {
+                tracing::debug!(%addr, "incoming plaintext refused (encryption forced)");
+                return;
+            }
+            // Plain handshake: finish reading it.
+            loop {
+                match Handshake::parse(&raw) {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(%addr, "incoming: {e}");
+                        return;
+                    }
+                }
+                let chunk = Buffer::from_vec(vec![0u8; 1024]);
+                match uring::timeout(HANDSHAKE_TIMEOUT, stream.recv(chunk)).await {
+                    Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => return,
+                    Ok((Ok(_), b)) => raw.extend_from_slice(b.as_slice()),
+                }
+            }
+            break match Handshake::parse(&raw) {
+                Ok(Some(hs)) => hs,
+                _ => return,
+            };
+        }
+        if ctx.cfg.encryption == EncryptionMode::Disabled {
+            tracing::debug!(%addr, "incoming: not a BitTorrent handshake (encryption disabled)");
+            return;
+        }
+        // MSE responder.
+        let mut rng = super::rng::RngRef(&ctx.rng);
+        let mut resp = mse::Responder::new(
+            ctx.dh_private(),
+            allowed_mask(&ctx),
+            ctx.cfg.profile.mse.prefer_rc4,
+        );
+        let torrents = ctx.info_hashes();
+        let mut pending = std::mem::take(&mut raw);
+        let outcome = loop {
+            match resp.receive(&pending, &torrents, &mut rng) {
+                Ok(Some(o)) => {
+                    let out = resp.take_outbound();
+                    if !out.is_empty() && stream.send_all(Buffer::from_vec(out)).await.is_err() {
+                        return;
+                    }
+                    break o;
+                }
+                Ok(None) => {
+                    let out = resp.take_outbound();
+                    if !out.is_empty() && stream.send_all(Buffer::from_vec(out)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(%addr, "incoming mse: {e}");
+                    return;
+                }
+            }
+            let chunk = Buffer::from_vec(vec![0u8; 4096]);
+            match uring::timeout(HANDSHAKE_TIMEOUT, stream.recv(chunk)).await {
+                Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => return,
+                Ok((Ok(_), b)) => pending = b.as_slice().to_vec(),
+            }
+        };
+        cipher = Cipher {
+            enc: outcome.encrypt,
+            dec: outcome.decrypt,
+        };
+        raw = outcome.plaintext;
+        // The peer's handshake is (the start of) the decrypted plaintext.
+        loop {
+            match Handshake::parse(&raw) {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(%addr, "incoming (mse): {e}");
+                    return;
+                }
+            }
+            let chunk = Buffer::from_vec(vec![0u8; 1024]);
+            match uring::timeout(HANDSHAKE_TIMEOUT, stream.recv(chunk)).await {
+                Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => return,
+                Ok((Ok(_), mut b)) => {
+                    if let Some(d) = cipher.dec.as_mut() {
+                        d.apply(b.as_mut_slice());
+                    }
+                    raw.extend_from_slice(b.as_slice());
+                }
+            }
+        }
+        break match Handshake::parse(&raw) {
+            Ok(Some(hs)) => hs,
+            _ => return,
+        };
     };
     let Some(torrent) = ctx.torrent_by_hash(&hs.info_hash) else {
         tracing::debug!(%addr, "incoming for unknown torrent");
@@ -371,11 +585,12 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
         Connection::new(connection_params(&ctx, &t, Role::Responder, addr.ip()))
     };
     let _ = stream.set_nodelay(true);
-    run_connection(ctx, torrent, stream, conn, addr, true, buf).await;
+    run_connection(ctx, torrent, stream, conn, addr, true, raw, cipher).await;
 }
 
 /// The connection's main loop. `initial` holds bytes already read (the
 /// incoming handshake and whatever followed it).
+#[allow(clippy::too_many_arguments)]
 async fn run_connection(
     ctx: Rc<Ctx>,
     torrent: Rc<RefCell<Torrent>>,
@@ -384,10 +599,13 @@ async fn run_connection(
     addr: SocketAddr,
     incoming: bool,
     initial: Vec<u8>,
+    cipher: Cipher,
 ) {
     let key = ctx.new_peer_key();
     let pieces = torrent.borrow().info.piece_count();
     let handle = Rc::new(PeerHandle::new(key, addr, incoming, conn, pieces));
+    handle.encrypted.set(cipher.enc.is_some());
+    *handle.cipher.borrow_mut() = cipher;
     torrent.borrow_mut().peers.insert(key, handle.clone());
     let stream = Rc::new(stream);
     uring::spawn(writer(
@@ -400,7 +618,9 @@ async fn run_connection(
 
     let mut reason: Option<String> = None;
     if !initial.is_empty() {
-        reason = process_bytes(&ctx, &torrent, &handle, &initial).await.err();
+        // `initial` is plaintext already (decrypted by the MSE handshake, or
+        // a plain handshake), so bypass the cipher for it.
+        reason = process_plain(&ctx, &torrent, &handle, &initial).await.err();
     }
     handle.out.notify();
     let down_limit = torrent.borrow().down_limit.clone();
@@ -460,9 +680,23 @@ async fn run_connection(
         let last = handle.last_have.borrow().clone();
         t.picker.peer_left(&last);
         *handle.last_have.borrow_mut() = Bitfield::new(pieces);
-        // Do not dial this address again right away (libtorrent's
-        // `min_reconnect_time`).
-        t.note_disconnect(addr, Instant::now());
+        // Q3: a plaintext attempt that died before the handshake completed
+        // makes the next attempt to this address encrypted (and soon).
+        if !incoming && ctx.cfg.encryption == EncryptionMode::Enabled {
+            if handle.peer_id.get().is_none() && !handle.encrypted.get() {
+                t.mse_retry.insert(addr);
+                t.allow_reconnect_now(addr);
+            } else if handle.peer_id.get().is_none() {
+                t.mse_retry.remove(&addr);
+                t.note_disconnect(addr, Instant::now());
+            } else {
+                t.note_disconnect(addr, Instant::now());
+            }
+        } else {
+            // Do not dial this address again right away (libtorrent's
+            // `min_reconnect_time`).
+            t.note_disconnect(addr, Instant::now());
+        }
         t.id
     };
     tracing::debug!(%addr, torrent = id.0, "peer disconnected: {reason}");
@@ -478,6 +712,38 @@ async fn run_connection(
 
 /// Feed bytes to the state machine and act on every resulting event.
 async fn process_bytes(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    handle: &Rc<PeerHandle>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let events = {
+        let mut cipher = handle.cipher.borrow_mut();
+        let mut conn = handle.conn.borrow_mut();
+        match cipher.dec.as_mut() {
+            Some(d) => {
+                let mut plain = bytes.to_vec();
+                d.apply(&mut plain);
+                conn.receive(&plain)
+            }
+            None => conn.receive(bytes),
+        }
+        .map_err(|e| format!("protocol: {e}"))?
+    };
+    for ev in events {
+        handle_event(ctx, torrent, handle, ev).await?;
+        if handle.close.is_set() {
+            break;
+        }
+    }
+    if handle.conn.borrow().has_outbound() {
+        handle.out.notify();
+    }
+    Ok(())
+}
+
+/// Like `process_bytes` for bytes that are already plaintext.
+async fn process_plain(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
     handle: &Rc<PeerHandle>,
@@ -645,7 +911,10 @@ async fn writer(
 ) {
     let up_limit = torrent.borrow().up_limit.clone();
     loop {
-        let out = handle.conn.borrow_mut().take_outbound();
+        let mut out = handle.conn.borrow_mut().take_outbound();
+        if let Some(e) = handle.cipher.borrow_mut().enc.as_mut() {
+            e.apply(&mut out);
+        }
         if out.is_empty() {
             match select2(handle.out.wait(), handle.close.wait()).await {
                 Either::Left(()) => continue,

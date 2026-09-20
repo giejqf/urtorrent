@@ -503,6 +503,13 @@ impl FramedReader {
         &self.buf[..self.filled]
     }
 
+    /// Take every buffered byte (e.g. to hand a non-plaintext head to the
+    /// MSE responder).
+    pub fn take_pending(&mut self) -> Vec<u8> {
+        let n = self.filled;
+        self.consume(n)
+    }
+
     pub fn peek_fill<R: Read>(&mut self, r: &mut R, want: usize) -> io::Result<&[u8]> {
         let _ = self.fill(r, want)?;
         Ok(&self.buf[..self.filled])

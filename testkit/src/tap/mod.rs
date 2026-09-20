@@ -3,5 +3,6 @@
 
 //! Test-only observers: `tap-tracker` and `tap-peer`.
 
+pub mod cipher;
 pub mod peer;
 pub mod tracker;

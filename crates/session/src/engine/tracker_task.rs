@@ -80,10 +80,8 @@ fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
         key: t.announce_key,
         event: job.event,
         tracker_id: job.tracker_id.clone(),
-        // MSE lands in M5; until then we announce the oracle's default
-        // ("encryption allowed") capability, which is what the profile's
-        // captures were taken with.
-        crypto_supported: true,
+        // Q8: `supportcrypto=1` unless encryption is disabled.
+        crypto_supported: ctx.cfg.encryption != crate::api::EncryptionMode::Disabled,
     }
 }
 

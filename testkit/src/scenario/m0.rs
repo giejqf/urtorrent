@@ -257,7 +257,13 @@ fn capture_tracker_http(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
-fn run_peer_capture(ctx: &mut Ctx, oracle_cfg: OracleConfig, tag: &str) -> Result<()> {
+pub fn run_peer_capture(
+    ctx: &mut Ctx,
+    oracle_cfg: OracleConfig,
+    tag: &str,
+    tap_enc: crate::tap::peer::TapEncryption,
+    tap_initiates_mse: bool,
+) -> Result<()> {
     let http: Vec<SocketAddr> = ctx
         .host_addrs()
         .into_iter()
@@ -284,6 +290,7 @@ fn run_peer_capture(ctx: &mut Ctx, oracle_cfg: OracleConfig, tag: &str) -> Resul
         TapPeerConfig::new(fx_a.info_hash, Role::Seeder)
             .listen(vec![peer_addr])
             .fixture(fx_a.clone())
+            .encryption(tap_enc)
             .linger(Duration::from_secs(8)),
     )?;
     let oracle = ctx.oracle("oracle", oracle_cfg)?;
@@ -319,10 +326,11 @@ fn run_peer_capture(ctx: &mut Ctx, oracle_cfg: OracleConfig, tag: &str) -> Resul
     ctx.artifact(&format!("tap-peer-{tag}-oracle-initiator.jsonl"), &out_path);
     for c in tap_seed.captures() {
         ctx.note(format!(
-            "in-conn {} from {}: plaintext={} hs={:?} recv={:?} close={}",
+            "in-conn {} from {}: plaintext={} mse={:?} hs={:?} recv={:?} close={}",
             c.id,
             c.remote,
             !c.not_plaintext,
+            c.mse,
             c.handshake.as_ref().map(|h| &h.reserved_bits),
             c.recv_kinds().iter().take(12).collect::<Vec<_>>(),
             c.close_reason
@@ -351,6 +359,8 @@ fn run_peer_capture(ctx: &mut Ctx, oracle_cfg: OracleConfig, tag: &str) -> Resul
     let tap_leech = TapPeer::start(
         TapPeerConfig::new(fx_b.info_hash, Role::Leecher)
             .fixture(fx_b.clone())
+            .encryption(tap_enc)
+            .initiate_mse(tap_initiates_mse)
             .linger(Duration::from_secs(3))
             .bind_addr(leech_ip),
     )?;
@@ -365,7 +375,8 @@ fn run_peer_capture(ctx: &mut Ctx, oracle_cfg: OracleConfig, tag: &str) -> Resul
         cap = tap_leech.connect(SocketAddr::new(oracle.actor.addr(), oracle.listen_port()))?;
     }
     ctx.note(format!(
-        "out-conn to oracle: hs={:?} pieces_ok={} recv={:?} close={}",
+        "out-conn to oracle: mse={:?} hs={:?} pieces_ok={} recv={:?} close={}",
+        cap.mse,
         cap.handshake.as_ref().map(|h| &h.reserved_bits),
         cap.pieces_ok,
         cap.recv_kinds().iter().take(12).collect::<Vec<_>>(),
@@ -403,6 +414,8 @@ fn capture_peer_plain(ctx: &mut Ctx) -> Result<()> {
         ctx,
         OracleConfig::primary().encryption(Encryption::Disable),
         "plain",
+        crate::tap::peer::TapEncryption::Disabled,
+        false,
     )
 }
 
@@ -412,6 +425,8 @@ fn capture_peer_encrypted(ctx: &mut Ctx) -> Result<()> {
         ctx,
         OracleConfig::primary().encryption(Encryption::Prefer),
         "prefer-enc",
+        crate::tap::peer::TapEncryption::Disabled,
+        false,
     )
 }
 

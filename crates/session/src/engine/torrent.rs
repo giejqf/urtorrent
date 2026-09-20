@@ -93,6 +93,8 @@ pub struct Torrent {
     failed: HashMap<SocketAddr, Instant>,
     /// Addresses with a connect in progress.
     pub connecting: HashSet<SocketAddr>,
+    /// Addresses whose next outgoing attempt uses MSE (Q3 toggle).
+    pub mse_retry: HashSet<SocketAddr>,
     pub half_open: usize,
     /// Set when the torrent is stopping; every task of the torrent exits.
     pub closing: Rc<Flag>,
@@ -240,6 +242,12 @@ impl Torrent {
         self.failed.insert(addr, now);
     }
 
+    /// Let the next tick dial `addr` again immediately (libtorrent's
+    /// `fast_reconnect` after a plaintext attempt that needs MSE).
+    pub fn allow_reconnect_now(&mut self, addr: SocketAddr) {
+        self.failed.remove(&addr);
+    }
+
     /// Record who supplied a block (for blame).
     pub fn note_supplier(&mut self, piece: u32, key: u32, ip: IpAddr) {
         let v = self.suppliers.entry(piece).or_default();
@@ -383,6 +391,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         known: HashSet::new(),
         failed: HashMap::new(),
         connecting: HashSet::new(),
+        mse_retry: HashSet::new(),
         half_open: 0,
         closing: Flag::new(),
         tracker_kick: Notify::new(),

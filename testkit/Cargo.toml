@@ -31,5 +31,9 @@ urtorrent = { path = "../crates/urtorrent", version = "0.1.0" }
 # The discriminator checks the library's own request builder against the
 # goldens too (a unit-level differential).
 tracker = { path = "../crates/tracker", version = "0.1.0" }
+# MSE for the tap-peer: interop with the oracle validates it (a symmetric
+# mistake cannot complete a handshake with libtorrent), and it lets the tap
+# record the oracle's crypto_provide / select and pad lengths.
+mse = { path = "../crates/mse", version = "0.1.0" }
 profile = { path = "../crates/profile", version = "0.1.0" }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }

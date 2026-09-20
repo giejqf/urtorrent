@@ -316,6 +316,18 @@ pub struct PeerShape {
     pub max_incoming_requests: u32,
 }
 
+/// Message Stream Encryption shape (AGENTS.md 6 L2: method selection,
+/// `crypto_provide` / `select`, padding distribution).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MseShape {
+    /// When both methods are offered and allowed, select RC4 (libtorrent
+    /// `prefer_rc4`). The oracle selected RC4 for `provide = 3`
+    /// (`capture_peer_allow_mse`).
+    pub prefer_rc4: bool,
+    /// Pads are uniform in `0..=pad_max` (libtorrent `random(512)`).
+    pub pad_max: u16,
+}
+
 /// A complete identity/wire profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
@@ -333,6 +345,8 @@ pub struct Profile {
     pub ltep: LtepShape,
     /// Peer-wire shape.
     pub peer: PeerShape,
+    /// MSE shape.
+    pub mse: MseShape,
 }
 
 /// Handshake reserved-bit positions (byte index, mask), BEP 3/6/10.
@@ -474,6 +488,10 @@ impl Profile {
                 allowed_fast_count: 5,
                 max_incoming_requests: 250,
             },
+            mse: MseShape {
+                prefer_rc4: true,
+                pad_max: 512,
+            },
         }
     }
 
@@ -539,6 +557,12 @@ impl Profile {
                 // Five `allowed_fast` messages in the seeding capture.
                 allowed_fast_count: 5,
                 max_incoming_requests: 2000,
+            },
+            mse: MseShape {
+                // `capture_peer_allow_mse`: provide 3 -> select 2.
+                prefer_rc4: true,
+                // `capture_peer_forced`: pads 292, 488, 77, 484 (random(512)).
+                pad_max: 512,
             },
         }
     }

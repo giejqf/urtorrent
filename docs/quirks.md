@@ -36,9 +36,15 @@ answered the way the oracle answers with uTP disabled (to be captured in M5:
 
 Capture: `capture_peer_encrypted` (oracle `Session\Encryption=0`, qBt "Allow
 encryption") - the oracle's outgoing connection to tap-peer is a plaintext
-handshake, no MSE attempt. libtorrent only tries the encrypted handshake first
-when the peer is known to support it (tracker `crypto_flags` / previous
-failure) or when encryption is *required*. The `Force` case is captured in M5.
+handshake, no MSE attempt. libtorrent (`bt_peer_connection::on_connected`,
+`pe_enabled`) toggles a per-peer `pe_support` flag: the first attempt is
+plaintext; if it fails before the handshake completes, the next attempt to
+that peer is encrypted (and vice versa). The session mirrors this with
+`Torrent::mse_retry`. `Force` (`capture_peer_forced`): MSE always,
+`crypto_provide = 2`, pads `random(512)`, the BitTorrent handshake travels as
+IA (`len(IA) = 68`). `capture_peer_allow_mse`: for `provide = 3` the oracle
+selects RC4 -> qBittorrent runs with `prefer_rc4 = true`
+(`profile::MseShape`).
 
 ## Q4. Tracker `interval` is clamped to libtorrent's `min_announce_interval`
 
