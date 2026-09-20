@@ -35,6 +35,8 @@ pub enum Source {
     Tracker,
     /// A peer's LTEP `yourip`.
     Peer,
+    /// A DHT node's `ip` reply field (BEP 42).
+    Dht,
 }
 
 #[derive(Debug, Clone)]

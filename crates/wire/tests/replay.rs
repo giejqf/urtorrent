@@ -123,6 +123,7 @@ fn replay_oracle_leeching_from_us() {
         metadata_size: Some(714),
         advertise_port: true,
         private: false,
+        dht_port: None,
     });
     let mut requests = 0;
     let mut haves = 0;
@@ -430,6 +431,7 @@ fn qbt_magnet_mode_matches_capture() {
         metadata_size: None,
         advertise_port: true,
         private: false,
+        dht_port: None,
     });
     let hs_out = conn.take_outbound();
     assert_eq!(hs_out.len(), wire::HANDSHAKE_LEN);

@@ -21,6 +21,7 @@ fn session(n: u8) -> Session {
             .listen_v4(Some(Ipv4Addr::new(127, 0, 0, n)))
             .listen_v6(None)
             .lsd(false)
+            .dht(false)
             .build(),
     )
     .unwrap()

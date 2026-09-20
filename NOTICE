@@ -35,6 +35,16 @@ logic carry the original copyright notice; the list is maintained here:
       The deferred allowed-fast set (on `interested`, skipping the peer's
       pieces) follows peer_connection.cpp (send_allowed_set) and the
       have-state rules bt_peer_connection.cpp (write_bitfield, on_metadata).
+  crates/dht/src/id.rs, node.rs, table.rs, storage.rs, token.rs, blocker.rs, krpc.rs
+      The DHT node ports libtorrent's kademlia implementation: node_id.cpp
+      (BEP 42 generation / verification, secret ids), routing_table.cpp
+      (bucket layout, replacement cache, split / refresh policy),
+      traversal_algorithm.cpp, get_peers.cpp, find_data.cpp, refresh.cpp,
+      rpc_manager.cpp and node.cpp (lookups, bootstrap, refresh, request
+      handling and reply shapes), dht_storage.cpp (peer store limits, BEP 33
+      filters, BEP 51 samples), dos_blocker.cpp.
+  crates/session/src/engine/dht.rs
+      The announce round-robin follows session_impl.cpp (on_dht_announce).
   crates/picker/src/lib.rs
       Piece extent affinity (extent size, the five recent extents, when an
       extent is recorded) follows piece_picker.cpp

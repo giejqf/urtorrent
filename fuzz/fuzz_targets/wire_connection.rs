@@ -32,6 +32,7 @@ fuzz_target!(|data: &[u8]| {
         metadata_size: Some(100),
         advertise_port: true,
         private: false,
+        dht_port: None,
     });
     let hs = Handshake {
         reserved: [0, 0, 0, 0, 0, if flags & 4 != 0 { 0x10 } else { 0 }, 0, if flags & 8 != 0 { 0x05 } else { 0 }],

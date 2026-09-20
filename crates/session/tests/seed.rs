@@ -22,6 +22,7 @@ fn session(upload_limit: u64) -> Session {
             .listen_port(0)
             .listen_v4(Some(Ipv4Addr::LOCALHOST))
             .listen_v6(None)
+            .dht(false)
             .upload_limit(upload_limit)
             .build(),
     )
@@ -201,6 +202,7 @@ fn encryption_modes() {
                 .listen_port(0)
                 .listen_v4(Some(Ipv4Addr::LOCALHOST))
                 .listen_v6(None)
+                .dht(false)
                 .profile(profile::Profile::qbt_5_2_3_lt2_0_14())
                 .encryption(mode)
                 .build(),

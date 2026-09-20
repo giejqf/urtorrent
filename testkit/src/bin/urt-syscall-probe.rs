@@ -85,6 +85,7 @@ fn session(ip: Ipv4Addr) -> Session {
             .listen_v4(Some(ip))
             .listen_v6(None)
             .lsd(false)
+            .dht(false)
             .build(),
     )
     .expect("engine")

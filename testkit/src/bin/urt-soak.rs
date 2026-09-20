@@ -97,6 +97,7 @@ fn session(ip: Ipv4Addr, max_peers: usize) -> Result<Session> {
             .listen_v4(Some(ip))
             .listen_v6(None)
             .lsd(false)
+            .dht(false)
             .max_peers_per_torrent(max_peers)
             .hash_threads(2)
             .disk_thread(DISK_THREAD.load(std::sync::atomic::Ordering::Relaxed))

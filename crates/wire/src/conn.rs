@@ -99,6 +99,12 @@ pub struct ConnectionParams {
     pub advertise_port: bool,
     /// BEP 27 private torrent: no PEX / metadata extensions (Q11).
     pub private: bool,
+    /// Our DHT node's UDP port when the DHT is running: sets the handshake's
+    /// DHT bit and sends `port` (BEP 5) to peers that advertise DHT, right
+    /// after the have-state (libtorrent `write_dht_port`). `None` when the
+    /// DHT is off: then, like the oracle with DHT disabled, `port` is never
+    /// sent (the qbt profile still advertises the bit, docs/quirks.md Q1).
+    pub dht_port: Option<u16>,
 }
 
 /// Something that happened on the connection that the caller must act on.
@@ -190,6 +196,10 @@ pub struct Connection {
     outbound: Vec<Vec<u8>>,
     established: bool,
     sent_handshake: bool,
+    /// The peer advertised DHT (handshake bit) or sent us `port`.
+    peer_dht: bool,
+    dht_port_sent: bool,
+    first_messages_sent: bool,
     peer_handshake: Option<Handshake>,
     ltep: bool,
     fast: bool,
@@ -224,6 +234,9 @@ impl Connection {
             outbound: vec![Vec::with_capacity(256)],
             established: false,
             sent_handshake: false,
+            peer_dht: false,
+            dht_port_sent: false,
+            first_messages_sent: false,
             peer_handshake: None,
             ltep: false,
             fast: false,
@@ -252,8 +265,12 @@ impl Connection {
     }
 
     fn send_handshake(&mut self) {
+        let mut reserved = self.params.profile.peer.reserved;
+        if self.params.dht_port.is_some() {
+            profile::reserved::set(&mut reserved, profile::reserved::DHT);
+        }
         let hs = Handshake {
-            reserved: self.params.profile.peer.reserved,
+            reserved,
             info_hash: self.params.info_hash,
             peer_id: self.params.our_peer_id,
         };
@@ -569,6 +586,7 @@ impl Connection {
         }
         self.ltep = hs.supports_ltep() && self.params.profile.supports_ltep();
         self.fast = hs.supports_fast() && self.params.profile.supports_fast();
+        self.peer_dht = profile::reserved::has(&hs.reserved, profile::reserved::DHT);
         events.push(Event::Handshaked {
             peer_id: hs.peer_id,
             reserved: hs.reserved,
@@ -619,8 +637,22 @@ impl Connection {
                     if self.params.piece_count.is_some() {
                         self.send_have_state();
                     }
+                    // libtorrent: `write_bitfield(); write_dht_port();`.
+                    self.maybe_send_dht_port();
                 }
             }
+        }
+        self.first_messages_sent = true;
+    }
+
+    /// BEP 5 `port`, once, to a DHT-capable peer while our DHT runs.
+    fn maybe_send_dht_port(&mut self) {
+        if self.dht_port_sent || !self.peer_dht {
+            return;
+        }
+        if let Some(p) = self.params.dht_port {
+            self.push(&Message::Port(p));
+            self.dht_port_sent = true;
         }
     }
 
@@ -872,7 +904,17 @@ impl Connection {
                     events.push(Event::Cancel(r));
                 }
             }
-            Message::Port(p) => events.push(Event::Port(p)),
+            Message::Port(p) => {
+                events.push(Event::Port(p));
+                if !self.peer_dht {
+                    // libtorrent `on_dht_port`: a peer that did not advertise
+                    // DHT in its handshake but talks it gets our port too.
+                    self.peer_dht = true;
+                    if self.first_messages_sent {
+                        self.maybe_send_dht_port();
+                    }
+                }
+            }
             Message::Suggest(i) => {
                 self.need_fast()?;
                 self.check_index(i)?;
@@ -922,7 +964,7 @@ mod tests {
         ConnectionParams {
             role,
             info_hash: [1; 20],
-            our_peer_id: *b"-UR0010-000000000000",
+            our_peer_id: *b"-UR0030-000000000000",
             profile: profile::Profile::native(),
             piece_count: Some(pieces),
             our_have: if have_all {
@@ -935,6 +977,7 @@ mod tests {
             metadata_size: Some(100),
             advertise_port: true,
             private: false,
+            dht_port: None,
         }
     }
 
@@ -978,6 +1021,57 @@ mod tests {
         assert!(matches!(msgs[0], Message::Extended { id: 0, .. }));
         assert_eq!(msgs[1], Message::HaveNone);
         assert_eq!(msgs.len(), 2);
+    }
+
+    /// BEP 5 `port` (testkit/golden/capture_dht: `handshake, extended,
+    /// have_none, port, interested`): sent right after the have-state to a
+    /// peer that advertises DHT while our DHT runs; never without a DHT node;
+    /// and in reply to a `port` from a peer that did not advertise the bit.
+    #[test]
+    fn dht_port_follows_the_have_state() {
+        let mut p = params(Role::Initiator, 32, false);
+        p.dht_port = Some(6881);
+        let mut c = Connection::new(p);
+        let hs = c.take_outbound();
+        // Our handshake carries the DHT bit (native profile: 0x04 -> 0x05).
+        assert_eq!(hs[27], 0x05);
+        c.receive(&peer_hs(FULL)).unwrap();
+        let msgs = decode_all(&c.take_outbound(), false);
+        assert!(matches!(msgs[0], Message::Extended { id: 0, .. }));
+        assert_eq!(msgs[1], Message::HaveNone);
+        assert_eq!(msgs[2], Message::Port(6881));
+        assert_eq!(msgs.len(), 3);
+        // The peer's `port` is reported; ours is not repeated.
+        let ev = c.receive(&Message::Port(7000).to_bytes()).unwrap();
+        assert_eq!(ev, vec![Event::Port(7000)]);
+        assert!(c.take_outbound().is_empty());
+
+        // No DHT node: the bit stays off for `native` and no `port` goes out.
+        let mut c = Connection::new(params(Role::Initiator, 32, false));
+        assert_eq!(c.take_outbound()[27], 0x04);
+        c.receive(&peer_hs(FULL)).unwrap();
+        assert!(
+            !decode_all(&c.take_outbound(), false)
+                .iter()
+                .any(|m| matches!(m, Message::Port(_)))
+        );
+
+        // A peer without the bit gets no `port` up front, but one in reply.
+        let mut p = params(Role::Initiator, 32, false);
+        p.dht_port = Some(6881);
+        let mut c = Connection::new(p);
+        c.take_outbound();
+        c.receive(&peer_hs([0, 0, 0, 0, 0, 0x10, 0, 0x04])).unwrap();
+        assert!(
+            !decode_all(&c.take_outbound(), false)
+                .iter()
+                .any(|m| matches!(m, Message::Port(_)))
+        );
+        c.receive(&Message::Port(7000).to_bytes()).unwrap();
+        assert_eq!(
+            decode_all(&c.take_outbound(), false),
+            vec![Message::Port(6881)]
+        );
     }
 
     #[test]
@@ -1318,7 +1412,7 @@ mod tests {
         let hs = Handshake {
             reserved: FULL,
             info_hash: [1; 20],
-            peer_id: *b"-UR0010-000000000000",
+            peer_id: *b"-UR0030-000000000000",
         };
         assert!(c.receive(&hs.encode()).is_err());
     }

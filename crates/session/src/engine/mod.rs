@@ -10,6 +10,7 @@
 //! that need the command loop's attention ring the same eventfd.
 
 mod choker;
+mod dht;
 mod dns;
 mod external_ip;
 mod http;
@@ -74,6 +75,15 @@ pub struct EngineConfig {
     pub pex: bool,
     /// Local Service Discovery enabled.
     pub lsd: bool,
+    /// Run a DHT node (BEP 5) on the listen port's UDP sockets.
+    pub dht: bool,
+    /// Bootstrap routers (`host:port`); `None` = the profile's defaults,
+    /// `Some(empty)` = none (saved state / peers' `port` messages only).
+    pub dht_bootstrap_nodes: Option<Vec<String>>,
+    /// BEP 43 read-only DHT node.
+    pub dht_read_only: bool,
+    /// Saved DHT state to restore (`Session::dht_state`).
+    pub dht_state: Option<Vec<u8>>,
     /// Torrent file I/O on its own `urt-disk` ring thread (default) rather
     /// than on the network ring.
     pub disk_thread: bool,
@@ -125,6 +135,10 @@ impl Default for EngineConfig {
             encryption: crate::api::EncryptionMode::Enabled,
             pex: true,
             lsd: true,
+            dht: true,
+            dht_bootstrap_nodes: None,
+            dht_read_only: false,
+            dht_state: None,
             disk_thread: true,
             max_checking: 1,
             max_concurrent_announces: 32,
@@ -151,6 +165,8 @@ pub enum Command {
     AddTracker(TorrentId, String, usize, oneshot::Sender<Result<(), Error>>),
     RemoveTracker(TorrentId, String, oneshot::Sender<Result<(), Error>>),
     SetMaxPeers(TorrentId, Option<usize>, oneshot::Sender<Result<(), Error>>),
+    DhtState(oneshot::Sender<Option<Vec<u8>>>),
+    AddDhtNode(SocketAddr, oneshot::Sender<()>),
     Status(TorrentId, oneshot::Sender<Result<TorrentStatus, Error>>),
     Statuses(oneshot::Sender<Vec<TorrentStatus>>),
     Peers(TorrentId, oneshot::Sender<Result<Vec<PeerInfo>, Error>>),
@@ -200,6 +216,8 @@ pub struct Ctx {
     pub udp: Rc<udp::UdpDemux>,
     /// Local Service Discovery sockets (`None` when disabled or unavailable).
     pub lsd: RefCell<Option<lsd::Lsd>>,
+    /// The DHT node(s), `None` when disabled.
+    pub dht: Option<Rc<dht::Dht>>,
     /// External-address voters, one per listen family (`[v4, v6]`).
     pub external: RefCell<[external_ip::IpVoter; 2]>,
     pub rng: rng::Rng,
@@ -387,6 +405,14 @@ impl Ctx {
                 t.borrow_mut().rerank_candidates();
             }
             self.emit(Event::ExternalAddress { ip });
+            self.dht_external_ip_changed(ip);
+        }
+    }
+
+    /// The DHT node of that family adopts a BEP 42 id for the new address.
+    fn dht_external_ip_changed(&self, ip: IpAddr) {
+        if let Some(d) = &self.dht {
+            d.external_ip(self, ip);
         }
     }
 
@@ -551,6 +577,22 @@ pub fn run(
             None
         };
         let now = Instant::now();
+        let dht_service = if cfg.dht
+            && (udp_demux.supports(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                || udp_demux.supports(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
+        {
+            Some(Rc::new(dht::Dht::new(
+                &cfg,
+                udp_demux.supports(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+                udp_demux.supports(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+                port,
+                cfg.dht_state.as_deref(),
+                &rng,
+                now,
+            )))
+        } else {
+            None
+        };
         // Peer receive buffers: one ring for every connection on this thread
         // (kernel 6.1 baseline: multishot recv + provided buffer rings).
         let recv_ring =
@@ -566,6 +608,7 @@ pub fn run(
             tls,
             udp: udp_demux.clone(),
             lsd: RefCell::new(lsd),
+            dht: dht_service,
             external: RefCell::new([
                 external_ip::IpVoter::new(now),
                 external_ip::IpVoter::new(now),
@@ -614,6 +657,21 @@ pub fn run(
             uring::spawn(accept_loop(ctx.clone(), l));
         }
         udp_demux.spawn(ctx.closing.clone());
+        if let Some(d) = ctx.dht.clone() {
+            // KRPC datagrams on the listen port go to the DHT.
+            let weak = Rc::downgrade(&ctx);
+            ctx.udp.set_dht_hook(Box::new(move |from, pkt, v6| {
+                if let Some(ctx) = weak.upgrade()
+                    && let Some(d) = ctx.dht.clone()
+                {
+                    d.incoming(&ctx, from, pkt, v6);
+                }
+            }));
+            let ctx2 = ctx.clone();
+            uring::spawn(async move {
+                d.start(&ctx2).await;
+            });
+        }
         if let Some(l) = ctx.lsd.borrow().as_ref() {
             l.spawn(ctx.clone());
         }
@@ -669,6 +727,7 @@ async fn accept_loop(ctx: Rc<Ctx>, listener: TcpListener) {
 async fn ticker(ctx: Rc<Ctx>) {
     let mut last_choke = Instant::now();
     let mut last_optimistic = Instant::now();
+    let mut last_dht = Instant::now();
     let mut next_lsd = Instant::now() + lsd::ANNOUNCE_INTERVAL;
     let mut lsd_index = 0usize;
     loop {
@@ -683,6 +742,12 @@ async fn ticker(ctx: Rc<Ctx>) {
         }
         let now = Instant::now();
         ctx.run_due_ticks(now);
+        if now.duration_since(last_dht) >= std::time::Duration::from_secs(1) {
+            last_dht = now;
+            if let Some(d) = ctx.dht.clone() {
+                d.tick(&ctx, now);
+            }
+        }
         if now.duration_since(last_choke) >= choker::UNCHOKE_INTERVAL {
             last_choke = now;
             let rotate = now.duration_since(last_optimistic) >= choker::OPTIMISTIC_INTERVAL;
@@ -879,6 +944,15 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 let _ = reply.send(Err(Error::NoSuchTorrent));
             }
         },
+        Command::DhtState(reply) => {
+            let _ = reply.send(ctx.dht.as_ref().map(|d| d.state()));
+        }
+        Command::AddDhtNode(addr, reply) => {
+            if let Some(d) = ctx.dht.clone() {
+                d.add_node(ctx, addr);
+            }
+            let _ = reply.send(());
+        }
         Command::SetMaxPeers(id, max, reply) => match ctx.torrent(id) {
             Some(t) => {
                 t.borrow_mut().max_peers = max;
@@ -959,6 +1033,12 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 .load(std::sync::atomic::Ordering::Relaxed);
             s.recv_buffers_free = ctx.recv_ring.free();
             s.recv_buffers = usize::from(ctx.cfg.recv_ring_entries);
+            if let Some(d) = &ctx.dht {
+                let ds = d.stats();
+                s.dht_nodes = ds.nodes;
+                s.dht_lookups = ds.lookups;
+                s.dht_stored_peers = ds.peers;
+            }
             let _ = reply.send(s);
         }
         Command::SaveResume(id, reply) => match ctx.torrent(id) {

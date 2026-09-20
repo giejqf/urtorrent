@@ -30,6 +30,9 @@ pub struct ClientConfig {
     pub lsd: bool,
     /// Peer exchange.
     pub pex: bool,
+    /// DHT bootstrap routers (`ip:port`); empty = DHT off. Never the
+    /// library's public defaults (AGENTS.md rule 3).
+    pub dht_bootstrap: Vec<std::net::SocketAddr>,
     /// Manually added peers (`Session::add_peer`).
     pub add_peers: Vec<std::net::SocketAddr>,
     /// Initial file priorities.
@@ -51,6 +54,7 @@ impl Default for ClientConfig {
             encryption: "enabled".into(),
             lsd: true,
             pex: true,
+            dht_bootstrap: Vec::new(),
             add_peers: Vec::new(),
             file_priorities: None,
             env: vec![("RUST_LOG".into(), "debug".into())],
@@ -61,6 +65,10 @@ impl Default for ClientConfig {
 impl ClientConfig {
     pub fn profile(mut self, p: &str) -> Self {
         self.profile = p.into();
+        self
+    }
+    pub fn dht_bootstrap(mut self, routers: Vec<std::net::SocketAddr>) -> Self {
+        self.dht_bootstrap = routers;
         self
     }
     pub fn lsd(mut self, on: bool) -> Self {
@@ -157,6 +165,12 @@ pub struct ClientStatus {
     pub peers_seen: Vec<ClientPeer>,
     #[serde(default)]
     pub events: Vec<String>,
+    #[serde(default)]
+    pub dht_nodes: usize,
+    #[serde(default)]
+    pub dht_lookups: usize,
+    #[serde(default)]
+    pub dht_stored_peers: usize,
     #[serde(default)]
     pub exited: bool,
 }
@@ -288,6 +302,9 @@ impl UrtClient {
         cmd.arg("--encryption").arg(&config.encryption);
         if !config.lsd {
             cmd.arg("--no-lsd");
+        }
+        for r in &config.dht_bootstrap {
+            cmd.arg("--dht-router").arg(r.to_string());
         }
         if !config.pex {
             cmd.arg("--no-pex");

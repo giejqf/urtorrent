@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-20
+
+The DHT (BEP 5). Peers now also come from the Mainline DHT; the public API
+grew (builder options, `Session::{dht_state, add_dht_node}`, new
+`PeerSource` / `Event` variants, `SessionStats::dht_*`), hence the minor
+bump. Tests never touch the public internet: in-process tests disable the
+DHT or bootstrap from each other, the lab bootstraps from tap nodes.
+
+### Added
+
+- `crates/dht`: a sans-IO Mainline DHT node (BEP 5, 42, 43, 51; libtorrent's
+  extensions `ip` / `p` / `bs` / `noseed` / `seed` / BEP 33 scrape filters),
+  ported from libtorrent 2.0.14 with attribution: routing table with the
+  extended bucket sizes and replacement cache, lookups with branch factor 5
+  and 1 s / 15 s timeouts, bootstrap and 5-second refresh, token rotation,
+  peer store, DoS blocker, BEP 42 ids from the voted external address. KRPC
+  messages are byte-exact against the oracle's captures
+  (`testkit/golden/capture_dht`).
+- Engine integration (ADR 0007): one node per listen family on the listen
+  port's UDP sockets via the demultiplexer hook; found peers arrive as
+  `PeerSource::Dht`; torrents are announced round-robin every 15 min / N
+  (new and just-finished ones within 4 s), never private ones; peers' `port`
+  messages feed the routing table; we send `port` after the have-state to
+  DHT-capable peers (`wire::ConnectionParams::dht_port`, the `native`
+  profile's handshake now sets the DHT bit while a node runs).
+- API: `SessionBuilder::{dht, dht_bootstrap_nodes, dht_read_only,
+  dht_state}`, `Session::{dht_state, add_dht_node}`, `Event::{DhtBootstrapped,
+  DhtPeers}`, `SessionStats::{dht_nodes, dht_lookups, dht_stored_peers}`,
+  `profile::DhtShape` (the `v` tag and qBittorrent's default routers).
+- Testkit: `tap-dht` (recording, scriptable DHT node with a router mode),
+  scenarios `capture_dht`, `dht_leech_from_oracle` (v4 / v6),
+  `dht_seed_to_oracle`, `dht_shape` (differential, in `xtask diff`),
+  `private_no_pex_lsd` extended to the DHT; the DHT fingerprint in the
+  discriminator; fuzz target `dht_krpc`.
+
+### Changed
+
+- The netns lab gives every actor its own /24 (v4) and /64 (v6):
+  `10.<id>.0.0/16` and `fd77:<id>::/32` per lab (ADR 0002 amended), because
+  libtorrent's DHT keeps one node per /24 or /64 per bucket and per lookup.
+- The `native` profile's version tags are `0.3.0` / `-UR0030-`.
+
 ## [0.2.0] - 2026-09-20
 
 Performance and completeness release. The public API grew (new `Session`

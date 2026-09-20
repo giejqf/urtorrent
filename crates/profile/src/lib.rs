@@ -341,6 +341,19 @@ pub struct MseShape {
     pub pad_max: u16,
 }
 
+/// DHT (BEP 5) shape: what a DHT node observes about us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtShape {
+    /// The `v` stamped on every KRPC message. libtorrent: `"LT"` + major
+    /// byte + `(minor << 4 | tiny)` byte (`4c 54 02 0e` for 2.0.14,
+    /// `testkit/golden/capture_dht`).
+    pub version: [u8; 4],
+    /// Default bootstrap routers (`host:port`), used unless the caller sets
+    /// their own. qBittorrent 5.2.3's list (data read from its settings, not
+    /// code).
+    pub bootstrap_nodes: &'static [&'static str],
+}
+
 /// A complete identity/wire profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
@@ -360,6 +373,8 @@ pub struct Profile {
     pub peer: PeerShape,
     /// MSE shape.
     pub mse: MseShape,
+    /// DHT shape.
+    pub dht: DhtShape,
 }
 
 /// Handshake reserved-bit positions (byte index, mask), BEP 3/6/10.
@@ -370,6 +385,11 @@ pub mod reserved {
     pub const FAST: (usize, u8) = (7, 0x04);
     /// BEP 5 DHT: byte 7, bit 0x01.
     pub const DHT: (usize, u8) = (7, 0x01);
+
+    /// Set `bit` in `r`.
+    pub fn set(r: &mut [u8; 8], bit: (usize, u8)) {
+        r[bit.0] |= bit.1;
+    }
 
     /// Whether `bit` is set in `r`.
     pub fn has(r: &[u8; 8], bit: (usize, u8)) -> bool {
@@ -504,13 +524,13 @@ impl Profile {
         Profile {
             name: "native",
             peer_id: PeerIdShape {
-                prefix: "-UR0010-",
+                prefix: "-UR0030-",
                 tail_alphabet: NATIVE_TAIL_ALPHABET,
                 lifetime: PeerIdLifetime::PerSession,
                 handshake: HandshakePeerId::SameAsAnnounce,
             },
-            user_agent: "urtorrent/0.1.0",
-            ltep_version: "urtorrent 0.1.0",
+            user_agent: "urtorrent/0.3.0",
+            ltep_version: "urtorrent 0.3.0",
             http: HttpAnnounceShape {
                 params: QBT_ANNOUNCE_PARAMS,
                 headers: QBT_ANNOUNCE_HEADERS,
@@ -546,6 +566,11 @@ impl Profile {
             mse: MseShape {
                 prefer_rc4: true,
                 pad_max: 512,
+            },
+            dht: DhtShape {
+                // Our own honest version tag: `UR` + 0.3.
+                version: *b"UR\x00\x03",
+                bootstrap_nodes: &["dht.libtorrent.org:25401", "router.bittorrent.com:6881"],
             },
         }
     }
@@ -624,6 +649,16 @@ impl Profile {
                 // `capture_peer_forced`: pads 292, 488, 77, 484 (random(512)).
                 pad_max: 512,
             },
+            dht: DhtShape {
+                // `capture_dht`: every query and reply carries `v = 4c54020e`.
+                version: [0x4c, 0x54, 0x02, 0x0e],
+                // qBittorrent 5.2.3 `Session\DHTBootstrapNodes` default.
+                bootstrap_nodes: &[
+                    "dht.libtorrent.org:25401",
+                    "dht.transmissionbt.com:6881",
+                    "router.bittorrent.com:6881",
+                ],
+            },
         }
     }
 
@@ -669,7 +704,7 @@ mod tests {
         }
         assert_eq!(p.peer_id.lifetime, PeerIdLifetime::PerTorrent);
         let n = Profile::native().peer_id.generate(&mut Counter(2));
-        assert_eq!(&n[..8], b"-UR0010-");
+        assert_eq!(&n[..8], b"-UR0030-");
         assert!(n[8..].iter().all(u8::is_ascii_alphanumeric));
     }
 

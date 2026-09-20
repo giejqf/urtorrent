@@ -40,6 +40,8 @@ struct Args {
     download_limit: u64,
     encryption: String,
     lsd: bool,
+    /// DHT routers; empty = DHT off (never the public defaults in the lab).
+    dht_routers: Vec<String>,
     pex: bool,
     add_peers: Vec<std::net::SocketAddr>,
     file_priorities: Option<Vec<u8>>,
@@ -65,6 +67,7 @@ fn parse_args() -> Result<Args> {
         download_limit: 0,
         encryption: "enabled".into(),
         lsd: true,
+        dht_routers: Vec::new(),
         pex: true,
         add_peers: Vec::new(),
         file_priorities: None,
@@ -76,6 +79,7 @@ fn parse_args() -> Result<Args> {
             "--torrent" => a.torrent = PathBuf::from(val()?),
             "--magnet" => a.magnet = Some(val()?),
             "--no-lsd" => a.lsd = false,
+            "--dht-router" => a.dht_routers.push(val()?),
             "--no-pex" => a.pex = false,
             "--add-peer" => a.add_peers.push(val()?.parse()?),
             "--file-priorities" => a.file_priorities = Some(parse_priorities(&val()?)?),
@@ -99,7 +103,7 @@ fn parse_args() -> Result<Args> {
     }
     if (a.torrent.as_os_str().is_empty() && a.magnet.is_none()) || a.save.as_os_str().is_empty() {
         bail!(
-            "usage: urt-client (--torrent <file> | --magnet <uri>) --save <dir> [--resume <dir>] [--status <file>] [--control <file>] [--listen-port N] [--profile native|qbt] [--v4 ip|--no-v4] [--v6 ip|--no-v6] [--exit-when-complete] [--sequential] [--no-lsd] [--no-pex] [--add-peer ip:port]..."
+            "usage: urt-client (--torrent <file> | --magnet <uri>) --save <dir> [--resume <dir>] [--status <file>] [--control <file>] [--listen-port N] [--profile native|qbt] [--v4 ip|--no-v4] [--v6 ip|--no-v6] [--exit-when-complete] [--sequential] [--no-lsd] [--no-pex] [--dht-router ip:port]... [--add-peer ip:port]..."
         );
     }
     Ok(a)
@@ -148,7 +152,9 @@ async fn main() -> Result<()> {
         .upload_limit(args.upload_limit)
         .download_limit(args.download_limit)
         .lsd(args.lsd)
-        .pex(args.pex);
+        .pex(args.pex)
+        .dht(!args.dht_routers.is_empty())
+        .dht_bootstrap_nodes(args.dht_routers.clone());
     if args.no_v4 {
         builder = builder.listen_v4(None);
     } else if let Some(v4) = args.v4 {
@@ -203,6 +209,7 @@ async fn main() -> Result<()> {
             }
         }
         let st = session.status(id).await?;
+        let stats = session.stats().await?;
         let peers = session.peers(id).await.unwrap_or_default();
         for p in &peers {
             if p.peer_id.is_some() {
@@ -245,6 +252,9 @@ async fn main() -> Result<()> {
                 "encryption": args.encryption,
                 "peers_seen": peers_seen.values().cloned().collect::<Vec<_>>(),
                 "events": event_log,
+                "dht_nodes": stats.dht_nodes,
+                "dht_lookups": stats.dht_lookups,
+                "dht_stored_peers": stats.dht_stored_peers,
             });
             write_status(p, &v);
         }

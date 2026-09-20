@@ -23,6 +23,7 @@ layers in [docs/testing.md](docs/testing.md) and soak/perf baselines in
 | M5 Reach | done (PT-complete): UDP tracker, scrape, MSE (all modes vs the oracle), per-listen-socket dual-stack announces, tier failover/backoff, PT-style tracker, uTP-enabled oracle over TCP |
 | M6 Extensions | done: PEX, `ut_metadata` / magnets, `upload_only`, LSD, web seeds, BEP 40; private torrents proven silent on the wire (Q11); scenarios green in v4 / v6 |
 | M7 Hardening | done: file priorities with a parts file + move storage (Tier 1), torrent files opened on the ring, `xtask syscalls` on a real session, `xtask soak` (20 GiB loopback, 500 torrents), fuzz time, API review; **0.1.0** |
+| 0.3.0 DHT | done: `crates/dht` (BEP 5 / 42 / 43 / 51 sans-IO node ported from libtorrent), engine integration on the listen port's UDP demux, `port` messages, per-actor /24s in the lab, `tap-dht`, `dht_leech_from_oracle` / `dht_seed_to_oracle` / `dht_shape` green (our node is indistinguishable from the oracle's on every probed shape); **0.3.0** |
 | 0.2.0 Performance | done: external-address voting, dedicated disk ring, hash-as-you-write, scale pass (10 000 torrents in one session), indexed picker + extent affinity, provided-buffer-ring receive path + vectored/zero-copy sends (ADR 0006), API completeness (tracker add/remove, `remove_torrent_with_files`, preallocation, per-torrent peer caps, time counters, richer stats); **0.2.0** |
 
 ## Developer commands

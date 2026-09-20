@@ -37,6 +37,7 @@ fn session_at(n: u8, lsd: bool) -> Session {
             .listen_v4(Some(Ipv4Addr::new(127, 0, 0, n)))
             .listen_v6(None)
             .lsd(lsd)
+            .dht(false)
             .build(),
     )
     .unwrap()
@@ -184,6 +185,7 @@ fn pex_introduces_peers() {
             .listen_v4(Some(Ipv4Addr::LOCALHOST))
             .listen_v6(None)
             .lsd(false)
+            .dht(false)
             .upload_limit(128 * 1024)
             .build(),
     )

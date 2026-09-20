@@ -285,6 +285,8 @@ pub enum PeerSource {
     Lsd,
     /// It connected to us.
     Incoming,
+    /// The DHT (BEP 5).
+    Dht,
 }
 
 /// A connected peer, copied out.
@@ -367,6 +369,12 @@ pub struct SessionStats {
     pub recv_buffers_free: usize,
     /// Receive buffers of the peer ring in total.
     pub recv_buffers: usize,
+    /// Live nodes in the DHT routing tables (0 when the DHT is off).
+    pub dht_nodes: usize,
+    /// DHT lookups in progress.
+    pub dht_lookups: usize,
+    /// Peers other nodes announced to us and we store for them.
+    pub dht_stored_peers: usize,
 }
 
 /// Something that happened in the engine.
@@ -478,6 +486,18 @@ pub enum Event {
         url: String,
         /// What went wrong.
         error: String,
+    },
+    /// The DHT bootstrap lookup finished.
+    DhtBootstrapped {
+        /// Live nodes in the routing table afterwards.
+        nodes: usize,
+    },
+    /// A DHT lookup returned peers for a torrent.
+    DhtPeers {
+        /// The torrent.
+        id: TorrentId,
+        /// Peers in the reply.
+        peers: usize,
     },
     /// A peer connection completed its handshake.
     PeerConnected {
@@ -628,6 +648,37 @@ impl SessionBuilder {
     /// never announced regardless.
     pub fn lsd(mut self, on: bool) -> Self {
         self.cfg.lsd = on;
+        self
+    }
+
+    /// The DHT (BEP 5), default on: one node per listen family on the listen
+    /// port's UDP sockets. Private torrents are never announced or looked up
+    /// regardless.
+    pub fn dht(mut self, on: bool) -> Self {
+        self.cfg.dht = on;
+        self
+    }
+
+    /// Bootstrap routers (`host:port`) instead of the profile's defaults; an
+    /// empty list means none (only saved state and peers' `port` messages
+    /// seed the table). Tests must set this: the defaults are on the public
+    /// internet.
+    pub fn dht_bootstrap_nodes(mut self, nodes: Vec<String>) -> Self {
+        self.cfg.dht_bootstrap_nodes = Some(nodes);
+        self
+    }
+
+    /// Run the DHT node read-only (BEP 43): it answers no queries and marks
+    /// its own `ro`.
+    pub fn dht_read_only(mut self, on: bool) -> Self {
+        self.cfg.dht_read_only = on;
+        self
+    }
+
+    /// Restore DHT state saved by [`Session::dht_state`] (node ids and
+    /// routing-table nodes), so the node comes up without a cold bootstrap.
+    pub fn dht_state(mut self, state: Vec<u8>) -> Self {
+        self.cfg.dht_state = Some(state);
         self
     }
 
@@ -806,6 +857,19 @@ impl Session {
     /// the cap are kept; no new ones are made.
     pub async fn set_max_peers(&self, id: TorrentId, max: Option<usize>) -> Result<(), Error> {
         self.send(|tx| Command::SetMaxPeers(id, max, tx)).await?
+    }
+
+    /// The DHT's persistable state (node ids and routing-table nodes) for
+    /// [`SessionBuilder::dht_state`]; `None` when the DHT is off. Save it at
+    /// shutdown.
+    pub async fn dht_state(&self) -> Result<Option<Vec<u8>>, Error> {
+        self.send(Command::DhtState).await
+    }
+
+    /// Tell the DHT about a node (it is probed and, if it answers, joins the
+    /// routing table).
+    pub async fn add_dht_node(&self, addr: SocketAddr) -> Result<(), Error> {
+        self.send(|tx| Command::AddDhtNode(addr, tx)).await
     }
 
     /// Pause a torrent (sends `stopped`, drops peers).

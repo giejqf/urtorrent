@@ -27,8 +27,14 @@ Findings while building M0 on the CI-like VM:
 The primary environment is a **netns lab** driven by `testkit`:
 
 - One Linux bridge per lab (`urt<id>`) on the host, carrying
-  `10.77.<id>.0/24` and `fd77:<id>::/64`. The harness itself lives at `.1`
-  and can add aliases `.2`-`.9` for tap actors that must present distinct IPs.
+  `10.<id>.0.0/16` and `fd77:<id>::/32` (amended 2026-09-20; the lab used to
+  be one /24 + /64). Every actor and every harness alias has its own /24 and
+  /64 inside it (`10.<id>.<n>.1`, `fd77:<id>:<n>::1`): libtorrent's DHT keeps
+  one node per /24 (v4) or /64 (v6) per bucket and per search, so a lab in
+  one /24 could never exercise multi-hop DHT behaviour. The harness itself
+  lives at `10.<id>.0.1` / `fd77:<id>::1` and adds aliases `n = 2..9` for
+  tap actors that must present distinct IPs. Ids whose `10.<id>.0.0/16`
+  overlaps a route the host already has are skipped.
 - One network namespace per client actor, attached with a veth pair, with a
   v4 address, a v6 address, or both. No default route: actors can only reach
   the lab (rule 3). IPv6 is disabled with sysctl in v4-only namespaces.

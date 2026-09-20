@@ -109,13 +109,28 @@ impl Lab {
         preflight()?;
         fs::create_dir_all(run_dir)?;
         let existing = ip(&["-o", "link", "show", "type", "bridge"])?;
-        let taken: Vec<u8> = existing
+        let mut taken: Vec<u8> = existing
             .lines()
             .filter_map(|l| l.split(':').nth(1))
             .map(str::trim)
             .filter_map(|n| n.strip_prefix(BRIDGE_PREFIX))
             .filter_map(|n| n.parse().ok())
             .collect();
+        // The lab owns `10.<id>.0.0/16`; never pick a second octet the host
+        // already routes (its own LAN, Docker, VPNs).
+        if let Ok(routes) = ip(&["-4", "route"]) {
+            for r in routes.lines() {
+                if let Some(rest) = r
+                    .split_whitespace()
+                    .next()
+                    .and_then(|d| d.strip_prefix("10."))
+                    && let Some(second) = rest.split('.').next()
+                    && let Ok(n) = second.parse::<u8>()
+                {
+                    taken.push(n);
+                }
+            }
+        }
         let mut id = (std::process::id() % 200 + 20) as u8;
         for _ in 0..240 {
             if !taken.contains(&id) {
@@ -139,7 +154,7 @@ impl Lab {
             ip(&[
                 "addr",
                 "add",
-                &format!("{}/24", lab.host_v4()),
+                &format!("{}/16", lab.host_v4()),
                 "dev",
                 &bridge,
             ])?;
@@ -147,7 +162,7 @@ impl Lab {
                 "-6",
                 "addr",
                 "add",
-                &format!("{}/64", lab.host_v6()),
+                &format!("{}/32", lab.host_v6()),
                 "dev",
                 &bridge,
                 "nodad",
@@ -188,11 +203,17 @@ impl Lab {
     pub fn bridge(&self) -> &str {
         &self.bridge
     }
-    /// The harness's own IPv4 address on the lab bridge.
+    /// The harness's own IPv4 address on the lab bridge. The lab is
+    /// `10.<id>.0.0/16`; every actor (and every harness alias) has its own
+    /// /24 inside it (`10.<id>.<n>.1`), because libtorrent's DHT keeps one
+    /// node per /24 in a bucket and per search (`dht_restrict_*_ips`), so a
+    /// lab in one /24 could never show multi-hop DHT behaviour.
     pub fn host_v4(&self) -> Ipv4Addr {
-        Ipv4Addr::new(10, 77, self.id, 1)
+        Ipv4Addr::new(10, self.id, 0, 1)
     }
-    /// The harness's own IPv6 address on the lab bridge.
+    /// The harness's own IPv6 address on the lab bridge: `fd77:<id>::/32`
+    /// on-link, with one /64 per actor / alias (`fd77:<id>:<n>::1`), for the
+    /// same reason as the v4 layout.
     pub fn host_v6(&self) -> Ipv6Addr {
         Ipv6Addr::new(0xfd77, u16::from(self.id), 0, 0, 0, 0, 0, 1)
     }
@@ -211,10 +232,10 @@ impl Lab {
         }
     }
     pub fn v4_subnet(&self) -> String {
-        format!("10.77.{}.0/24", self.id)
+        format!("10.{}.0.0/16", self.id)
     }
     pub fn v6_subnet(&self) -> String {
-        format!("fd77:{:x}::/64", self.id)
+        format!("fd77:{:x}::/32", self.id)
     }
 
     /// Keep the lab (and its namespaces) around after drop, for debugging.
@@ -222,21 +243,22 @@ impl Lab {
         self.keep = true;
     }
 
-    /// Add an extra host-side address `10.77.<id>.<n>` / `fd77:<id>::<n>` on
-    /// the bridge, so that several harness-side actors (tap-tracker, tap-peers)
-    /// can present distinct IPs to the clients under test.
+    /// Add an extra host-side address `10.<id>.<n>.1` / `fd77:<id>:<n>::1`
+    /// on the bridge, so that several harness-side actors (tap-tracker,
+    /// tap-peers, tap-dht nodes) can present distinct IPs, each in its own
+    /// /24 and /64, to the clients under test.
     pub fn host_alias(&self, n: u8) -> Result<(Ipv4Addr, Ipv6Addr)> {
         if !(2..10).contains(&n) {
             bail!("host alias index must be 2..9");
         }
-        let v4 = Ipv4Addr::new(10, 77, self.id, n);
-        let v6 = Ipv6Addr::new(0xfd77, u16::from(self.id), 0, 0, 0, 0, 0, u16::from(n));
-        let _ = ip(&["addr", "add", &format!("{v4}/24"), "dev", &self.bridge]);
+        let v4 = Ipv4Addr::new(10, self.id, n, 1);
+        let v6 = Ipv6Addr::new(0xfd77, u16::from(self.id), u16::from(n), 0, 0, 0, 0, 1);
+        let _ = ip(&["addr", "add", &format!("{v4}/16"), "dev", &self.bridge]);
         let _ = ip(&[
             "-6",
             "addr",
             "add",
-            &format!("{v6}/64"),
+            &format!("{v6}/32"),
             "dev",
             &self.bridge,
             "nodad",
@@ -264,12 +286,12 @@ impl Lab {
         ])?;
         ip(&["link", "set", &veth, "master", &self.bridge, "up"])?;
         ip(&["-n", &ns, "link", "set", "lo", "up"])?;
-        let v4 = shape.has_v4().then(|| Ipv4Addr::new(10, 77, self.id, idx));
+        let v4 = shape.has_v4().then(|| Ipv4Addr::new(10, self.id, idx, 1));
         let v6 = shape
             .has_v6()
-            .then(|| Ipv6Addr::new(0xfd77, u16::from(self.id), 0, 0, 0, 0, 0, u16::from(idx)));
+            .then(|| Ipv6Addr::new(0xfd77, u16::from(self.id), u16::from(idx), 0, 0, 0, 0, 1));
         if let Some(a) = v4 {
-            ip(&["-n", &ns, "addr", "add", &format!("{a}/24"), "dev", "eth0"])?;
+            ip(&["-n", &ns, "addr", "add", &format!("{a}/16"), "dev", "eth0"])?;
         } else {
             // v6-only: make sure nothing can even bind v4 on the lab interface.
             let _ = ip(&[
@@ -288,7 +310,7 @@ impl Lab {
                 "-6",
                 "addr",
                 "add",
-                &format!("{a}/64"),
+                &format!("{a}/32"),
                 "dev",
                 "eth0",
                 "nodad",

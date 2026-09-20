@@ -129,10 +129,129 @@ pub struct Fingerprint {
     pub udp: Option<UdpFingerprint>,
     pub mse: Option<MseFingerprint>,
     pub pex: Option<PexFingerprint>,
+    pub dht: Option<DhtFingerprint>,
     /// L1 (Q19): the handshake carried the same peer id as the announce for
     /// the same torrent. libtorrent 2.0 uses a fresh id per connection, so
     /// this is `false` for the oracle. Set by scenarios that observe both.
     pub handshake_id_is_announce_id: Option<bool>,
+}
+
+/// What a DHT node the client bootstraps from (and one it probes) can tell
+/// (BEP 5 shape, libtorrent-specific fields). Ids, tokens, transaction ids
+/// and endpoints are random / environmental and never compared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DhtFingerprint {
+    /// L1: the `v` on every message, hex.
+    pub version_hex: Option<String>,
+    /// L2: transaction id length on queries.
+    pub tid_len: Option<usize>,
+    /// L2: top-level and `a` keys of the first query to a router.
+    pub bootstrap_shape: Option<String>,
+    /// L2: every distinct `get_peers` argument key set seen (sorted).
+    pub lookup_shapes: Vec<String>,
+    /// L2: `announce_peer` argument key set and the `seed` values seen, in order.
+    pub announce_shape: Option<String>,
+    pub announce_seed_values: Vec<i64>,
+    /// L2: what our node answers to each probe: `probe kind -> shape`, where
+    /// shape is `y=<y> top=[..] body=[..]` plus the error code / text.
+    pub probe_replies: Vec<(String, String)>,
+    /// L2: position of the peer-wire `port` message among the first messages
+    /// (`None` when never sent).
+    pub port_position: Option<usize>,
+}
+
+/// Build the DHT fingerprint from a tap node's events: `ips` are the client's
+/// addresses, `probes` the `(kind, reply)` pairs a scenario collected.
+pub fn dht_fingerprint(
+    events: &[crate::tap::dht::DhtEvent],
+    ips: &[IpAddr],
+    probes: &[(String, Option<crate::bencode::Value>)],
+    peer_capture: Option<&PeerCapture>,
+) -> Option<DhtFingerprint> {
+    let ours: Vec<&crate::tap::dht::DhtEvent> = events
+        .iter()
+        .filter(|e| e.dir == "recv" && ips.contains(&e.remote.ip()))
+        .collect();
+    if ours.is_empty() {
+        return None;
+    }
+    let keys = |v: &serde_json::Value| -> String {
+        v.as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
+            .unwrap_or_default()
+    };
+    let shape_of = |d: &serde_json::Value| -> String {
+        let y = d.get("y").and_then(|y| y.as_str()).unwrap_or("?");
+        let body = d
+            .get("a")
+            .or_else(|| d.get("r"))
+            .map(keys)
+            .unwrap_or_default();
+        let mut s = format!("y={y} top=[{}] body=[{body}]", keys(d));
+        if let Some(e) = d.get("e").and_then(|e| e.as_array()) {
+            s.push_str(&format!(" e={e:?}"));
+        }
+        s
+    };
+    let version_hex = ours.iter().find_map(|e| {
+        e.decoded
+            .get("v")
+            .and_then(|v| v.get("hex"))
+            .and_then(|h| h.as_str())
+            .map(str::to_string)
+    });
+    let tid_len = ours
+        .iter()
+        .find(|e| e.kind.starts_with("query:"))
+        .map(|e| e.tid_hex.len() / 2);
+    let bootstrap_shape = ours
+        .iter()
+        .find(|e| e.kind == "query:get_peers")
+        .map(|e| shape_of(&e.decoded));
+    let mut lookup_shapes: Vec<String> = ours
+        .iter()
+        .filter(|e| e.kind == "query:get_peers")
+        .map(|e| e.decoded.get("a").map(keys).unwrap_or_default())
+        .collect();
+    lookup_shapes.sort();
+    lookup_shapes.dedup();
+    let announces: Vec<&&crate::tap::dht::DhtEvent> = ours
+        .iter()
+        .filter(|e| e.kind == "query:announce_peer")
+        .collect();
+    let announce_shape = announces.first().map(|e| shape_of(&e.decoded));
+    let mut announce_seed_values: Vec<i64> = announces
+        .iter()
+        .filter_map(|e| e.decoded.get("a")?.get("seed")?.as_i64())
+        .collect();
+    announce_seed_values.dedup();
+    let probe_replies = probes
+        .iter()
+        .map(|(k, r)| {
+            (
+                k.clone(),
+                r.as_ref()
+                    .map(|v| shape_of(&crate::peerwire::value_to_json(v)))
+                    .unwrap_or_else(|| "no reply".into()),
+            )
+        })
+        .collect();
+    let port_position = peer_capture.and_then(|c| {
+        c.events
+            .iter()
+            .filter(|e| e.dir == "recv" && e.kind != "handshake")
+            .position(|e| e.kind == "port")
+    });
+    Some(DhtFingerprint {
+        version_hex,
+        tid_len,
+        bootstrap_shape,
+        lookup_shapes,
+        announce_shape,
+        announce_seed_values,
+        probe_replies,
+        port_position,
+    })
 }
 
 /// Whether the handshake id of a peer capture equals the announce id: the
@@ -451,6 +570,27 @@ pub fn diff(a: &Fingerprint, b: &Fingerprint) -> Vec<String> {
         (None, None) => {}
         _ => out.push("tracker observation missing on one side".into()),
     }
+    match (&a.dht, &b.dht) {
+        (Some(x), Some(y)) => {
+            macro_rules! cmp {
+                ($field:ident, $label:expr) => {
+                    if x.$field != y.$field {
+                        out.push(format!("{}: {:?} vs {:?}", $label, x.$field, y.$field));
+                    }
+                };
+            }
+            cmp!(version_hex, "L1 dht version (v)");
+            cmp!(tid_len, "L2 dht transaction id length");
+            cmp!(bootstrap_shape, "L2 dht bootstrap query shape");
+            cmp!(lookup_shapes, "L2 dht get_peers argument sets");
+            cmp!(announce_shape, "L2 dht announce_peer shape");
+            cmp!(announce_seed_values, "L2 dht announce seed flags");
+            cmp!(probe_replies, "L2 dht replies to probes");
+            cmp!(port_position, "L2 peer-wire port message position");
+        }
+        (None, None) => {}
+        _ => out.push("dht observation missing on one side".into()),
+    }
     match (&a.udp, &b.udp) {
         (Some(x), Some(y)) => {
             macro_rules! cmp {
@@ -708,6 +848,7 @@ mod tests {
             "GET /announce?info_hash=%88%3A%1E%EC%C0%C4%8Fj%ED%C0jPi%8ABD%AB%8A%B8%BF&peer_id=-TR4110-4fpjabbr2ey8&port=51413&uploaded=0&downloaded=0&left=4194304&numwant=80&key=59FC7E97&compact=1&supportcrypto=1&event=started HTTP/1.1",
         );
         let fp = Fingerprint {
+            dht: None,
             tracker: tracker_fingerprint(&[tr], &["10.0.0.11".parse().unwrap()]),
             peer: None,
             udp: None,
@@ -717,6 +858,7 @@ mod tests {
         };
         let d = diff(
             &Fingerprint {
+                dht: None,
                 tracker: oracle.tracker.clone(),
                 peer: None,
                 udp: None,
@@ -786,6 +928,7 @@ mod tests {
             response_hex: String::new(),
         };
         let fp = Fingerprint {
+            dht: None,
             tracker: tracker_fingerprint(&[ev], &["10.0.0.11".parse().unwrap()]),
             peer: None,
             udp: None,
@@ -795,6 +938,7 @@ mod tests {
         };
         let d = diff(
             &Fingerprint {
+                dht: None,
                 tracker: oracle.tracker.clone(),
                 peer: None,
                 udp: None,

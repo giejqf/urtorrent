@@ -38,6 +38,7 @@ fn leech_from_seeder_via_tracker() {
             .listen_port(0)
             .listen_v4(Some(Ipv4Addr::LOCALHOST))
             .listen_v6(None)
+            .dht(false)
             .profile(profile::Profile::qbt_5_2_3_lt2_0_14())
             .build(),
     )
@@ -142,6 +143,7 @@ fn leech_from_seeder_via_tracker() {
             .listen_port(0)
             .listen_v4(Some(Ipv4Addr::LOCALHOST))
             .listen_v6(None)
+            .dht(false)
             .build(),
     )
     .unwrap();
@@ -166,6 +168,7 @@ fn leech_from_seeder_via_tracker() {
             .listen_port(0)
             .listen_v4(Some(Ipv4Addr::LOCALHOST))
             .listen_v6(None)
+            .dht(false)
             .build(),
     )
     .unwrap();
@@ -195,6 +198,7 @@ fn add_twice_is_duplicate_and_magnets_wait_for_metadata() {
             .listen_port(0)
             .listen_v4(Some(Ipv4Addr::LOCALHOST))
             .listen_v6(None)
+            .dht(false)
             .build(),
     )
     .unwrap();
@@ -273,6 +277,7 @@ fn peer_id_lifetime_follows_the_profile() {
                 .listen_port(0)
                 .listen_v4(Some(Ipv4Addr::LOCALHOST))
                 .listen_v6(None)
+                .dht(false)
                 .profile(profile.clone())
                 .build(),
         )

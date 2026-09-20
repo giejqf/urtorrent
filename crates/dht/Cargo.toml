@@ -1,0 +1,23 @@
+[package]
+name = "dht"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Mainline DHT (BEP 5, 42, 43, 51) node as a sans-IO state machine for urtorrent"
+
+[lints]
+workspace = true
+
+[dependencies]
+bencode = { path = "../bencode", version = "0.3.0" }
+metainfo = { path = "../metainfo", version = "0.3.0" }
+profile = { path = "../profile", version = "0.3.0" }
+sha1.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

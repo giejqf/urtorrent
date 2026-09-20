@@ -14,8 +14,9 @@ that trackers and peers see nothing unusual.
 
 - Torrent creation, RSS, search, web UI, GUI, scheduler, IP-filter file formats.
 - Any OS other than Linux. No epoll/kqueue/IOCP fallback. Do not add one.
-- **DHT (BEP 5/32) and uTP (BEP 29) are out of scope for 0.1.0** (maintainer decision,
-  2026-09-19). 0.1.0 is TCP-only and tracker/PEX/LSD-driven. Keep the design open for them.
+- **DHT (BEP 5/32) and uTP (BEP 29) were out of scope for 0.1.0** (maintainer decision,
+  2026-09-19): 0.1.0 was TCP-only and tracker/PEX/LSD-driven. The DHT shipped in 0.3.0
+  (ADR 0007); uTP is still open. Keep the design open for uTP.
 - I2P, SOCKS/HTTP proxies, SSL torrents, share mode, super-seeding (revisit later if asked).
 - BEP 52 (v2/hybrid) is *deferred*, not rejected. See section 4.
 
@@ -114,12 +115,14 @@ Tiering reflects what public BT and private-tracker (PT) communities actually us
 
 **Tier 3 - post-0.1.0, design must not preclude**
 
-BEP 5/32 DHT, BEP 29 uTP, BEP 55 `ut_holepunch` (needs uTP to be useful), BEP 52 v2/hybrid
-torrents (merkle trees, SHA-256), BEP 17 web seeds, UPnP/NAT-PMP/PCP port mapping.
+BEP 5/32 DHT (**done in 0.3.0**: BEP 5, 42, 43, 51 and libtorrent's extras; BEP 44 items
+are a documented gap, docs/quirks.md Q20), BEP 29 uTP, BEP 55 `ut_holepunch` (needs uTP
+to be useful), BEP 52 v2/hybrid torrents (merkle trees, SHA-256), BEP 17 web seeds,
+UPnP/NAT-PMP/PCP port mapping.
 
 "Must not preclude" concretely: the listen port's UDP socket is owned by `uring` with a
-demultiplexer hook (UDP tracker today; DHT/uTP later), and `session` talks to peers
-through a transport trait that TCP implements today.
+demultiplexer hook (UDP tracker and DHT today; uTP later), and `session` talks to peers
+through a `Transport` enum that TCP implements today (ADR 0006).
 
 Note: the libtorrent 2.0 oracle speaks v2. If a Tier-1/2 capture shows v2-related bits on
 v1-only torrents, that becomes a fidelity item and gets pulled forward; otherwise v2 waits.
@@ -135,7 +138,8 @@ crates/
   wire/        peer protocol codec + per-connection state machine   (sans-IO)
   mse/         encryption handshake + RC4 stream                    (sans-IO)
   tracker/     HTTP + UDP announce/scrape builders and parsers      (sans-IO)
-  (dht/, utp/  reserved names, post-0.1.0)
+  dht/         Mainline DHT node (BEP 5/42/43/51), sans-IO                (0.3.0)
+  (utp/        reserved name, post-0.3.0)
   picker/      piece picker, request scheduling
   profile/     identity profiles as data (section 6)
   uring/       io_uring reactor, buffer pools, timers, TCP/UDP/file ops
@@ -404,8 +408,8 @@ Each milestone ends with its integration scenarios green in CI.
   *PT-complete: private-tracker users are fully served here.*
 - **M6 Extensions.** PEX, `ut_metadata`/magnet, `upload_only`, LSD, web seeds, BEP 40.
 - **M7 0.1.0 hardening.** Soak, perf, fuzz time, API review, docs. **Release 0.1.0.**
-- **Post-0.1.0:** DHT, uTP (+ holepunch), BEP 52, port mapping, each as its own minor
-  release (0.2.0, 0.3.0, ...).
+- **Post-0.1.0:** each as its own minor release: 0.2.0 performance pass (done), 0.3.0 DHT
+  (done), then uTP (+ holepunch), BEP 52, port mapping.
 
 ## 9. Working conventions
 
@@ -456,6 +460,7 @@ Each milestone ends with its integration scenarios green in CI.
 ### Decided by the maintainer (2026-09-19)
 
 - **0.1.0 scope excludes DHT and uTP.** TCP-only; peers come from trackers, PEX, LSD.
+  (The DHT followed in 0.3.0; uTP is still open.)
 - **io_uring is mandatory on every performance-critical path with no fallback of any
   kind** (no epoll, kqueue, IOCP, poll). Non-critical work such as DNS may use whatever
   works. Details and enforcement in 5.3.

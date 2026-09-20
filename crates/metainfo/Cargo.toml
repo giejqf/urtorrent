@@ -12,7 +12,7 @@ description = "Torrent metainfo and magnet parsing, file tree and piece/file spa
 workspace = true
 
 [dependencies]
-bencode = { path = "../bencode", version = "0.2.0" }
+bencode = { path = "../bencode", version = "0.3.0" }
 thiserror.workspace = true
 sha1.workspace = true
 

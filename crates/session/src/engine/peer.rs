@@ -429,6 +429,7 @@ fn connection_params(
         // end of this connection (v4 matches while nothing is voted).
         advertise_port: ctx.advertise_port_for(local_ip),
         private: t.private,
+        dht_port: ctx.dht.as_ref().map(|d| d.port()),
     }
 }
 
@@ -1228,7 +1229,15 @@ async fn handle_event(
                 _ => {}
             }
         }
-        WireEvent::NotInterested | WireEvent::Port(_) | WireEvent::KeepAlive => {}
+        WireEvent::Port(port) => {
+            // BEP 5: the peer's DHT node (libtorrent `incoming_dht_port`).
+            if let Some(d) = ctx.dht.clone()
+                && port != 0
+            {
+                d.add_node(ctx, SocketAddr::new(handle.addr.ip(), port));
+            }
+        }
+        WireEvent::NotInterested | WireEvent::KeepAlive => {}
     }
     Ok(())
 }

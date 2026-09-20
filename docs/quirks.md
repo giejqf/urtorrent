@@ -13,11 +13,14 @@ Capture: `testkit/golden/capture_peer_plain/*/tap-peer-plain-oracle-initiator.js
 DHT enabled (`capture_defaults`). libtorrent sets the DHT bit from the
 `enable_dht`-independent "DHT support compiled in" state.
 
-Consequence for 0.1.0 (no DHT): the qbt profile advertises the DHT bit for
-L1/L2 exactness. We never send `PORT`, and we ignore incoming `PORT`. The
-oracle itself does not send `PORT` to a peer whose reserved bits lack DHT
-(`capture_defaults`: no `port` message received by tap-peer), so a peer that
-does not advertise DHT is never misled.
+Consequence: the qbt profile advertises the DHT bit unconditionally for
+L1/L2 exactness (the `native` profile only while a DHT node runs). Until
+0.3.0 we never sent `PORT`; since 0.3.0 `PORT` follows the oracle's rules
+(Q20): sent only while a DHT node runs, so with the DHT disabled the bit is
+advertised and `PORT` is not sent, exactly like the oracle with
+`DHTEnabled=false`. The oracle does not send `PORT` to a peer whose reserved
+bits lack DHT (`capture_defaults`: no `port` message received by tap-peer), so
+a peer that does not advertise DHT is never misled.
 
 ## Q2. LTEP `m` advertises `ut_holepunch`, `share_mode`, `lt_donthave`
 
@@ -275,3 +278,46 @@ trackers see the torrent's own `m_peer_id`. Two consequences we mirror:
 
 Pinned in `crates/wire/tests/replay.rs`; the discriminator compares
 "handshake id equals announce id" between the oracle and us.
+
+## Q20. DHT (BEP 5) wire shape: libtorrent's extras
+
+Capture: `testkit/golden/capture_dht/{v4,v6}/tap-dht-*.jsonl` (oracle with DHT
+on and uTP off, bootstrapped from a tap DHT node, probed with every query
+kind). Confirmed in libtorrent 2.0.14 `rpc_manager.cpp`, `node.cpp`,
+`refresh.cpp`, `get_peers.cpp`. Everything here is mirrored by `crates/dht`
+and checked byte-for-byte or by shape in `dht_shape` (`xtask diff`):
+
+- **`v` on every message** is `"LT"` + `0x02` + `0x0e` (`4c 54 02 0e`):
+  `LT` + major byte + `(minor << 4 | tiny)` for 2.0.14. It is *not* derived
+  from the peer-id fingerprint. Profile data: `DhtShape::version`.
+- **Transaction ids** are 2 random bytes.
+- **Responses carry `ip`** (6 / 18 byte compact endpoint of the requester,
+  BEP 42) and **`r.p`** (the requester's port as an integer) on every reply.
+- **Errors keep `r`**: once the top level parsed, an error reply is `{e,
+  ip, r: {id, p}, t, v, y: "e"}` — the `r` dictionary built before the query
+  was rejected stays in. Error texts come from `verify_message`: `missing
+  'target' key`, `invalid value for 'info_hash'`, plus `invalid token`,
+  `invalid port`, `unknown message`. Code 203 for all of them.
+- **Unknown methods with a `target` or `info_hash` argument are answered
+  with nodes**, not an error; only an unknown method without one gets
+  `unknown message`.
+- **Bootstrap** is a `get_peers` traversal for the node's own id with a
+  random secret tail, and queries to the *router* nodes carry `a.bs: 1`
+  (non-router nodes reached during the same traversal do not).
+- **A seed's lookup asks for `noseed: 1`** and its `announce_peer` says
+  `seed: 1`; a leecher's lookup has neither and announces `seed: 0`. With
+  uTP disabled the announce has no `implied_port` and `port` is the TCP
+  listen port. After finishing a download the torrent is re-announced as a
+  seed within seconds.
+- **Refresh**: every 5 s one routing-table node is probed with `get_peers`
+  for a random id in its bucket's range (`ping` when the bucket is full);
+  routers never enter the routing table and never receive refreshes.
+- **`port` (peer wire)** is sent right after the have-state to a peer whose
+  handshake has the DHT bit, only while a DHT node runs, and in reply to a
+  `port` from a peer that did not advertise the bit. With DHT disabled the
+  oracle still advertises the bit (Q1) but never sends `port`.
+
+Capability gap: BEP 44 `put` is not implemented (we answer `unknown
+message`; the oracle stores the item). `get` is answered like the oracle's
+"no such item" reply (nodes + token). A DHT-aware discriminator that probes
+`put` would tell us apart; `dht_shape` does not.

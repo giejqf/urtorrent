@@ -15,12 +15,15 @@
 
 ## The lab
 
-`testkit::lab` builds a bridge on the host (`urt<id>`) with a private v4 and
-v6 subnet and a network namespace per actor (see ADR 0002). Client actors
+`testkit::lab` builds a bridge on the host (`urt<id>`) with a private v4 /16
+and v6 /32 and a network namespace per actor (see ADR 0002). Client actors
 (oracle, transmission, our client) each get a namespace and one address per
-family the shape asks for. Harness-side actors (tap-tracker, tap-peer,
+family the shape asks for, in their own /24 and /64 (`10.<id>.<n>.1`,
+`fd77:<id>:<n>::1`): libtorrent's DHT keeps one node per /24 or /64 per
+bucket and per lookup, so distinct prefixes are what make multi-hop DHT
+behaviour observable. Harness-side actors (tap-tracker, tap-peer, tap-dht,
 opentracker) run in the harness process or as host processes bound to bridge
-addresses (`.1` plus aliases `.2`-`.9`).
+addresses (`10.<id>.0.1` plus aliases `10.<id>.<2..9>.1`).
 
 The library under test runs as the `urt-client` binary (`testkit/src/bin`),
 launched into its own namespace like the oracle. It writes a JSON status
@@ -75,16 +78,23 @@ identity and wire shape (AGENTS.md 6). Formats:
 - `tap-peer*.jsonl`: one `PeerCapture` per connection: both handshakes
   (raw + decoded reserved bits), every message in order with direction,
   timestamps and raw frame (except piece payloads), decoded LTEP dictionaries.
+- `tap-dht*.jsonl`: one `DhtEvent` per KRPC datagram either way: direction,
+  kind (`query:<q>` / `response` / `error`), transaction id, raw bytes and
+  the decoded dictionary (binary strings as hex). `capture_dht` also records
+  the oracle's replies to a fixed probe list (every query kind, good and
+  bad); the `dht_shape` scenario replays that list against us.
 
 Bumping `testkit/oracle.lock` regenerates all of them in the same PR.
 
 ## The discriminator
 
-`testkit::discriminator` turns tap-tracker events and tap-peer captures into
-a `Fingerprint` (L1 identifiers and L2 wire shape only: peer-id prefix,
-`User-Agent`, header and parameter order, escape style, `key` format,
-`numwant`/flags, reserved bits, LTEP `m`/keys/`reqq`/`v`, the first-messages
-sequence). `diff(a, b)` lists the tells; `classify` compares against the
+`testkit::discriminator` turns tap-tracker events, tap-peer captures and
+tap-dht events into a `Fingerprint` (L1 identifiers and L2 wire shape only:
+peer-id prefix, `User-Agent`, header and parameter order, escape style,
+`key` format, `numwant`/flags, reserved bits, LTEP `m`/keys/`reqq`/`v`, the
+first-messages sequence; for the DHT the `v` tag, transaction id length,
+bootstrap / lookup / announce argument sets, replies to the probe list and
+the `port` position). `diff(a, b)` lists the tells; `classify` compares against the
 oracle's fingerprint computed from the committed goldens. `diff_identity`
 runs the oracle, us (qbt and native) and Transmission through the same taps
 and asserts the discriminator separates exactly the right ones. When a new

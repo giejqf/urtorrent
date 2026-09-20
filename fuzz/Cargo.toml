@@ -16,6 +16,7 @@ wire = { path = "../crates/wire" }
 tracker = { path = "../crates/tracker" }
 profile = { path = "../crates/profile" }
 mse = { path = "../crates/mse" }
+dht = { path = "../crates/dht" }
 
 [[bin]]
 name = "bencode_decode"
@@ -130,3 +131,10 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "dht_krpc"
+path = "fuzz_targets/dht_krpc.rs"
+test = false
+doc = false
+bench = false

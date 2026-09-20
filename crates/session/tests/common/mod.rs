@@ -159,6 +159,7 @@ pub fn spawn_seeder(info_hash: [u8; 20], data: Arc<Vec<u8>>, piece_len: usize) -
                     metadata_size: None,
                     advertise_port: true,
                     private: false,
+                    dht_port: None,
                 });
                 stream
                     .set_read_timeout(Some(Duration::from_secs(20)))

@@ -1046,6 +1046,12 @@ fn start_tasks(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
     ctx.schedule_tick(torrent);
     super::lsd::announce_now(ctx, torrent);
     super::webseed::start(ctx, torrent);
+    if let Some(d) = &ctx.dht {
+        let t = torrent.borrow();
+        if !t.private {
+            d.announce_soon(t.id);
+        }
+    }
 }
 
 /// `Session::resume`.
@@ -1521,6 +1527,12 @@ fn maybe_finished(ctx: &Ctx, t: &mut Torrent, now: Instant) -> bool {
     if t.picker.is_seed() {
         t.announcer.completed(now);
         t.tracker_kick.notify();
+        // The oracle re-announces to the DHT as a seed right after finishing.
+        if let Some(d) = &ctx.dht
+            && !t.private
+        {
+            d.announce_soon(t.id);
+        }
     }
     tracing::info!(
         torrent = t.id.0,

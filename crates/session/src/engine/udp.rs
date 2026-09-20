@@ -2,10 +2,11 @@
 // Copyright (c) 2026 urtorrent contributors
 
 //! The listen port's UDP sockets (one per family) and their demultiplexer
-//! (AGENTS.md 4: owned by the ring, with a hook for DHT / uTP later). Today
-//! the only consumer is the BEP 15 UDP tracker: requests register a waiter
-//! keyed by `(tracker address, transaction id)` and the receive loop hands
-//! replies over; anything else is dropped at `trace`.
+//! (AGENTS.md 4: owned by the ring, with a hook for DHT / uTP). Consumers:
+//! the BEP 15 UDP tracker (requests register a waiter keyed by `(tracker
+//! address, transaction id)` and the receive loop hands replies over) and the
+//! DHT (every datagram that is a bencoded dictionary). Anything else is
+//! dropped at `trace`; uTP would hook in the same way.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -35,12 +36,18 @@ struct Sock {
     v6: bool,
 }
 
+/// A consumer of datagrams that are not tracker replies: `(from, packet,
+/// arrived on the v6 socket)`.
+pub type DhtHook = Box<dyn Fn(SocketAddr, &[u8], bool)>;
+
 /// The demultiplexer.
 pub struct UdpDemux {
     socks: Vec<Sock>,
     waiters: RefCell<Waiters>,
     cache: RefCell<ConnectionCache>,
     next_tid: Cell<u32>,
+    /// KRPC (bencoded dictionary) datagrams go here.
+    dht: RefCell<Option<DhtHook>>,
 }
 
 impl UdpDemux {
@@ -77,6 +84,7 @@ impl UdpDemux {
             waiters: RefCell::new(HashMap::new()),
             cache: RefCell::new(ConnectionCache::default()),
             next_tid: Cell::new(seed | 1),
+            dht: RefCell::new(None),
         }
     }
 
@@ -124,7 +132,34 @@ impl UdpDemux {
         }
     }
 
+    /// Install the DHT consumer.
+    pub fn set_dht_hook(&self, hook: DhtHook) {
+        *self.dht.borrow_mut() = Some(hook);
+    }
+
+    /// Send a datagram (fire and forget, through the ring).
+    pub fn send_raw(&self, to: SocketAddr, payload: Vec<u8>) {
+        let Some(sock) = self.sock_for(to.ip()) else {
+            return;
+        };
+        let socket = sock.socket.clone();
+        uring::spawn(async move {
+            let (r, _) = socket.send_to(Buffer::from_vec(payload), to).await;
+            if let Err(e) = r {
+                tracing::trace!(%to, "udp send failed: {e}");
+            }
+        });
+    }
+
     fn dispatch(&self, from: SocketAddr, pkt: &[u8], v6: bool) {
+        // KRPC messages are bencoded dictionaries; tracker replies never
+        // start with 'd' (their first field is a big-endian action).
+        if pkt.first() == Some(&b'd') {
+            if let Some(h) = self.dht.borrow().as_ref() {
+                h(from, pkt, v6);
+            }
+            return;
+        }
         match udp::parse_reply(pkt, v6) {
             Ok(reply) => {
                 let key = (from, reply.transaction_id());
@@ -143,7 +178,7 @@ impl UdpDemux {
                     None => tracing::trace!(%from, "unmatched udp tracker reply"),
                 }
             }
-            // Not a tracker reply: DHT / uTP demux hook goes here (post-0.1.0).
+            // Not a tracker reply and not KRPC: uTP demux hook goes here (post-0.3.0).
             Err(_) => tracing::trace!(%from, len = pkt.len(), "udp datagram ignored"),
         }
     }

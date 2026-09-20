@@ -902,14 +902,23 @@ fn web_seed_only(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Rule 2 on the wire: with PEX and LSD enabled in the session, a private
-/// torrent produces no LSD datagram and no `ut_pex` message from us, and our
-/// LTEP handshake advertises neither `ut_pex` nor `ut_metadata` (Q11). The
-/// oracle seeds; a silent tap peer (with `p`) connects to us and records
-/// everything we send; a pcap on the bridge records every multicast datagram.
+/// Rule 2 on the wire: with DHT, PEX and LSD enabled in the session, a
+/// private torrent produces no DHT lookup or announce, no LSD datagram and no
+/// `ut_pex` message from us, and our LTEP handshake advertises neither
+/// `ut_pex` nor `ut_metadata` (Q11). The oracle seeds; a silent tap peer
+/// (with `p`) connects to us and records everything we send; a tap DHT node
+/// is our bootstrap router and records every KRPC message from us; a pcap on
+/// the bridge records every multicast datagram.
 fn private_no_pex_lsd(ctx: &mut Ctx) -> Result<()> {
     let pcap_path = ctx.file("private.pcap");
     let pcap = Pcap::start(ctx.lab.bridge(), &pcap_path, "udp port 6771")?;
+    let router_ip = ctx.host_alias(4)?;
+    let router = crate::tap::dht::TapDht::start(
+        crate::tap::dht::TapDhtConfig::new(vec![SocketAddr::new(router_ip, 6881)])
+            .node_id([0xd4; 20])
+            .learn(true),
+    )?;
+    let router_addr = router.local_addrs()[0];
     let tracker = tap_tracker(ctx)?;
     let fx = Arc::new(Fixture::generate(
         FixtureSpec::small("private.bin")
@@ -938,6 +947,7 @@ fn private_no_pex_lsd(ctx: &mut Ctx) -> Result<()> {
             .profile("qbt")
             .lsd(true)
             .pex(true)
+            .dht_bootstrap(vec![router_addr])
             .download_limit(256 * 1024),
         &torrent_path,
     )?;
@@ -1011,13 +1021,49 @@ fn private_no_pex_lsd(ctx: &mut Ctx) -> Result<()> {
         "private torrent produced PEX/LSD events: {:?}",
         st.events
     );
-    // 2. No LSD datagram from us on the wire.
+    // 2. The DHT ran (we bootstrapped from the router) but never looked the
+    // private torrent up or announced it.
+    let our_ips = client.actor.addrs();
+    let krpc = router.events();
+    let from_us: Vec<_> = krpc
+        .iter()
+        .filter(|e| e.dir == "recv" && our_ips.contains(&e.remote.ip()))
+        .collect();
+    ensure!(
+        from_us.iter().any(|e| e.kind == "query:get_peers"),
+        "our DHT node never queried the router: the check would be vacuous"
+    );
+    let ih_hex = fx.info_hash_hex();
+    let about_private: Vec<String> = from_us
+        .iter()
+        .filter(|e| {
+            e.kind == "query:announce_peer"
+                || e.body()
+                    .and_then(|b| b.get("info_hash"))
+                    .and_then(|h| h.get("hex"))
+                    .and_then(|h| h.as_str())
+                    == Some(ih_hex.as_str())
+        })
+        .map(|e| format!("{} {}", e.kind, e.decoded))
+        .collect();
+    ctx.note(format!(
+        "krpc from us: {} messages, {} about the private torrent",
+        from_us.len(),
+        about_private.len()
+    ));
+    ensure!(
+        about_private.is_empty(),
+        "DHT traffic about a private torrent: {about_private:?}"
+    );
+    let p = ctx.file("tap-dht-private.jsonl");
+    router.save_jsonl(&p)?;
+    ctx.artifact("tap-dht-private.jsonl", &p);
+    // 3. No LSD datagram from us on the wire.
     let mut pcap = pcap;
     if let Some(p) = pcap.as_mut() {
         p.stop();
         std::thread::sleep(Duration::from_millis(300));
         let packets = lsd_packets(&pcap_path)?;
-        let our_ips = client.actor.addrs();
         let ours: Vec<_> = packets
             .iter()
             .filter(|(ip, _)| our_ips.contains(ip))
