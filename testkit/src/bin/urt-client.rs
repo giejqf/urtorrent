@@ -203,6 +203,10 @@ async fn main() -> Result<()> {
                     "reannounce" => session.force_reannounce(id).await?,
                     "save-resume" => session.save_resume_data(id).await?,
                     "recheck" => session.force_recheck(id).await?,
+                    "scrape" => {
+                        let r = session.scrape(id).await?;
+                        tracing::info!("scrape: {r:?}");
+                    }
                     other => tracing::warn!("unknown control command {other}"),
                 }
             }

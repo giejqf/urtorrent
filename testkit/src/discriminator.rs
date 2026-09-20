@@ -67,11 +67,71 @@ pub struct PeerFingerprint {
     pub first_messages: Vec<String>,
 }
 
+/// What a UDP tracker can tell from a client's datagrams (BEP 15 field
+/// values; transaction and connection ids are random by design).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UdpFingerprint {
+    /// Action sequence of the first datagrams (connect, announce, ...).
+    pub first_actions: Vec<u32>,
+    /// `num_want` on a started announce.
+    pub num_want: Option<i32>,
+    /// `num_want` on `stopped`.
+    pub num_want_stopped: Option<i32>,
+    /// `ip` field is zero.
+    pub ip_zero: Option<bool>,
+    /// The BEP 41 extension bytes after the fixed fields (URL data etc.).
+    pub extensions_hex: Option<String>,
+    /// Peer id prefix.
+    pub peer_id_prefix: Option<String>,
+    /// The announce `port` equals the datagram's source port.
+    pub port_is_source: Option<bool>,
+}
+
 /// A client's observable identity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fingerprint {
     pub tracker: Option<TrackerFingerprint>,
     pub peer: Option<PeerFingerprint>,
+    pub udp: Option<UdpFingerprint>,
+}
+
+/// Build a UDP fingerprint from the datagrams sent by `ips`.
+pub fn udp_fingerprint(events: &[TapEvent], ips: &[IpAddr]) -> Option<UdpFingerprint> {
+    let ours: Vec<&TapEvent> = events
+        .iter()
+        .filter(|e| e.transport == "udp" && ips.contains(&e.from.ip()) && e.udp.is_some())
+        .collect();
+    if ours.is_empty() {
+        return None;
+    }
+    let first_actions = ours
+        .iter()
+        .take(2)
+        .filter_map(|e| e.udp.as_ref().map(|u| u.action))
+        .collect();
+    let announces: Vec<(&TapEvent, &crate::tap::tracker::UdpAnnounce)> = ours
+        .iter()
+        .filter_map(|e| {
+            e.udp
+                .as_ref()
+                .and_then(|u| u.announce.as_ref())
+                .map(|a| (*e, a))
+        })
+        .collect();
+    let started = announces
+        .iter()
+        .find(|(_, a)| a.event == 2)
+        .or(announces.first());
+    let stopped = announces.iter().find(|(_, a)| a.event == 3);
+    Some(UdpFingerprint {
+        first_actions,
+        num_want: started.map(|(_, a)| a.num_want),
+        num_want_stopped: stopped.map(|(_, a)| a.num_want),
+        ip_zero: started.map(|(_, a)| a.ip == 0),
+        extensions_hex: started.map(|(_, a)| a.extensions_hex.clone()),
+        peer_id_prefix: started.map(|(_, a)| a.peer_id.chars().take(8).collect()),
+        port_is_source: started.map(|(e, a)| a.port == e.from.port()),
+    })
 }
 
 fn query<'a>(e: &'a TapEvent, key: &str) -> Option<&'a str> {
@@ -278,6 +338,30 @@ pub fn diff(a: &Fingerprint, b: &Fingerprint) -> Vec<String> {
         (None, None) => {}
         _ => out.push("tracker observation missing on one side".into()),
     }
+    match (&a.udp, &b.udp) {
+        (Some(x), Some(y)) => {
+            macro_rules! cmp {
+                ($field:ident, $label:expr) => {
+                    if x.$field != y.$field {
+                        out.push(format!("{}: {:?} vs {:?}", $label, x.$field, y.$field));
+                    }
+                };
+            }
+            cmp!(first_actions, "L2 udp action sequence");
+            cmp!(num_want, "L2 udp num_want");
+            cmp!(ip_zero, "L2 udp ip field");
+            cmp!(extensions_hex, "L2 udp extensions (BEP 41)");
+            cmp!(peer_id_prefix, "L1 peer-id prefix (udp)");
+            cmp!(port_is_source, "L2 udp announce port vs source port");
+            if let (Some(p), Some(q)) = (x.num_want_stopped, y.num_want_stopped)
+                && p != q
+            {
+                out.push(format!("L2 udp num_want on stopped: {p} vs {q}"));
+            }
+        }
+        (None, None) => {}
+        _ => out.push("udp observation missing on one side".into()),
+    }
     match (&a.peer, &b.peer) {
         (Some(x), Some(y)) => {
             macro_rules! cmp {
@@ -415,11 +499,13 @@ mod tests {
         let fp = Fingerprint {
             tracker: tracker_fingerprint(&[tr], &["10.0.0.11".parse().unwrap()]),
             peer: None,
+            udp: None,
         };
         let d = diff(
             &Fingerprint {
                 tracker: oracle.tracker.clone(),
                 peer: None,
+                udp: None,
             },
             &fp,
         );
@@ -485,11 +571,13 @@ mod tests {
         let fp = Fingerprint {
             tracker: tracker_fingerprint(&[ev], &["10.0.0.11".parse().unwrap()]),
             peer: None,
+            udp: None,
         };
         let d = diff(
             &Fingerprint {
                 tracker: oracle.tracker.clone(),
                 peer: None,
+                udp: None,
             },
             &fp,
         );

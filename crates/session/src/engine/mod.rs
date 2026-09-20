@@ -20,6 +20,7 @@ mod rng;
 mod tls;
 mod torrent;
 mod tracker_task;
+mod udp;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -34,7 +35,9 @@ use tokio::sync::{mpsc, oneshot};
 use uring::{BufferPool, Notifier, NotifyHandle, Runtime, TcpListener};
 
 use crate::Error;
-use crate::api::{AddTorrent, Event, PeerInfo, SessionStats, TorrentId, TorrentStatus};
+use crate::api::{
+    AddTorrent, Event, PeerInfo, SessionStats, TorrentId, TorrentStatus, TrackerStatus,
+};
 use dns::Dns;
 use local::{Either, Flag, select2};
 use torrent::Torrent;
@@ -92,6 +95,10 @@ pub enum Command {
     SaveResume(TorrentId, oneshot::Sender<Result<(), Error>>),
     ForceReannounce(TorrentId, oneshot::Sender<Result<(), Error>>),
     ForceRecheck(TorrentId, oneshot::Sender<Result<(), Error>>),
+    Scrape(
+        TorrentId,
+        oneshot::Sender<Result<Vec<TrackerStatus>, Error>>,
+    ),
     SetRateLimits(u64, u64, oneshot::Sender<()>),
     SetTorrentRateLimits(TorrentId, u64, u64, oneshot::Sender<Result<(), Error>>),
     Subscribe(mpsc::Sender<Event>),
@@ -118,6 +125,7 @@ pub struct Ctx {
     pub pool: Rc<HashPool>,
     pub dns: Dns,
     pub tls: tls::TlsClient,
+    pub udp: Rc<udp::UdpDemux>,
     pub rng: rng::Rng,
     pub kick: NotifyHandle,
     pub recv_pool: BufferPool,
@@ -301,12 +309,20 @@ pub fn run(
             let mut r = rng::RngRef(&rng);
             cfg.profile.peer_id.generate(&mut r)
         };
+        // The listen port's UDP sockets (UDP trackers now; DHT/uTP demux later).
+        let udp_demux = Rc::new(udp::UdpDemux::bind(
+            port,
+            if families.v4 { cfg.listen_v4 } else { None },
+            if families.v6 { cfg.listen_v6 } else { None },
+            (rng.next_u64() >> 32) as u32,
+        ));
         let pool = Rc::new(HashPool::new(cfg.hash_threads));
         pool.attach_notifier(kick.clone());
         let now = Instant::now();
         let ctx = Rc::new(Ctx {
             dns: Dns::new(kick.clone()),
             tls,
+            udp: udp_demux.clone(),
             up_limit: rate::Limiter::new(cfg.upload_rate, now),
             down_limit: rate::Limiter::new(cfg.download_rate, now),
             slots: Cell::new(cfg.unchoke_slots),
@@ -343,6 +359,7 @@ pub fn run(
         for l in listeners {
             uring::spawn(accept_loop(ctx.clone(), l));
         }
+        udp_demux.spawn(ctx.closing.clone());
         uring::spawn(ticker(ctx.clone()));
 
         // Command loop. The eventfd read is always in flight, so the runtime
@@ -615,6 +632,19 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 uring::spawn(async move {
                     torrent::recheck(ctx2, t).await;
                     let _ = reply.send(Ok(()));
+                });
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::Scrape(id, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let ctx2 = ctx.clone();
+                uring::spawn(async move {
+                    tracker_task::scrape_all(&ctx2, &t).await;
+                    let st = t.borrow().status(Instant::now());
+                    let _ = reply.send(Ok(st.trackers));
                 });
             }
             None => {

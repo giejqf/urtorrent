@@ -110,6 +110,8 @@ pub struct TrackerStatus {
     pub seeders: Option<u32>,
     /// Leechers reported by the tracker.
     pub leechers: Option<u32>,
+    /// Completed downloads reported by a scrape.
+    pub downloaded: Option<u32>,
     /// Time until the next scheduled announce.
     pub next_announce_in: Option<Duration>,
 }
@@ -250,6 +252,19 @@ pub enum Event {
         url: String,
         /// Peers in the reply.
         peers: usize,
+    },
+    /// A scrape answered (BEP 48).
+    ScrapeReply {
+        /// The torrent.
+        id: TorrentId,
+        /// Scrape URL.
+        url: String,
+        /// Seeders.
+        complete: u32,
+        /// Leechers.
+        incomplete: u32,
+        /// Completed downloads.
+        downloaded: u32,
     },
     /// A tracker announce failed.
     TrackerError {
@@ -504,6 +519,12 @@ impl Session {
     /// Re-announce as soon as each tracker's `min interval` allows.
     pub async fn force_reannounce(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::ForceReannounce(id, tx)).await?
+    }
+
+    /// Scrape every tracker of a torrent (BEP 48, HTTP and UDP). Resolves with
+    /// the updated tracker statuses once every scrape answered or failed.
+    pub async fn scrape(&self, id: TorrentId) -> Result<Vec<TrackerStatus>, Error> {
+        self.send(|tx| Command::Scrape(id, tx)).await?
     }
 
     /// Drop peers and re-hash everything on disk; the have-set is rebuilt from

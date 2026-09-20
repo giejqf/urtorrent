@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use uring::{Buffer, File, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
+use uring::{Buffer, File, Runtime, TcpListener, TcpStream, UdpSocket, sleep, spawn, timeout};
 
 #[test]
 fn tcp_loopback_echo() {
@@ -225,5 +225,33 @@ fn many_dropped_ops_stay_sound() {
             // `c` drops here too, closing through the ring.
         }
         sleep(Duration::from_millis(50)).await;
+    });
+}
+
+#[test]
+fn udp_unconnected_send_to_recv_from() {
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on(async {
+        let a = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (r, _) = a
+            .send_to(Buffer::from_vec(b"ping".to_vec()), b.local_addr())
+            .await;
+        assert_eq!(r.unwrap(), 4);
+        let (r, buf, from) = b.recv_from(Buffer::from_vec(vec![0u8; 64])).await;
+        assert_eq!(r.unwrap(), 4);
+        assert_eq!(buf.as_slice(), b"ping");
+        assert_eq!(from, Some(a.local_addr()));
+        // v6 too
+        let c = UdpSocket::bind("[::1]:0".parse().unwrap()).unwrap();
+        let d = UdpSocket::bind("[::1]:0".parse().unwrap()).unwrap();
+        let (r, _) = c
+            .send_to(Buffer::from_vec(b"pong6".to_vec()), d.local_addr())
+            .await;
+        assert_eq!(r.unwrap(), 5);
+        let (r, buf, from) = d.recv_from(Buffer::from_vec(vec![0u8; 64])).await;
+        assert_eq!(r.unwrap(), 5);
+        assert_eq!(buf.as_slice(), b"pong6");
+        assert_eq!(from, Some(c.local_addr()));
     });
 }

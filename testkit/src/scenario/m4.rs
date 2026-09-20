@@ -147,11 +147,11 @@ fn https_tracker(ctx: &mut Ctx) -> Result<()> {
     let oracle_ips = seeder.actor.addrs();
     let oracle_fp = Fingerprint {
         tracker: discriminator::tracker_fingerprint(&events, &oracle_ips),
-        peer: None,
+        ..Default::default()
     };
     let our_fp = Fingerprint {
         tracker: discriminator::tracker_fingerprint(&events, &our_ips),
-        peer: None,
+        ..Default::default()
     };
     let d = discriminator::diff(&oracle_fp, &our_fp);
     ensure!(d.is_empty(), "https announce tells: {d:?}");
@@ -295,6 +295,7 @@ fn diff_identity(ctx: &mut Ctx) -> Result<()> {
         Fingerprint {
             tracker: discriminator::tracker_fingerprint(events, ips),
             peer,
+            udp: None,
         }
     };
 

@@ -167,6 +167,7 @@ impl Torrent {
                 last_error: t.last_error,
                 seeders: t.complete,
                 leechers: t.incomplete,
+                downloaded: t.downloaded,
                 next_announce_in: t.next_announce.map(|a| a.saturating_duration_since(now)),
             })
             .collect();

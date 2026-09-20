@@ -65,6 +65,8 @@ struct Tracker {
     last_error: Option<String>,
     complete: Option<u32>,
     incomplete: Option<u32>,
+    /// Completed downloads reported by a scrape.
+    downloaded: Option<u32>,
     interval: Option<u32>,
 }
 
@@ -84,6 +86,7 @@ impl Tracker {
             last_error: None,
             complete: None,
             incomplete: None,
+            downloaded: None,
             interval: None,
         }
     }
@@ -118,6 +121,8 @@ pub struct TrackerSnapshot {
     pub complete: Option<u32>,
     /// Leechers reported.
     pub incomplete: Option<u32>,
+    /// Completed downloads reported (scrape).
+    pub downloaded: Option<u32>,
 }
 
 /// The announce scheduler for one torrent.
@@ -327,6 +332,22 @@ impl Announcer {
         t.next_announce = Some(now + Duration::from_secs(delay));
     }
 
+    /// Every tracker URL, tier by tier (for scrapes).
+    pub fn urls(&self) -> Vec<String> {
+        self.tiers.iter().flatten().map(|t| t.url.clone()).collect()
+    }
+
+    /// Record a scrape result for `url`.
+    pub fn record_scrape(&mut self, url: &str, complete: u32, incomplete: u32, downloaded: u32) {
+        for t in self.tiers.iter_mut().flatten() {
+            if t.url == url {
+                t.complete = Some(complete);
+                t.incomplete = Some(incomplete);
+                t.downloaded = Some(downloaded);
+            }
+        }
+    }
+
     /// Snapshot of every tracker, tier by tier.
     pub fn snapshot(&self) -> Vec<TrackerSnapshot> {
         let mut v = Vec::new();
@@ -342,6 +363,7 @@ impl Announcer {
                     last_error: t.last_error.clone(),
                     complete: t.complete,
                     incomplete: t.incomplete,
+                    downloaded: t.downloaded,
                 });
             }
         }

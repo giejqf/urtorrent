@@ -58,8 +58,30 @@ impl RawSockAddr {
     pub(crate) fn as_ptr(&self) -> *const libc::sockaddr {
         &self.storage as *const _ as *const libc::sockaddr
     }
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut libc::sockaddr {
+        &mut self.storage as *mut _ as *mut libc::sockaddr
+    }
     pub(crate) fn len(&self) -> libc::socklen_t {
         self.len
+    }
+    /// Full storage size (for the kernel to fill in on receive).
+    pub(crate) fn capacity(&self) -> libc::socklen_t {
+        mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t
+    }
+    /// An empty storage for the kernel to fill.
+    pub(crate) fn empty() -> RawSockAddr {
+        // SAFETY: zeroed sockaddr_storage is a valid all-zero POD.
+        RawSockAddr {
+            storage: unsafe { mem::zeroed() },
+            len: 0,
+        }
+    }
+    /// Decode a kernel-filled storage of `len` bytes.
+    pub(crate) fn to_std(&self, len: libc::socklen_t) -> Option<SocketAddr> {
+        if len == 0 {
+            return None;
+        }
+        sockaddr_to_std(&self.storage)
     }
 }
 
@@ -364,5 +386,18 @@ impl UdpSocket {
     pub async fn recv(&self, buf: Buffer) -> (Result<u32>, Buffer) {
         let (r, b) = recv(self.fd.raw(), buf).await;
         (r.map_err(Into::into), b)
+    }
+
+    /// Send a datagram to `addr` (unconnected socket, `sendmsg`).
+    pub async fn send_to(&self, buf: Buffer, addr: SocketAddr) -> (Result<u32>, Buffer) {
+        let (r, b) = reactor::send_to(self.fd.raw(), buf, RawSockAddr::from(addr)).await;
+        (r.map_err(Into::into), b)
+    }
+
+    /// Receive a datagram and its sender (`recvmsg`). The buffer is truncated
+    /// to the datagram length.
+    pub async fn recv_from(&self, buf: Buffer) -> (Result<u32>, Buffer, Option<SocketAddr>) {
+        let (r, b, from) = reactor::recv_from(self.fd.raw(), buf).await;
+        (r.map_err(Into::into), b, from)
     }
 }

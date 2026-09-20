@@ -9,8 +9,9 @@
 //! libtorrent semantics), event sequencing (`started` / `completed` exactly
 //! once / `stopped`) and failure backoff over an injected clock.
 //!
-//! Sans-IO (AGENTS.md 5.2): no sockets, no DNS, no clocks. The UDP tracker
-//! (BEP 15) and scrape (BEP 48) land in M5 in this same crate.
+//! Also: the BEP 15 UDP tracker packets and connection-id cache ([`udp`]) and
+//! BEP 48 scrape ([`scrape`]). Sans-IO (AGENTS.md 5.2): no sockets, no DNS,
+//! no clocks.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -19,6 +20,8 @@
 mod announce;
 mod announcer;
 pub mod http;
+pub mod scrape;
+pub mod udp;
 mod url;
 
 pub use announce::{AnnounceEvent, AnnounceRequest, AnnounceResponse, MAX_PEERS};

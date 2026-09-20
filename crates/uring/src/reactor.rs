@@ -474,6 +474,85 @@ mod ops {
         (r, buf)
     }
 
+    /// Resources for an unconnected UDP `sendmsg`/`recvmsg`: the buffer, the
+    /// sockaddr storage, the iovec and the msghdr all live in the slab slot
+    /// for the op's lifetime.
+    pub(crate) struct MsgRes {
+        pub buf: Buffer,
+        pub addr: crate::net::RawSockAddr,
+        pub iov: libc::iovec,
+        pub hdr: libc::msghdr,
+    }
+
+    impl MsgRes {
+        fn new(buf: Buffer, addr: crate::net::RawSockAddr) -> Box<MsgRes> {
+            // SAFETY: zeroed iovec/msghdr are valid all-zero PODs; they are
+            // filled in by `wire_up` once the box has a stable address.
+            let (iov, hdr) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+            Box::new(MsgRes {
+                buf,
+                addr,
+                iov,
+                hdr,
+            })
+        }
+
+        /// Point the msghdr at this struct's own buffer and address. Must be
+        /// called on the boxed (address-stable) value.
+        fn wire_up(&mut self) {
+            self.iov.iov_base = self.buf.as_mut_ptr() as *mut libc::c_void;
+            self.iov.iov_len = self.buf.len();
+            self.hdr.msg_name = self.addr.as_mut_ptr() as *mut libc::c_void;
+            self.hdr.msg_namelen = self.addr.capacity();
+            self.hdr.msg_iov = &mut self.iov;
+            self.hdr.msg_iovlen = 1;
+        }
+    }
+
+    /// `sendmsg` of `buf` to `addr` on an unconnected socket.
+    pub(crate) async fn send_to(
+        fd: i32,
+        buf: Buffer,
+        addr: crate::net::RawSockAddr,
+    ) -> (io::Result<u32>, Buffer) {
+        let mut res = MsgRes::new(buf, addr);
+        res.wire_up();
+        res.hdr.msg_namelen = res.addr.len();
+        let (r, res) = Op::submit(res, |b, ud| {
+            opcode::SendMsg::new(types::Fd(fd), &b.hdr as *const libc::msghdr)
+                .build()
+                .user_data(ud)
+        })
+        .await;
+        (cqe_result(r), res.buf)
+    }
+
+    /// `recvmsg` into `buf` (sized to its length); returns the filled buffer
+    /// and the sender's address.
+    pub(crate) async fn recv_from(
+        fd: i32,
+        mut buf: Buffer,
+    ) -> (io::Result<u32>, Buffer, Option<std::net::SocketAddr>) {
+        let taken = std::mem::replace(&mut buf, Buffer::from_vec(Vec::new()));
+        let mut res = MsgRes::new(taken, crate::net::RawSockAddr::empty());
+        res.wire_up();
+        let (r, mut res) = Op::submit(res, |b, ud| {
+            opcode::RecvMsg::new(types::Fd(fd), &mut b.hdr as *mut libc::msghdr)
+                .build()
+                .user_data(ud)
+        })
+        .await;
+        let result = cqe_result(r);
+        let from = match &result {
+            Ok(_) => res.addr.to_std(res.hdr.msg_namelen),
+            Err(_) => None,
+        };
+        if let Ok(n) = result {
+            res.buf.truncate(n as usize);
+        }
+        (result, res.buf, from)
+    }
+
     /// `connect` to a prepared sockaddr.
     pub(crate) async fn connect(fd: i32, addr: crate::net::RawSockAddr) -> io::Result<()> {
         let (res, _addr) = Op::submit(addr, |a, ud| {

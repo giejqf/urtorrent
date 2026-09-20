@@ -97,6 +97,9 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
     let result: Result<AnnounceResponse, String> = async {
         let url = Url::parse(&job.url).map_err(|e| e.to_string())?;
         let profile = &ctx.cfg.profile;
+        if url.scheme == "udp" {
+            return announce_udp(ctx, &url, &request).await;
+        }
         let resp = http::get(&ctx.dns, &ctx.tls, ctx.families, &url, &|u| {
             request.http_request(u, profile)
         })
@@ -146,6 +149,110 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
                 url: job.url.clone(),
                 error: e,
             });
+        }
+    }
+}
+
+/// BEP 15 announce: resolve, pick an address our UDP sockets can reach, then
+/// connect + announce through the demultiplexer.
+async fn announce_udp(
+    ctx: &Rc<Ctx>,
+    url: &Url,
+    request: &AnnounceRequest,
+) -> Result<AnnounceResponse, String> {
+    let addrs = ctx
+        .dns
+        .resolve(&url.host, url.effective_port())
+        .await
+        .map_err(|e| format!("resolve {}: {e}", url.host))?;
+    let to = addrs
+        .into_iter()
+        .find(|a| ctx.udp.supports(a.ip()))
+        .ok_or_else(|| format!("no usable address for {}", url.host))?;
+    let shape = &ctx.cfg.profile.http;
+    let numwant = if request.event == tracker::AnnounceEvent::Stopped {
+        shape.numwant_stopped
+    } else {
+        shape.numwant
+    } as i32;
+    let mut path = url.path.clone();
+    if let Some(q) = &url.query
+        && !q.is_empty()
+    {
+        path.push('?');
+        path.push_str(q);
+    }
+    ctx.udp.announce(to, request, numwant, &path).await
+}
+
+/// Scrape every tracker of the torrent, sequentially (a handful of URLs).
+pub async fn scrape_all(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
+    let (urls, hash, id) = {
+        let t = torrent.borrow();
+        (t.announcer.urls(), t.info.info_hash, t.id)
+    };
+    for announce_url in urls {
+        let Some(scrape_url) = tracker::scrape::scrape_url(&announce_url) else {
+            continue;
+        };
+        let result: Result<(u32, u32, u32), String> = async {
+            let url = Url::parse(&scrape_url).map_err(|e| e.to_string())?;
+            if url.scheme == "udp" {
+                let addrs = ctx
+                    .dns
+                    .resolve(&url.host, url.effective_port())
+                    .await
+                    .map_err(|e| format!("resolve {}: {e}", url.host))?;
+                let to = addrs
+                    .into_iter()
+                    .find(|a| ctx.udp.supports(a.ip()))
+                    .ok_or_else(|| format!("no usable address for {}", url.host))?;
+                let entries = ctx.udp.scrape(to, &[hash]).await?;
+                return entries
+                    .first()
+                    .copied()
+                    .ok_or_else(|| "empty scrape reply".to_string());
+            }
+            let profile = &ctx.cfg.profile;
+            let resp = http::get(&ctx.dns, &ctx.tls, ctx.families, &url, &|u| {
+                tracker::scrape::http_request(u, &[hash], profile)
+            })
+            .await?;
+            if !(200..300).contains(&resp.status) {
+                return Err(tracker::Error::Status(resp.status).to_string());
+            }
+            let files = tracker::scrape::parse_response(&resp.body).map_err(|e| e.to_string())?;
+            let e = files
+                .get(&hash)
+                .copied()
+                .ok_or_else(|| "scrape reply lacks our hash".to_string())?;
+            Ok((e.complete, e.downloaded, e.incomplete))
+        }
+        .await;
+        match result {
+            Ok((complete, downloaded, incomplete)) => {
+                torrent.borrow_mut().announcer.record_scrape(
+                    &announce_url,
+                    complete,
+                    incomplete,
+                    downloaded,
+                );
+                ctx.emit(Event::ScrapeReply {
+                    id,
+                    url: scrape_url,
+                    complete,
+                    incomplete,
+                    downloaded,
+                });
+            }
+            Err(e) => {
+                tracing::debug!(url = %scrape_url, "scrape failed: {e}");
+                ctx.emit(Event::TrackerError {
+                    id,
+                    url: scrape_url,
+                    error: e,
+                });
+            }
         }
     }
 }

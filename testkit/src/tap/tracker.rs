@@ -202,6 +202,8 @@ impl Swarm {
 
 struct Inner {
     config: TapTrackerConfig,
+    /// Runtime-changeable behaviour (starts as `config.behaviour`).
+    behaviour: Mutex<Behaviour>,
     start: Instant,
     events: Mutex<Vec<TapEvent>>,
     swarm: Mutex<Swarm>,
@@ -225,6 +227,7 @@ fn now_ms(start: Instant) -> u64 {
 impl TapTracker {
     pub fn start(config: TapTrackerConfig) -> Result<TapTracker> {
         let inner = Arc::new(Inner {
+            behaviour: Mutex::new(config.behaviour.clone()),
             config: config.clone(),
             start: Instant::now(),
             events: Mutex::new(Vec::new()),
@@ -336,9 +339,8 @@ impl TapTracker {
     }
 
     /// Change behaviour at runtime (e.g. take the tracker "down").
-    pub fn set_behaviour(&self, _b: Behaviour) {
-        // Behaviour is immutable after start in this version; runtime changes
-        // are done by starting a second tracker. Kept for API symmetry.
+    pub fn set_behaviour(&self, b: Behaviour) {
+        *self.inner.behaviour.lock().unwrap() = b;
     }
 
     pub fn http_url(&self, idx: usize) -> String {
@@ -496,7 +498,8 @@ impl Inner {
                 udp: None,
                 response_hex: bencode::hex(&body),
             });
-            match &self.config.behaviour {
+            let behaviour = self.behaviour.lock().unwrap().clone();
+            match &behaviour {
                 Behaviour::Silent => {
                     std::thread::sleep(Duration::from_secs(120));
                     return;
@@ -548,7 +551,7 @@ impl Inner {
         let Some(kind) = announce_key(&self.config.passkey, req.path()) else {
             return ("other", b"not found".to_vec(), 404);
         };
-        if let Behaviour::Failure(reason) = &self.config.behaviour {
+        if let Behaviour::Failure(reason) = &*self.behaviour.lock().unwrap() {
             return (kind, Self::failure(reason), 200);
         }
         let q = req.query();
@@ -675,7 +678,10 @@ impl Inner {
                 udp: view,
                 response_hex: bencode::hex(&resp),
             });
-            if matches!(self.config.behaviour, Behaviour::Silent | Behaviour::Drop) {
+            if matches!(
+                &*self.behaviour.lock().unwrap(),
+                Behaviour::Silent | Behaviour::Drop
+            ) {
                 continue;
             }
             if !resp.is_empty() {
@@ -769,7 +775,7 @@ impl Inner {
                     port,
                     extensions_hex: bencode::hex(&pkt[98..]),
                 });
-                if let Behaviour::Failure(reason) = &self.config.behaviour {
+                if let Behaviour::Failure(reason) = &*self.behaviour.lock().unwrap() {
                     return ("announce", Some(view), Self::udp_error(tid, reason));
                 }
                 let ev = match event {
