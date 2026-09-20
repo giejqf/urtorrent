@@ -64,6 +64,9 @@ pub struct AddTorrent {
     /// priorities from the resume data, or the default. For a magnet link
     /// they apply once the metadata arrives (ignored if the count differs).
     pub file_priorities: Option<Vec<u8>>,
+    /// Allocate every content file to its full size up front (`fallocate`)
+    /// instead of writing sparse files (default off).
+    pub preallocate: bool,
 }
 
 impl AddTorrent {
@@ -76,6 +79,7 @@ impl AddTorrent {
             paused: false,
             sequential: false,
             file_priorities: None,
+            preallocate: false,
         }
     }
 
@@ -88,6 +92,7 @@ impl AddTorrent {
             paused: false,
             sequential: false,
             file_priorities: None,
+            preallocate: false,
         }
     }
 
@@ -100,6 +105,12 @@ impl AddTorrent {
     /// Start paused.
     pub fn paused(mut self, paused: bool) -> AddTorrent {
         self.paused = paused;
+        self
+    }
+
+    /// Preallocate the content files (`fallocate`) when they are created.
+    pub fn preallocate(mut self, on: bool) -> AddTorrent {
+        self.preallocate = on;
         self
     }
 
@@ -134,6 +145,8 @@ pub struct FileStatus {
 pub enum TorrentState {
     /// A magnet link waiting for its metadata (BEP 9).
     FetchingMetadata,
+    /// Waiting for a checking slot (`SessionBuilder::max_checking`).
+    QueuedForChecking,
     /// Verifying data on disk.
     Checking,
     /// Downloading (or waiting for peers).
@@ -226,6 +239,16 @@ pub struct TorrentStatus {
     pub total_wanted_done: u64,
     /// Where the content lives.
     pub save_path: PathBuf,
+    /// Time the torrent has been active (not paused), over its whole life
+    /// (persisted in resume data).
+    pub active_time: Duration,
+    /// Time the torrent has been active as a complete torrent, over its
+    /// whole life (persisted in resume data).
+    pub seeding_time: Duration,
+    /// Per-torrent connection cap, if set (`Session::set_max_peers`).
+    pub max_peers: Option<usize>,
+    /// Time until the earliest scheduled tracker announce, if any.
+    pub next_announce_in: Option<Duration>,
 }
 
 impl TorrentStatus {
@@ -295,6 +318,22 @@ pub struct PeerInfo {
     pub encrypted: bool,
     /// The peer declared itself upload-only (BEP 21) or is a seed.
     pub upload_only: bool,
+    /// The transport the connection runs over.
+    pub transport: PeerTransport,
+    /// Payload bytes per second received from this peer (smoothed).
+    pub download_rate: u64,
+    /// Payload bytes per second sent to this peer (smoothed).
+    pub upload_rate: u64,
+    /// How long the connection has been up.
+    pub connected_for: Duration,
+}
+
+/// The byte transport under a peer connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PeerTransport {
+    /// Plain TCP (the only transport in 0.x; uTP is planned).
+    Tcp,
 }
 
 /// Session-wide counters.
@@ -316,6 +355,18 @@ pub struct SessionStats {
     pub external_v4: Option<std::net::IpAddr>,
     /// External IPv6 address, once voted in.
     pub external_v6: Option<std::net::IpAddr>,
+    /// Peer connections plus dials in progress, across torrents.
+    pub connections: usize,
+    /// Storage jobs submitted to the disk ring and not finished.
+    pub disk_jobs_pending: usize,
+    /// Hash jobs handed to the SHA-1 workers and not finished.
+    pub hash_jobs_pending: usize,
+    /// Bytes re-read from disk to hash blocks that arrived out of order.
+    pub hash_readback_bytes: u64,
+    /// Receive buffers of the peer ring not currently holding data.
+    pub recv_buffers_free: usize,
+    /// Receive buffers of the peer ring in total.
+    pub recv_buffers: usize,
 }
 
 /// Something that happened in the engine.
@@ -580,6 +631,54 @@ impl SessionBuilder {
         self
     }
 
+    /// How many torrents are hashed (checked) at once; the others queue
+    /// (default 1, like libtorrent's `active_checking`).
+    pub fn max_checking(mut self, n: usize) -> Self {
+        self.cfg.max_checking = n.max(1);
+        self
+    }
+
+    /// Torrent files kept open at once across the session (default 512, an
+    /// LRU like libtorrent's file pool); handles are reopened on demand.
+    pub fn max_open_files(mut self, n: usize) -> Self {
+        self.cfg.max_open_files = n.max(1);
+        self
+    }
+
+    /// Prefer finishing a few recently started 4 MiB extents before
+    /// rarest-first picks elsewhere (default on; libtorrent's
+    /// `piece_extent_affinity`, off there). With small pieces this turns
+    /// scattered 16 KiB writes into runs the kernel can write back
+    /// efficiently; piece order within a swarm is otherwise unchanged.
+    pub fn piece_extent_affinity(mut self, on: bool) -> Self {
+        self.cfg.piece_extent_affinity = on;
+        self
+    }
+
+    /// The provided receive buffers every peer socket shares: `entries`
+    /// buffers (a power of two, default 256) of `buf_size` bytes (default
+    /// 32 KiB). A connection holds no receive memory while idle; when every
+    /// buffer is in use the kernel pauses the sockets until one returns.
+    pub fn recv_ring(mut self, entries: u16, buf_size: usize) -> Self {
+        self.cfg.recv_ring_entries = entries.clamp(1, 1 << 15).next_power_of_two();
+        self.cfg.recv_buf_size = buf_size.clamp(4096, 1 << 20);
+        self
+    }
+
+    /// Send piece payloads with zero-copy `sendmsg` when the kernel supports
+    /// it (default off; see `docs/perf.md` for when it pays).
+    pub fn zero_copy_send(mut self, on: bool) -> Self {
+        self.cfg.zero_copy_send = on;
+        self
+    }
+
+    /// Tracker requests in flight at once across the session (default 32):
+    /// bounds the announce storm when thousands of torrents start together.
+    pub fn max_concurrent_announces(mut self, n: usize) -> Self {
+        self.cfg.max_concurrent_announces = n.max(1);
+        self
+    }
+
     /// Run torrent file I/O on a dedicated `urt-disk` io_uring thread
     /// (default) instead of the network ring. Off keeps disk latency on the
     /// network ring but saves the cross-thread hops; see `docs/perf.md`.
@@ -666,7 +765,47 @@ impl Session {
 
     /// Remove a torrent (sends `stopped`, keeps the files).
     pub async fn remove_torrent(&self, id: TorrentId) -> Result<(), Error> {
-        self.send(|tx| Command::Remove(id, tx)).await?
+        self.send(|tx| Command::Remove(id, false, tx)).await?
+    }
+
+    /// Remove a torrent and delete its content files, its parts file and
+    /// the directories that became empty (the resume file too).
+    pub async fn remove_torrent_with_files(&self, id: TorrentId) -> Result<(), Error> {
+        self.send(|tx| Command::Remove(id, true, tx)).await?
+    }
+
+    /// The torrent with this info-hash, if present.
+    pub async fn find_torrent(&self, info_hash: InfoHash) -> Option<TorrentId> {
+        self.send(|tx| Command::Find(info_hash, tx)).await.ok()?
+    }
+
+    /// Pause every torrent (each sends `stopped`).
+    pub async fn pause_all(&self) -> Result<(), Error> {
+        self.send(Command::PauseAll).await
+    }
+
+    /// Resume every paused torrent.
+    pub async fn resume_all(&self) -> Result<(), Error> {
+        self.send(Command::ResumeAll).await
+    }
+
+    /// Add a tracker to `tier` (a tier past the end appends a new one). It
+    /// is announced to at once if the torrent is running.
+    pub async fn add_tracker(&self, id: TorrentId, url: String, tier: usize) -> Result<(), Error> {
+        self.send(|tx| Command::AddTracker(id, url, tier, tx))
+            .await?
+    }
+
+    /// Remove a tracker (it gets `stopped` if it had `started`).
+    pub async fn remove_tracker(&self, id: TorrentId, url: String) -> Result<(), Error> {
+        self.send(|tx| Command::RemoveTracker(id, url, tx)).await?
+    }
+
+    /// Cap this torrent's connections (`None` restores the session default,
+    /// `SessionBuilder::max_peers_per_torrent`). Existing connections above
+    /// the cap are kept; no new ones are made.
+    pub async fn set_max_peers(&self, id: TorrentId, max: Option<usize>) -> Result<(), Error> {
+        self.send(|tx| Command::SetMaxPeers(id, max, tx)).await?
     }
 
     /// Pause a torrent (sends `stopped`, drops peers).

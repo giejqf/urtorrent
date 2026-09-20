@@ -23,7 +23,7 @@ use metainfo::Bitfield;
 
 /// Current resume-data format version. Version 2 added `file_priorities`
 /// (optional; version-1 files read as "all default").
-pub const FORMAT_VERSION: i64 = 2;
+pub const FORMAT_VERSION: i64 = 3;
 
 /// Decoded resume data for one torrent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +44,10 @@ pub struct ResumeData {
     pub downloaded: u64,
     /// File priorities per `info.files` entry (empty = all default).
     pub file_priorities: Vec<u8>,
+    /// Seconds the torrent has been active (not paused) in total (v3).
+    pub active_time: u64,
+    /// Seconds the torrent has been active as a seed in total (v3).
+    pub seeding_time: u64,
 }
 
 impl ResumeData {
@@ -63,6 +67,8 @@ impl ResumeData {
             uploaded: 0,
             downloaded: 0,
             file_priorities: Vec::new(),
+            active_time: 0,
+            seeding_time: 0,
         }
     }
 
@@ -73,19 +79,24 @@ impl ResumeData {
         let up = self.uploaded as i64;
         let down = self.downloaded as i64;
         let pieces = self.have.len() as i64;
+        let active = self.active_time.min(i64::MAX as u64) as i64;
+        let seeding = self.seeding_time.min(i64::MAX as u64) as i64;
+        // Keys in sorted order (canonical bencode).
         let mut entries: Vec<(&[u8], Value)> = vec![
+            (b"active_time", Value::Int(active)),
             (b"downloaded", Value::Int(down)),
             (b"format", Value::Int(self.format_version)),
             (b"have", Value::Bytes(self.have.as_bytes())),
             (b"info_hash", Value::Bytes(&self.info_hash)),
             (b"pieces", Value::Int(pieces)),
             (b"piece_length", Value::Int(piece_len)),
+            (b"seeding_time", Value::Int(seeding)),
             (b"total_length", Value::Int(total)),
             (b"uploaded", Value::Int(up)),
         ];
         if !self.file_priorities.is_empty() {
-            // Sorted key order: `file_priorities` sorts before `format`.
-            entries.insert(1, (b"file_priorities", Value::Bytes(&self.file_priorities)));
+            // `file_priorities` sorts between `downloaded` and `format`.
+            entries.insert(2, (b"file_priorities", Value::Bytes(&self.file_priorities)));
         }
         bencode::to_bytes(&Value::Dict { entries, raw: b"" })
     }
@@ -147,6 +158,8 @@ impl ResumeData {
             .and_then(Value::as_bytes)
             .map(|b| b.iter().map(|p| (*p).min(7)).collect())
             .unwrap_or_default();
+        // v3 fields; absent in v1/v2 files.
+        let secs = |key: &str| v.get_str(key).and_then(Value::as_int).unwrap_or(0).max(0) as u64;
         Ok(ResumeData {
             format_version,
             info_hash,
@@ -156,6 +169,8 @@ impl ResumeData {
             uploaded,
             downloaded,
             file_priorities,
+            active_time: secs("active_time"),
+            seeding_time: secs("seeding_time"),
         })
     }
 
@@ -223,7 +238,37 @@ mod tests {
             uploaded: 1000,
             downloaded: 2000,
             file_priorities: vec![4, 0, 7],
+            active_time: 3600,
+            seeding_time: 1200,
         }
+    }
+
+    /// A version-2 file (no time counters) still loads, with zero times; the
+    /// bytes a v2 writer produced are exactly what v2 wrote.
+    #[test]
+    fn reads_format_version_2() {
+        let mut v2 = sample();
+        v2.format_version = 2;
+        v2.active_time = 0;
+        v2.seeding_time = 0;
+        // What 0.1.0 wrote: the same dictionary minus the two time keys.
+        let bytes = v2.encode();
+        let strip = |b: &[u8], needle: &[u8]| -> Vec<u8> {
+            let at = b
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .expect("key present");
+            [&b[..at], &b[at + needle.len()..]].concat()
+        };
+        let stripped = strip(&bytes, b"11:active_timei0e");
+        let stripped = strip(&stripped, b"12:seeding_timei0e");
+        assert_ne!(bytes, stripped);
+        let back = ResumeData::decode(&stripped).unwrap();
+        assert_eq!(back.format_version, 2);
+        assert_eq!(back.active_time, 0);
+        assert_eq!(back.seeding_time, 0);
+        assert_eq!(back.have, v2.have);
+        assert_eq!(back.file_priorities, v2.file_priorities);
     }
 
     /// A version-1 file (no `file_priorities`) still loads.

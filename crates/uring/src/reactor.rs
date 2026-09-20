@@ -73,14 +73,35 @@ enum Lifecycle {
     Waiting(Waker),
     /// The CQE arrived with this result; the future has not taken it yet.
     Completed(i32),
-    /// The future was dropped; free the slot (and resources) when the CQE lands.
+    /// The future was dropped; free the slot (and resources) when the last
+    /// CQE lands.
     Ignored,
+    /// A multishot operation: completions queue up until the consumer takes
+    /// them; `finished` once a CQE without `IORING_CQE_F_MORE` arrived.
+    Multi {
+        queue: VecDeque<(i32, u32)>,
+        waker: Option<Waker>,
+        finished: bool,
+    },
+}
+
+/// Hook for resources that must react to completions the reactor discards
+/// (an abandoned multishot recv whose CQEs still carry provided buffers).
+pub(crate) trait Recycle {
+    /// A discarded CQE with these flags arrived for the op owning `self`.
+    fn recycle(&self, flags: u32);
 }
 
 struct Slot {
     lifecycle: Lifecycle,
     /// Resources the kernel is using; boxed so their address is stable.
     resources: Option<Box<dyn Any>>,
+    /// Called for CQEs nobody will look at (see [`Recycle`]).
+    recycler: Option<Rc<dyn Recycle>>,
+    /// A CQE with `IORING_CQE_F_MORE` arrived for a single-shot op (a
+    /// zero-copy send's result; its notification follows): the resources
+    /// stay in the slot until that final CQE even after the result is taken.
+    more_pending: bool,
 }
 
 /// A very small slab: a `Vec<Option<Slot>>` with a free list. Keys are indices.
@@ -124,7 +145,17 @@ pub(crate) struct Reactor {
 
 impl Reactor {
     pub(crate) fn new(entries: u32) -> io::Result<Reactor> {
-        let ring = IoUring::new(entries)?;
+        // One thread owns each ring and is the only submitter and waiter, so
+        // completion work can be deferred to our own `io_uring_enter` calls
+        // (`SINGLE_ISSUER` + `DEFER_TASKRUN`, 6.1) instead of interrupting
+        // the thread with task work: fewer context switches per completion.
+        // Both flags exist since 6.0/6.1, inside the kernel baseline.
+        let ring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .build(entries)
+            .or_else(|_| IoUring::builder().setup_coop_taskrun().build(entries))
+            .or_else(|_| IoUring::new(entries))?;
         Ok(Reactor {
             ring,
             slab: Slab::default(),
@@ -148,6 +179,8 @@ impl Reactor {
         let key = self.slab.insert(Slot {
             lifecycle: Lifecycle::Submitted,
             resources: Some(Box::new(resources)),
+            recycler: None,
+            more_pending: false,
         });
         let entry = {
             let slot = self.slab.get_mut(key).expect("just inserted");
@@ -171,10 +204,59 @@ impl Reactor {
         let key = self.slab.insert(Slot {
             lifecycle: Lifecycle::Ignored,
             resources: None,
+            recycler: None,
+            more_pending: false,
         });
         let entry = build(key as u64);
         self.push(entry);
         self.in_flight += 1;
+    }
+
+    /// Submit a multishot operation: its CQEs queue in the slot until
+    /// [`MultiOp::poll_next`] takes them. `recycler` sees the CQEs that
+    /// arrive after the consumer is gone.
+    fn submit_multi(
+        &mut self,
+        recycler: Rc<dyn Recycle>,
+        build: impl FnOnce(u64) -> squeue::Entry,
+    ) -> usize {
+        let key = self.slab.insert(Slot {
+            lifecycle: Lifecycle::Multi {
+                queue: VecDeque::new(),
+                waker: None,
+                finished: false,
+            },
+            resources: None,
+            recycler: Some(recycler),
+            more_pending: false,
+        });
+        let entry = build(key as u64);
+        self.push(entry);
+        self.in_flight += 1;
+        key
+    }
+
+    /// Register a provided-buffer ring (`IORING_REGISTER_PBUF_RING`).
+    ///
+    /// # Safety
+    /// `ring_addr` must point at `entries` page-aligned `io_uring_buf`
+    /// entries that stay mapped until `unregister_buf_ring`.
+    pub(crate) unsafe fn register_buf_ring(
+        &self,
+        ring_addr: u64,
+        entries: u16,
+        bgid: u16,
+    ) -> io::Result<()> {
+        // SAFETY: forwarded to the caller's contract.
+        unsafe {
+            self.ring
+                .submitter()
+                .register_buf_ring_with_flags(ring_addr, entries, bgid, 0)
+        }
+    }
+
+    pub(crate) fn unregister_buf_ring(&self, bgid: u16) -> io::Result<()> {
+        self.ring.submitter().unregister_buf_ring(bgid)
     }
 
     /// Enqueue an SQE, spilling to the backlog if the submission queue is full.
@@ -209,30 +291,62 @@ impl Reactor {
     fn reap(&mut self, wakers: &mut Vec<Waker>) {
         self.ring.completion().sync();
         // Collect first; `completion()` borrows the ring mutably.
-        let mut done: Vec<(u64, i32)> = Vec::new();
+        let mut done: Vec<(u64, i32, u32)> = Vec::new();
         {
             let cq = self.ring.completion();
             for cqe in cq {
-                done.push((cqe.user_data(), cqe.result()));
+                done.push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
         }
-        for (ud, res) in done {
+        for (ud, res, flags) in done {
             if ud == CANCEL_UD {
                 continue; // untracked cancel CQE
             }
             let key = ud as usize;
+            // The op is over unless the kernel promised more CQEs.
+            let last = !io_uring::cqueue::more(flags);
             let mut remove = false;
             if let Some(slot) = self.slab.get_mut(key) {
-                match std::mem::replace(&mut slot.lifecycle, Lifecycle::Completed(res)) {
-                    Lifecycle::Waiting(w) => wakers.push(w),
-                    Lifecycle::Ignored => remove = true,
-                    _ => {}
+                match &mut slot.lifecycle {
+                    Lifecycle::Multi {
+                        queue,
+                        waker,
+                        finished,
+                    } => {
+                        queue.push_back((res, flags));
+                        *finished |= last;
+                        if let Some(w) = waker.take() {
+                            wakers.push(w);
+                        }
+                    }
+                    Lifecycle::Ignored => {
+                        if let Some(r) = &slot.recycler {
+                            r.recycle(flags);
+                        }
+                        remove = last;
+                    }
+                    Lifecycle::Completed(_) => {
+                        // The notification of a zero-copy send whose result
+                        // was already recorded but not yet taken: the
+                        // buffers may now go when the future takes it.
+                        slot.more_pending = false;
+                    }
+                    lc => {
+                        if let Lifecycle::Waiting(w) =
+                            std::mem::replace(lc, Lifecycle::Completed(res))
+                        {
+                            wakers.push(w);
+                        }
+                        slot.more_pending = !last;
+                    }
                 }
             }
             if remove {
                 self.slab.remove(key); // drops resources now that the kernel is done
             }
-            self.in_flight = self.in_flight.saturating_sub(1);
+            if last {
+                self.in_flight = self.in_flight.saturating_sub(1);
+            }
         }
     }
 
@@ -251,16 +365,46 @@ impl Reactor {
             .enumerate()
             .filter_map(|(k, s)| {
                 s.as_ref()
-                    .filter(|s| matches!(s.lifecycle, Lifecycle::Submitted | Lifecycle::Waiting(_)))
+                    .filter(|s| {
+                        matches!(
+                            s.lifecycle,
+                            Lifecycle::Submitted
+                                | Lifecycle::Waiting(_)
+                                | Lifecycle::Multi {
+                                    finished: false,
+                                    ..
+                                }
+                        )
+                    })
                     .map(|_| k)
             })
             .collect();
         for key in keys {
-            if let Some(slot) = self.slab.get_mut(key)
-                && let Lifecycle::Waiting(w) =
-                    std::mem::replace(&mut slot.lifecycle, Lifecycle::Ignored)
-            {
-                wakers.push(w);
+            if let Some(slot) = self.slab.get_mut(key) {
+                match std::mem::replace(&mut slot.lifecycle, Lifecycle::Ignored) {
+                    Lifecycle::Waiting(w) => wakers.push(w),
+                    Lifecycle::Multi {
+                        queue,
+                        waker: Some(w),
+                        ..
+                    } => {
+                        wakers.push(w);
+                        // Queued-but-untaken completions still own buffers.
+                        if let Some(r) = &slot.recycler {
+                            for (_, flags) in queue {
+                                r.recycle(flags);
+                            }
+                        }
+                    }
+                    Lifecycle::Multi { queue, .. } => {
+                        if let Some(r) = &slot.recycler {
+                            for (_, flags) in queue {
+                                r.recycle(flags);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
             let cancel = opcode::AsyncCancel::new(key as u64)
                 .build()
@@ -339,16 +483,127 @@ impl Reactor {
         }
     }
 
+    /// Next completion of multishot op `key`: `Ready(Some)` with a queued
+    /// `(result, flags)`, `Ready(None)` once the op finished and the queue is
+    /// drained (the slot is freed), `Pending` otherwise.
+    fn poll_multi(&mut self, key: usize, cx: &mut Context<'_>) -> Poll<Option<(i32, u32)>> {
+        let Some(slot) = self.slab.get_mut(key) else {
+            return Poll::Ready(None);
+        };
+        let Lifecycle::Multi {
+            queue,
+            waker,
+            finished,
+        } = &mut slot.lifecycle
+        else {
+            return Poll::Ready(None);
+        };
+        if let Some(c) = queue.pop_front() {
+            return Poll::Ready(Some(c));
+        }
+        if *finished {
+            self.slab.remove(key);
+            return Poll::Ready(None);
+        }
+        *waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// A queued completion of multishot op `key` if one is waiting (no waker
+    /// registered): `Some(Some)` a completion, `Some(None)` the op finished
+    /// and is drained (slot freed), `None` nothing yet.
+    fn try_take_multi(&mut self, key: usize) -> Option<Option<(i32, u32)>> {
+        let Some(slot) = self.slab.get_mut(key) else {
+            return Some(None);
+        };
+        let Lifecycle::Multi {
+            queue, finished, ..
+        } = &mut slot.lifecycle
+        else {
+            return Some(None);
+        };
+        if let Some(c) = queue.pop_front() {
+            return Some(Some(c));
+        }
+        if *finished {
+            self.slab.remove(key);
+            return Some(None);
+        }
+        None
+    }
+
+    /// The consumer of multishot op `key` is gone: recycle what it never
+    /// took, and cancel the op if the kernel still runs it.
+    fn abandon_multi(&mut self, key: usize) {
+        let Some(slot) = self.slab.get_mut(key) else {
+            return;
+        };
+        let Lifecycle::Multi {
+            queue, finished, ..
+        } = std::mem::replace(&mut slot.lifecycle, Lifecycle::Ignored)
+        else {
+            return;
+        };
+        if let Some(r) = &slot.recycler {
+            for (_, flags) in queue {
+                r.recycle(flags);
+            }
+        }
+        if finished {
+            self.slab.remove(key);
+            return;
+        }
+        let cancel = opcode::AsyncCancel::new(key as u64)
+            .build()
+            .user_data(CANCEL_UD);
+        self.push(cancel);
+    }
+
+    /// Like [`Reactor::poll`] for an op whose resources never come back to
+    /// the future (a zero-copy send): the result is handed out at the first
+    /// CQE, and the slot keeps the buffers until the kernel's notification
+    /// CQE says it is done with them.
+    fn poll_result_only(&mut self, key: usize, cx: &mut Context<'_>) -> Poll<i32> {
+        let Some(slot) = self.slab.get_mut(key) else {
+            return Poll::Pending;
+        };
+        match &mut slot.lifecycle {
+            Lifecycle::Completed(res) => {
+                let res = *res;
+                if slot.more_pending {
+                    slot.lifecycle = Lifecycle::Ignored;
+                } else {
+                    self.slab.remove(key);
+                }
+                Poll::Ready(res)
+            }
+            lc => {
+                *lc = Lifecycle::Waiting(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
     /// Mark op `key` abandoned (its future was dropped) and submit a cancel.
     fn abandon(&mut self, key: usize) {
-        let already_done = match self.slab.get_mut(key) {
-            Some(slot) => matches!(slot.lifecycle, Lifecycle::Completed(_)),
-            None => true,
+        let (already_done, more_pending) = match self.slab.get_mut(key) {
+            Some(slot) => (
+                matches!(slot.lifecycle, Lifecycle::Completed(_)),
+                slot.more_pending,
+            ),
+            None => (true, false),
         };
         if already_done {
+            if more_pending {
+                // A zero-copy send's result is in but its notification is
+                // not: keep the buffers until it lands.
+                if let Some(slot) = self.slab.get_mut(key) {
+                    slot.lifecycle = Lifecycle::Ignored;
+                }
+                return;
+            }
             // Result already here (or slot gone); just drop it.
             self.slab.remove(key);
-            self.in_flight = self.in_flight.saturating_sub(1);
             return;
         }
         if let Some(slot) = self.slab.get_mut(key) {
@@ -418,6 +673,111 @@ fn this_done<T: 'static>(op: &Op<T>) -> bool {
     op.done
 }
 
+/// A one-result operation whose resources stay with the reactor until the
+/// kernel's last CQE (zero-copy sends): resolves to the raw CQE result.
+pub(crate) struct ResultOp {
+    reactor: Rc<RefCell<Reactor>>,
+    key: usize,
+    done: bool,
+}
+
+impl ResultOp {
+    pub(crate) fn submit<T: 'static>(
+        resources: T,
+        build: impl FnOnce(&mut T, u64) -> squeue::Entry,
+    ) -> ResultOp {
+        let reactor = current();
+        let key = reactor.borrow_mut().submit(resources, build);
+        ResultOp {
+            reactor,
+            key,
+            done: false,
+        }
+    }
+}
+
+impl Future for ResultOp {
+    type Output = i32;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+        let this = self.get_mut();
+        let p = this.reactor.borrow_mut().poll_result_only(this.key, cx);
+        if p.is_ready() {
+            this.done = true;
+        }
+        p
+    }
+}
+
+impl Drop for ResultOp {
+    fn drop(&mut self) {
+        if !self.done {
+            self.reactor.borrow_mut().abandon(self.key);
+        }
+    }
+}
+
+/// A multishot io_uring operation: a stream of `(result, flags)` completions
+/// ending with the CQE that lacks `IORING_CQE_F_MORE`.
+pub(crate) struct MultiOp {
+    reactor: Rc<RefCell<Reactor>>,
+    key: usize,
+    ended: bool,
+}
+
+impl MultiOp {
+    /// Submit a multishot operation on the current thread's reactor.
+    pub(crate) fn submit(
+        recycler: Rc<dyn Recycle>,
+        build: impl FnOnce(u64) -> squeue::Entry,
+    ) -> MultiOp {
+        let reactor = current();
+        let key = reactor.borrow_mut().submit_multi(recycler, build);
+        MultiOp {
+            reactor,
+            key,
+            ended: false,
+        }
+    }
+
+    /// Wait for the next completion; `None` once the operation is over.
+    pub(crate) fn next(&mut self) -> impl Future<Output = Option<(i32, u32)>> + '_ {
+        std::future::poll_fn(move |cx| {
+            if self.ended {
+                return Poll::Ready(None);
+            }
+            let p = self.reactor.borrow_mut().poll_multi(self.key, cx);
+            if let Poll::Ready(None) = p {
+                self.ended = true;
+            }
+            p
+        })
+    }
+}
+
+impl MultiOp {
+    /// A completion already delivered, without waiting: `Some(Some)` one,
+    /// `Some(None)` the operation is over, `None` nothing queued.
+    pub(crate) fn try_next(&mut self) -> Option<Option<(i32, u32)>> {
+        if self.ended {
+            return Some(None);
+        }
+        let r = self.reactor.borrow_mut().try_take_multi(self.key);
+        if let Some(None) = r {
+            self.ended = true;
+        }
+        r
+    }
+}
+
+impl Drop for MultiOp {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.reactor.borrow_mut().abandon_multi(self.key);
+        }
+    }
+}
+
 /// Map a CQE result to an `io::Result<u32>` (>= 0 is the byte count / fd).
 pub(crate) fn cqe_result(res: i32) -> io::Result<u32> {
     if res < 0 {
@@ -445,9 +805,25 @@ mod ops {
 
     /// `send` all-in-one: kernel reads from `buf`.
     pub(crate) async fn send(fd: i32, buf: Buffer) -> (io::Result<u32>, Buffer) {
+        let len = buf.len();
+        send_range(fd, buf, 0, len).await
+    }
+
+    /// `send` of `buf[start..start + len]` without copying: the whole buffer
+    /// stays in the slab slot, the SQE points into it.
+    pub(crate) async fn send_range(
+        fd: i32,
+        buf: Buffer,
+        start: usize,
+        len: usize,
+    ) -> (io::Result<u32>, Buffer) {
+        debug_assert!(start + len <= buf.len());
         let (res, buf) = Op::submit(buf, |b, ud| {
-            let len = b.len() as u32;
-            opcode::Send::new(types::Fd(fd), b.as_ptr(), len)
+            // SAFETY: `start + len <= b.len()`, so the pointer stays inside
+            // the buffer's initialised bytes, which the slab keeps alive
+            // until the CQE.
+            let ptr = unsafe { b.as_ptr().add(start) };
+            opcode::Send::new(types::Fd(fd), ptr, len as u32)
                 .build()
                 .user_data(ud)
         })
@@ -506,6 +882,159 @@ mod ops {
             self.hdr.msg_namelen = self.addr.capacity();
             self.hdr.msg_iov = &mut self.iov;
             self.hdr.msg_iovlen = 1;
+        }
+    }
+
+    /// Resources for a vectored `sendmsg` on a connected socket: the chunks,
+    /// the iovec array over the byte range being sent, and the msghdr.
+    pub(crate) struct VecMsgRes {
+        pub bufs: Vec<Buffer>,
+        pub iovs: Vec<libc::iovec>,
+        pub hdr: libc::msghdr,
+    }
+
+    impl VecMsgRes {
+        fn new(bufs: Vec<Buffer>) -> Box<VecMsgRes> {
+            // SAFETY: an all-zero msghdr is a valid POD; `wire_up` fills it.
+            let hdr = unsafe { std::mem::zeroed() };
+            Box::new(VecMsgRes {
+                bufs,
+                iovs: Vec::new(),
+                hdr,
+            })
+        }
+
+        /// Point the iovecs at bytes `[start, start + len)` of the chunks'
+        /// concatenation (at most `max_iov` entries) and the msghdr at them.
+        /// Must be called on the boxed (address-stable) value. Returns the
+        /// number of bytes covered.
+        fn wire_up(&mut self, start: usize, len: usize, max_iov: usize) -> usize {
+            self.iovs.clear();
+            let mut skip = start;
+            let mut left = len;
+            for b in &self.bufs {
+                if left == 0 || self.iovs.len() == max_iov {
+                    break;
+                }
+                let n = b.len();
+                if skip >= n {
+                    skip -= n;
+                    continue;
+                }
+                let take = (n - skip).min(left);
+                // SAFETY: `skip < n`, so the pointer is inside the buffer,
+                // which the slab keeps alive until the CQE.
+                let base = unsafe { b.as_ptr().add(skip) } as *mut libc::c_void;
+                self.iovs.push(libc::iovec {
+                    iov_base: base,
+                    iov_len: take,
+                });
+                left -= take;
+                skip = 0;
+            }
+            self.hdr.msg_iov = self.iovs.as_mut_ptr();
+            self.hdr.msg_iovlen = self.iovs.len();
+            len - left
+        }
+    }
+
+    /// One `sendmsg` of bytes `[start, start + len)` of `bufs` (as many
+    /// iovecs as fit); returns the CQE result and the chunks.
+    pub(crate) async fn send_chunks(
+        fd: i32,
+        bufs: Vec<Buffer>,
+        start: usize,
+        len: usize,
+    ) -> (io::Result<u32>, Vec<Buffer>) {
+        const MAX_IOV: usize = 64;
+        let mut res = VecMsgRes::new(bufs);
+        let covered = res.wire_up(start, len, MAX_IOV);
+        if covered == 0 {
+            return (Ok(0), res.bufs);
+        }
+        let (r, res) = Op::submit(res, |b, ud| {
+            opcode::SendMsg::new(types::Fd(fd), &b.hdr as *const libc::msghdr)
+                .flags(libc::MSG_NOSIGNAL as u32)
+                .build()
+                .user_data(ud)
+        })
+        .await;
+        (cqe_result(r), res.bufs)
+    }
+
+    /// Zero-copy `sendmsg` (`IORING_OP_SENDMSG_ZC`) of bytes `[start, start +
+    /// len)` of `bufs`: the kernel maps the buffers instead of copying them
+    /// into socket memory and references them until the data is acknowledged,
+    /// so `bufs` is shared with the slot (an `Rc`) and freed when both the
+    /// caller and the notification CQE are done with it.
+    pub(crate) async fn send_chunks_zc(
+        fd: i32,
+        bufs: Rc<Vec<Buffer>>,
+        start: usize,
+        len: usize,
+    ) -> io::Result<u32> {
+        const MAX_IOV: usize = 64;
+        let mut res = ZcMsgRes::new(bufs);
+        let covered = res.wire_up(start, len, MAX_IOV);
+        if covered == 0 {
+            return Ok(0);
+        }
+        let r = ResultOp::submit(res, |b, ud| {
+            opcode::SendMsgZc::new(types::Fd(fd), &b.hdr as *const libc::msghdr)
+                .flags(libc::MSG_NOSIGNAL as u32)
+                .build()
+                .user_data(ud)
+        })
+        .await;
+        cqe_result(r)
+    }
+
+    /// Resources of a zero-copy vectored send: shared chunks plus this op's
+    /// own iovec array and msghdr.
+    pub(crate) struct ZcMsgRes {
+        pub bufs: Rc<Vec<Buffer>>,
+        pub iovs: Vec<libc::iovec>,
+        pub hdr: libc::msghdr,
+    }
+
+    impl ZcMsgRes {
+        fn new(bufs: Rc<Vec<Buffer>>) -> Box<ZcMsgRes> {
+            // SAFETY: an all-zero msghdr is a valid POD; `wire_up` fills it.
+            let hdr = unsafe { std::mem::zeroed() };
+            Box::new(ZcMsgRes {
+                bufs,
+                iovs: Vec::new(),
+                hdr,
+            })
+        }
+
+        fn wire_up(&mut self, start: usize, len: usize, max_iov: usize) -> usize {
+            self.iovs.clear();
+            let mut skip = start;
+            let mut left = len;
+            for b in self.bufs.iter() {
+                if left == 0 || self.iovs.len() == max_iov {
+                    break;
+                }
+                let n = b.len();
+                if skip >= n {
+                    skip -= n;
+                    continue;
+                }
+                let take = (n - skip).min(left);
+                // SAFETY: `skip < n`; the chunks live as long as the slot
+                // holds the `Rc` (until the notification CQE).
+                let base = unsafe { b.as_ptr().add(skip) } as *mut libc::c_void;
+                self.iovs.push(libc::iovec {
+                    iov_base: base,
+                    iov_len: take,
+                });
+                left -= take;
+                skip = 0;
+            }
+            self.hdr.msg_iov = self.iovs.as_mut_ptr();
+            self.hdr.msg_iovlen = self.iovs.len();
+            len - left
         }
     }
 
@@ -601,9 +1130,47 @@ mod ops {
 
     /// `write` at `offset`: kernel reads from `buf`; returns bytes written.
     pub(crate) async fn write_at(fd: i32, offset: u64, buf: Buffer) -> (io::Result<u32>, Buffer) {
+        let len = buf.len();
+        write_range_at(fd, offset, buf, 0, len).await
+    }
+
+    /// `write` of `buf[start..start + len]` at `offset` without copying.
+    pub(crate) async fn write_range_at(
+        fd: i32,
+        offset: u64,
+        buf: Buffer,
+        start: usize,
+        len: usize,
+    ) -> (io::Result<u32>, Buffer) {
+        debug_assert!(start + len <= buf.len());
         let (res, buf) = Op::submit(buf, |b, ud| {
-            let len = b.len() as u32;
-            opcode::Write::new(types::Fd(fd), b.as_ptr(), len)
+            // SAFETY: `start + len <= b.len()`; the slab keeps `b` alive
+            // until the CQE.
+            let ptr = unsafe { b.as_ptr().add(start) };
+            opcode::Write::new(types::Fd(fd), ptr, len as u32)
+                .offset(offset)
+                .build()
+                .user_data(ud)
+        })
+        .await;
+        (cqe_result(res), buf)
+    }
+
+    /// `read` at `offset` into `buf[start..start + len]` without a temporary
+    /// buffer; returns the bytes read (the caller tracks the fill).
+    pub(crate) async fn read_range_at(
+        fd: i32,
+        offset: u64,
+        buf: Buffer,
+        start: usize,
+        len: usize,
+    ) -> (io::Result<u32>, Buffer) {
+        debug_assert!(start + len <= buf.len());
+        let (res, buf) = Op::submit(buf, |b, ud| {
+            // SAFETY: as above; the kernel writes at most `len` bytes from
+            // `start`, inside the buffer's length.
+            let ptr = unsafe { b.as_mut_ptr().add(start) };
+            opcode::Read::new(types::Fd(fd), ptr, len as u32)
                 .offset(offset)
                 .build()
                 .user_data(ud)

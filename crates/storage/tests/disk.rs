@@ -69,7 +69,7 @@ fn disk_ring_end_to_end() {
     let root2 = tmpdir("b");
     let rt = Runtime::with_defaults().unwrap();
     let notifier = Rc::new(Notifier::new().unwrap());
-    let ring = Rc::new(DiskRing::start(1, notifier.handle()).unwrap());
+    let ring = Rc::new(DiskRing::start(1, 64, notifier.handle()).unwrap());
     let content = fx.content.clone();
     let pl = 16384usize;
     let pieces = info.piece_count();
@@ -82,7 +82,7 @@ fn disk_ring_end_to_end() {
             store.piece_priorities(),
             storage::layout::piece_priorities(&info_c, &[4, 0, 4])
         );
-        store.create_files().await.unwrap();
+        store.create_files(false).await.unwrap();
         assert!(!root_c.join("ring/b.bin").exists());
         for p in 0..pieces {
             if store.piece_priorities()[p] == 0 {

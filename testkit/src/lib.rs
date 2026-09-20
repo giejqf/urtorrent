@@ -32,8 +32,14 @@ pub mod webapi;
 
 /// Initialise tracing from `RUST_LOG` (default `info`).
 pub fn init_tracing() {
+    init_tracing_with("info");
+}
+
+/// [`init_tracing`] with a different default filter (when `RUST_LOG` is not
+/// set).
+pub fn init_tracing_with(default: &str) {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

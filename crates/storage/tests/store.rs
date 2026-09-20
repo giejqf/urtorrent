@@ -464,3 +464,63 @@ fn hash_cursor_handles_out_of_order_blocks_and_failures() {
     });
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The shared file pool caps open handles across stores; evicted files are
+/// reopened on demand and still fsynced by `sync_all`.
+#[test]
+fn file_pool_caps_open_handles_across_stores() {
+    let fx_a = fixture::multi(
+        "pa",
+        &[("a", 20_000), ("b", 20_000), ("c", 20_000)],
+        16384,
+        31,
+    );
+    let fx_b = fixture::multi(
+        "pb",
+        &[("x", 20_000), ("y", 20_000), ("z", 20_000)],
+        16384,
+        32,
+    );
+    let ta = Torrent::parse(&fx_a.torrent).unwrap();
+    let tb = Torrent::parse(&fx_b.torrent).unwrap();
+    let root = tmpdir("pool");
+    let pool = Rc::new(HashPool::new(1));
+    let res = storage::DiskResources::new(2);
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on({
+        let root = root.clone();
+        let (ca, cb) = (fx_a.content.clone(), fx_b.content.clone());
+        async move {
+            let sa =
+                Storage::with_resources(Arc::new(ta.info), root.clone(), pool.clone(), res.clone());
+            let sb =
+                Storage::with_resources(Arc::new(tb.info), root.clone(), pool.clone(), res.clone());
+            sa.create_files().await.unwrap();
+            sb.create_files().await.unwrap();
+            assert!(
+                res.open_files() <= 2,
+                "cap holds after creating 6 files: {}",
+                res.open_files()
+            );
+            write_all(&sa, &ca, fx_a.piece_length).await;
+            write_all(&sb, &cb, fx_b.piece_length).await;
+            assert!(res.open_files() <= 2);
+            sa.sync_all().await.unwrap();
+            sb.sync_all().await.unwrap();
+            for p in 0..sa.info().piece_count() {
+                assert!(sa.verify_piece(p).await.unwrap());
+            }
+            for p in 0..sb.info().piece_count() {
+                assert!(sb.verify_piece(p).await.unwrap());
+            }
+            assert_eq!(
+                sa.check_all().await.unwrap().count(),
+                sa.info().piece_count()
+            );
+            assert!(res.open_files() <= 2);
+            drop(sb);
+            assert!(res.open_files() <= 2);
+        }
+    });
+    std::fs::remove_dir_all(&root).ok();
+}

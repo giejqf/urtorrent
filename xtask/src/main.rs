@@ -108,8 +108,9 @@ fn syscalls() -> Result<()> {
     Ok(())
 }
 
-/// `cargo xtask soak [transfer|many|all] [--size 2G] [--torrents 500]`: the
-/// release-built `urt-soak` binary against `target/soak`.
+/// `cargo xtask soak [transfer|many|all] [--size 2G] [--piece 1M]
+/// [--torrents 500]`: the release-built `urt-soak` binary against
+/// `target/soak`.
 fn soak(args: &[String]) -> Result<()> {
     run(
         cargo().args([
@@ -288,7 +289,7 @@ fn usage() -> ExitCode {
   capture [scen ...] regenerate golden captures from the pinned oracle
   fuzz <target> [secs]
   syscalls           assert no non-uring data-path syscalls during a transfer
-  soak [mode] [--size N] [--torrents N]
+  soak [mode] [--size N] [--piece N] [--torrents N]
                      perf / leak exercise (release build): many torrents, big loopback transfer"
     );
     ExitCode::from(2)

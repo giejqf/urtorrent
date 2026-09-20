@@ -110,6 +110,136 @@ impl PieceHash {
     }
 }
 
+/// Resources every store of one disk ring shares: an LRU of open file
+/// handles capped at `max_open` (libtorrent's file pool), and piece-sized
+/// buffer pools per piece length. Without the cap a session with thousands
+/// of torrents holds every content file open forever; without sharing, each
+/// store would keep its own idle piece buffers (megabytes each).
+pub struct DiskResources {
+    files: RefCell<FilePool>,
+    bufs: RefCell<HashMap<usize, BufferPool>>,
+    next_store: std::cell::Cell<u64>,
+    stats: Arc<DiskStats>,
+}
+
+/// Counters of the disk side readable from any thread (the session's
+/// stats). Relaxed atomics: they are indicators, not synchronisation.
+#[derive(Debug, Default)]
+pub struct DiskStats {
+    /// Jobs submitted to the disk ring and not finished.
+    pub jobs_pending: std::sync::atomic::AtomicUsize,
+    /// Hash jobs handed to the SHA-1 workers and not finished (shared with
+    /// the [`HashPool`](crate::HashPool) through `HashPool::with_counter`).
+    pub hash_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bytes re-read from disk (page cache) to hash blocks that arrived out
+    /// of order, across every store since start (see
+    /// [`Storage::hash_readback_bytes`]).
+    pub readback_bytes: std::sync::atomic::AtomicU64,
+}
+
+/// Which file of which store a pooled handle is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct FileKey {
+    store: u64,
+    /// `None` is the store's parts file.
+    index: Option<usize>,
+}
+
+struct FilePool {
+    max_open: usize,
+    open: HashMap<FileKey, (Rc<File>, u64)>,
+    /// Last-use stamp -> key, for eviction.
+    lru: std::collections::BTreeMap<u64, FileKey>,
+    stamp: u64,
+}
+
+impl FilePool {
+    fn touch(&mut self, key: FileKey) -> Option<Rc<File>> {
+        let stamp = self.stamp;
+        self.stamp += 1;
+        let (f, old) = self.open.get_mut(&key)?;
+        self.lru.remove(old);
+        *old = stamp;
+        self.lru.insert(stamp, key);
+        Some(f.clone())
+    }
+
+    fn insert(&mut self, key: FileKey, f: Rc<File>) {
+        while self.open.len() >= self.max_open.max(1) {
+            let Some((&stamp, &victim)) = self.lru.iter().next() else {
+                break;
+            };
+            self.lru.remove(&stamp);
+            // The handle closes (through the ring) when the last user drops it.
+            self.open.remove(&victim);
+        }
+        let stamp = self.stamp;
+        self.stamp += 1;
+        self.open.insert(key, (f, stamp));
+        self.lru.insert(stamp, key);
+    }
+
+    fn remove_store(&mut self, store: u64) {
+        let keys: Vec<FileKey> = self
+            .open
+            .keys()
+            .filter(|k| k.store == store)
+            .copied()
+            .collect();
+        for k in keys {
+            if let Some((_, stamp)) = self.open.remove(&k) {
+                self.lru.remove(&stamp);
+            }
+        }
+    }
+}
+
+impl DiskResources {
+    /// Resources allowing `max_open` open file handles across stores.
+    pub fn new(max_open: usize) -> Rc<DiskResources> {
+        Self::with_stats(max_open, Arc::new(DiskStats::default()))
+    }
+
+    /// [`DiskResources::new`] reporting into `stats`.
+    pub fn with_stats(max_open: usize, stats: Arc<DiskStats>) -> Rc<DiskResources> {
+        Rc::new(DiskResources {
+            files: RefCell::new(FilePool {
+                max_open: max_open.max(1),
+                open: HashMap::new(),
+                lru: std::collections::BTreeMap::new(),
+                stamp: 0,
+            }),
+            bufs: RefCell::new(HashMap::new()),
+            next_store: std::cell::Cell::new(1),
+            stats,
+        })
+    }
+
+    /// The shared counters.
+    pub fn stats(&self) -> &Arc<DiskStats> {
+        &self.stats
+    }
+
+    /// Open file handles right now.
+    pub fn open_files(&self) -> usize {
+        self.files.borrow().open.len()
+    }
+
+    fn take_buf(&self, size: usize) -> Buffer {
+        self.bufs
+            .borrow_mut()
+            .entry(size)
+            .or_insert_with(|| BufferPool::new(size, 2))
+            .take()
+    }
+
+    fn put_buf(&self, size: usize, data: Vec<u8>) {
+        if let Some(p) = self.bufs.borrow().get(&size) {
+            p.put(data);
+        }
+    }
+}
+
 /// Default file priority (libtorrent's `default_priority`).
 pub const DEFAULT_PRIORITY: u8 = 4;
 /// Highest file priority.
@@ -120,48 +250,72 @@ pub struct Storage {
     info: Arc<Info>,
     root: RefCell<PathBuf>,
     pool: Rc<HashPool>,
-    files: RefCell<HashMap<usize, Rc<File>>>,
+    res: Rc<DiskResources>,
+    store_id: u64,
+    /// Files written since the last `sync_all` (fsync must reach them even
+    /// if their handle was evicted from the pool meanwhile).
+    dirty: RefCell<std::collections::HashSet<Option<usize>>>,
     have: RefCell<Bitfield>,
     /// Priority per `info.files` entry (padding files are always 0).
     priorities: RefCell<Vec<u8>>,
     /// Whether a file's bytes live in the parts file (skipped and never
     /// created on disk).
     use_parts: RefCell<Vec<bool>>,
-    parts: RefCell<Option<Rc<File>>>,
     /// Pieces being downloaded, hashed as they are written.
     progress: RefCell<HashMap<usize, PieceHash>>,
-    /// Piece-sized buffers for read-back hashing (recheck, fallback).
-    piece_bufs: BufferPool,
     /// Bytes the hash cursor had to read back (diagnostics: zero when blocks
     /// arrive in order).
     readback_bytes: std::cell::Cell<u64>,
 }
 
 impl Storage {
-    /// Create a store for `info` under `root`, using `pool` for hashing.
-    /// Every content file starts at [`DEFAULT_PRIORITY`].
+    /// Create a store for `info` under `root`, using `pool` for hashing, with
+    /// its own file/buffer resources (tests; the disk ring shares one
+    /// [`DiskResources`] across stores). Every content file starts at
+    /// [`DEFAULT_PRIORITY`].
     pub fn new(info: Arc<Info>, root: PathBuf, pool: Rc<HashPool>) -> Storage {
+        Storage::with_resources(info, root, pool, DiskResources::new(64))
+    }
+
+    /// Create a store sharing `res` with other stores.
+    pub fn with_resources(
+        info: Arc<Info>,
+        root: PathBuf,
+        pool: Rc<HashPool>,
+        res: Rc<DiskResources>,
+    ) -> Storage {
         let pieces = info.piece_count();
-        let piece_len = info.piece_length as usize;
         let priorities = info
             .files
             .iter()
             .map(|f| if f.is_padding() { 0 } else { DEFAULT_PRIORITY })
             .collect::<Vec<u8>>();
         let n = info.files.len();
+        let store_id = res.next_store.get();
+        res.next_store.set(store_id + 1);
         Storage {
             info,
             root: RefCell::new(root),
             pool,
-            files: RefCell::new(HashMap::new()),
+            res,
+            store_id,
+            dirty: RefCell::new(std::collections::HashSet::new()),
             have: RefCell::new(Bitfield::new(pieces)),
             priorities: RefCell::new(priorities),
             use_parts: RefCell::new(vec![false; n]),
-            parts: RefCell::new(None),
             progress: RefCell::new(HashMap::new()),
-            piece_bufs: BufferPool::new(piece_len, 2),
             readback_bytes: std::cell::Cell::new(0),
         }
+    }
+
+    /// Bytes of one piece (for buffer sizing).
+    fn piece_buf_size(&self) -> usize {
+        self.info.piece_length as usize
+    }
+
+    /// The disk side's shared counters.
+    pub fn stats(&self) -> &Arc<DiskStats> {
+        self.res.stats()
     }
 
     /// Bytes the hash cursor read back from disk because blocks arrived ahead
@@ -270,20 +424,25 @@ impl Storage {
             let buf = Buffer::from_vec(vec![0u8; (e - s) as usize]);
             let got = parts.read_exact_at(s, buf).await?;
             target.write_all_at(s - f.offset, got).await?;
+            self.dirty.borrow_mut().insert(Some(i));
         }
         Ok(())
     }
 
     async fn parts_file(&self) -> Result<Rc<File>, Error> {
-        if let Some(p) = self.parts.borrow().as_ref() {
-            return Ok(p.clone());
+        let key = FileKey {
+            store: self.store_id,
+            index: None,
+        };
+        if let Some(f) = self.res.files.borrow_mut().touch(key) {
+            return Ok(f);
         }
         let path = self.parts_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let f = Rc::new(File::open_rw(&path).await?);
-        *self.parts.borrow_mut() = Some(f.clone());
+        self.res.files.borrow_mut().insert(key, f.clone());
         Ok(f)
     }
 
@@ -314,8 +473,7 @@ impl Storage {
     /// lazily under the new root.
     pub async fn move_to(&self, new_root: PathBuf) -> Result<(), Error> {
         self.sync_all().await?;
-        self.files.borrow_mut().clear();
-        *self.parts.borrow_mut() = None;
+        self.res.files.borrow_mut().remove_store(self.store_id);
         let old_root = self.root.borrow().clone();
         std::fs::create_dir_all(&new_root)?;
         let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -401,6 +559,49 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete every content file of the torrent, the parts file, and the
+    /// directories that became empty (from the deepest up to, but not
+    /// including, the save path). Files that are already gone are fine.
+    /// Handles are closed first. Directory walking is one-time blocking
+    /// work off the data path (AGENTS.md 5.3).
+    pub async fn delete_files(&self) -> Result<(), Error> {
+        self.res.files.borrow_mut().remove_store(self.store_id);
+        self.dirty.borrow_mut().clear();
+        let root = self.root.borrow().clone();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for f in &self.info.files {
+            if f.is_padding() {
+                continue;
+            }
+            let path = f.path.to_path(&root);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            let mut p = path.parent();
+            while let Some(d) = p
+                && d.starts_with(&root)
+                && d != root
+            {
+                if !dirs.contains(&d.to_path_buf()) {
+                    dirs.push(d.to_path_buf());
+                }
+                p = d.parent();
+            }
+        }
+        let parts = self.parts_path();
+        if parts.exists() {
+            std::fs::remove_file(&parts)?;
+        }
+        // Deepest first so parents empty out.
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for d in dirs {
+            let _ = std::fs::remove_dir(d); // only if empty
+        }
+        Ok(())
+    }
+
     /// Preallocate all non-padding files to their full length (`fallocate`).
     pub async fn preallocate(&self) -> Result<(), Error> {
         self.create_files().await?;
@@ -417,8 +618,12 @@ impl Storage {
     /// The open handle for file `index`, opening it through the ring on first
     /// use (directory creation is a one-time blocking call, AGENTS.md 5.3).
     async fn file(&self, index: usize) -> Result<Rc<File>, Error> {
-        if let Some(f) = self.files.borrow().get(&index) {
-            return Ok(f.clone());
+        let key = FileKey {
+            store: self.store_id,
+            index: Some(index),
+        };
+        if let Some(f) = self.res.files.borrow_mut().touch(key) {
+            return Ok(f);
         }
         let spec = self.info.files.get(index).ok_or(Error::OutOfRange)?;
         let path = spec.path.to_path(&self.root.borrow());
@@ -426,7 +631,7 @@ impl Storage {
             std::fs::create_dir_all(parent)?;
         }
         let f = Rc::new(File::open_rw(&path).await?);
-        self.files.borrow_mut().insert(index, f.clone());
+        self.res.files.borrow_mut().insert(key, f.clone());
         Ok(f)
     }
 
@@ -437,6 +642,17 @@ impl Storage {
         let torrent_off = self.torrent_offset(piece, offset)?;
         let len = data.len() as u64;
         let slices = self.info.slices_for(torrent_off, len);
+        // The common case, a block inside one content file: write the
+        // buffer itself and hash from it afterwards. No copy.
+        if let [s] = slices.as_slice()
+            && !s.padding
+            && s.length == len
+        {
+            let (file, off) = self.target(s).await?;
+            self.mark_dirty(s);
+            let data = file.write_all_at(off, data).await?;
+            return self.on_written(piece, offset, data.into_vec()).await;
+        }
         let mut bytes = data.into_vec();
         let mut pos = 0usize;
         for s in slices {
@@ -451,10 +667,27 @@ impl Storage {
             let chunk = &bytes[pos..pos + take];
             pos += take;
             let (file, off) = self.target(&s).await?;
+            self.mark_dirty(&s);
             let buf = Buffer::from_vec(chunk.to_vec());
             file.write_all_at(off, buf).await?;
         }
         self.on_written(piece, offset, bytes).await
+    }
+
+    /// Remember that the file behind `s` has unsynced writes.
+    fn mark_dirty(&self, s: &FileSlice) {
+        let key = if self
+            .use_parts
+            .borrow()
+            .get(s.file_index)
+            .copied()
+            .unwrap_or(false)
+        {
+            None
+        } else {
+            Some(s.file_index)
+        };
+        self.dirty.borrow_mut().insert(key);
     }
 
     /// A block of `piece` is on disk: record it and advance the hash cursor as
@@ -539,12 +772,16 @@ impl Storage {
                     continue;
                 }
                 let Some(&(s, e)) = rb.next() else { break };
-                let mut buf = self.piece_bufs.take();
+                let mut buf = self.res.take_buf(self.piece_buf_size());
                 buf.resize((e - s) as usize);
                 match self.read_exact_piece_range(piece, s, buf).await {
                     Ok(b) => {
                         self.readback_bytes
                             .set(self.readback_bytes.get() + u64::from(e - s));
+                        self.res
+                            .stats
+                            .readback_bytes
+                            .fetch_add(u64::from(e - s), std::sync::atomic::Ordering::Relaxed);
                         *c = b.into_vec();
                         pooled_idx.push(i);
                     }
@@ -567,7 +804,7 @@ impl Storage {
             let (state, chunks, digest) = self.pool.update_async(state, chunks, finish).await;
             for (i, c) in chunks.into_iter().enumerate() {
                 if pooled_idx.contains(&i) {
-                    self.piece_bufs.put(c);
+                    self.res.put_buf(self.piece_buf_size(), c);
                 }
             }
             let mut prog = self.progress.borrow_mut();
@@ -604,23 +841,20 @@ impl Storage {
         let len = buf.len() as u32;
         let torrent_off = self.torrent_offset(piece, start)?;
         let slices = self.info.slices_for(torrent_off, u64::from(len));
-        let mut out = buf.into_vec();
+        let mut out = buf;
         let mut pos = 0usize;
         for s in slices {
             let take = s.length as usize;
             if s.padding {
-                out[pos..pos + take].fill(0);
+                out.as_mut_slice()[pos..pos + take].fill(0);
                 pos += take;
                 continue;
             }
             let (file, off) = self.target(&s).await?;
-            let got = file
-                .read_exact_at(off, Buffer::from_vec(vec![0u8; take]))
-                .await?;
-            out[pos..pos + take].copy_from_slice(got.as_slice());
+            out = file.read_exact_into(off, out, pos, take).await?;
             pos += take;
         }
-        Ok(Buffer::from_vec(out))
+        Ok(out)
     }
 
     fn piece_len(&self, piece: usize) -> Result<u32, Error> {
@@ -633,7 +867,7 @@ impl Storage {
     /// bytes are zero-filled so hashing is deterministic.
     pub async fn read_piece(&self, piece: usize) -> Result<(Vec<u8>, bool), Error> {
         let loc = self.info.piece_location(piece).ok_or(Error::OutOfRange)?;
-        let mut buf = self.piece_bufs.take();
+        let mut buf = self.res.take_buf(self.piece_buf_size());
         buf.resize(loc.length as usize);
         let mut out = buf.into_vec();
         let mut pos = 0usize;
@@ -668,7 +902,19 @@ impl Storage {
     ) -> Result<Buffer, Error> {
         let torrent_off = self.torrent_offset(piece, offset)?;
         let slices = self.info.slices_for(torrent_off, u64::from(length));
-        let mut out = vec![0u8; length as usize];
+        // One content file (the common case): read straight into the block
+        // buffer. Otherwise assemble the block slice by slice, zero-filling
+        // padding.
+        if let [s] = slices.as_slice()
+            && !s.padding
+            && s.length == u64::from(length)
+        {
+            let (file, off) = self.target(s).await?;
+            let mut buf = Buffer::with_capacity(length as usize);
+            buf.resize(length as usize);
+            return file.read_exact_at(off, buf).await.map_err(Into::into);
+        }
+        let mut out = Buffer::from_vec(vec![0u8; length as usize]);
         let mut pos = 0usize;
         for s in slices {
             let take = s.length as usize;
@@ -677,12 +923,10 @@ impl Storage {
                 continue;
             }
             let (file, off) = self.target(&s).await?;
-            let buf = Buffer::from_vec(vec![0u8; take]);
-            let got = file.read_exact_at(off, buf).await?;
-            out[pos..pos + take].copy_from_slice(got.as_slice());
+            out = file.read_exact_into(off, out, pos, take).await?;
             pos += take;
         }
-        Ok(Buffer::from_vec(out))
+        Ok(out)
     }
 
     /// Verify `piece` against its expected hash. On success the have-bit is set.
@@ -722,12 +966,12 @@ impl Storage {
         self.progress.borrow_mut().remove(&piece);
         let (data, complete) = self.read_piece(piece).await?;
         if !complete {
-            self.piece_bufs.put(data);
+            self.res.put_buf(self.piece_buf_size(), data);
             self.have.borrow_mut().clear(piece);
             return Ok(false);
         }
         let (ok, buf) = self.pool.verify_async(data, expected).await;
-        self.piece_bufs.put(buf);
+        self.res.put_buf(self.piece_buf_size(), buf);
         if ok {
             self.have.borrow_mut().set(piece);
         } else {
@@ -774,26 +1018,30 @@ impl Storage {
             let (data, complete) = self.read_piece(p).await?;
             if complete {
                 let (ok, buf) = self.pool.verify_async(data, expected).await;
-                self.piece_bufs.put(buf);
+                self.res.put_buf(self.piece_buf_size(), buf);
                 if ok {
                     have.set(p);
                 }
             } else {
-                self.piece_bufs.put(data);
+                self.res.put_buf(self.piece_buf_size(), data);
             }
         }
         *self.have.borrow_mut() = have.clone();
         Ok(have)
     }
 
-    /// Flush all open files (and the parts file) to disk (`fsync`).
+    /// `fsync` every file written since the last sync (reopening one whose
+    /// handle left the pool; the dirty pages are the kernel's, not the
+    /// handle's).
     pub async fn sync_all(&self) -> Result<(), Error> {
-        let mut files: Vec<Rc<File>> = self.files.borrow().values().cloned().collect();
-        if let Some(p) = self.parts.borrow().as_ref() {
-            files.push(p.clone());
-        }
-        for f in files {
+        let dirty: Vec<Option<usize>> = self.dirty.borrow().iter().copied().collect();
+        for key in dirty {
+            let f = match key {
+                Some(i) => self.file(i).await?,
+                None => self.parts_file().await?,
+            };
             f.sync_all().await?;
+            self.dirty.borrow_mut().remove(&key);
         }
         Ok(())
     }
@@ -826,6 +1074,13 @@ impl Storage {
     ) -> Result<Vec<FileSlice>, Error> {
         let torrent_off = self.torrent_offset(piece, offset)?;
         Ok(self.info.slices_for(torrent_off, u64::from(length)))
+    }
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        // Give the pool's slots back right away rather than at eviction.
+        self.res.files.borrow_mut().remove_store(self.store_id);
     }
 }
 

@@ -14,8 +14,12 @@ use std::os::fd::RawFd;
 use std::rc::Rc;
 
 use crate::bufpool::Buffer;
+use crate::bufring::{BufRing, BufRingInner, RingBuf};
 use crate::error::Result;
-use crate::reactor::{self, accept, close_fd_detached, connect, recv, send};
+use crate::reactor::{
+    self, MultiOp, accept, close_fd_detached, connect, recv, send, send_chunks, send_chunks_zc,
+    send_range,
+};
 
 /// A raw sockaddr with its length, kept alive across an async `connect`.
 pub(crate) struct RawSockAddr {
@@ -292,20 +296,28 @@ impl TcpStream {
 
     /// Send all of `buf`, resubmitting on short writes.
     pub async fn send_all(&self, buf: Buffer) -> Result<Buffer> {
-        let total = buf.len();
+        let len = buf.len();
+        self.send_all_range(buf, 0, len).await
+    }
+
+    /// Send all of `buf[start..start + len]`, resubmitting on short writes,
+    /// without copying: the buffer comes back untouched.
+    pub async fn send_all_range(&self, buf: Buffer, start: usize, len: usize) -> Result<Buffer> {
+        if start + len > buf.len() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
+        }
+        let mut buf = buf;
         let mut sent = 0usize;
-        let mut data = buf.into_vec();
-        while sent < total {
-            let chunk = Buffer::from_vec(data[sent..].to_vec());
-            let (r, _b) = send(self.fd.raw(), chunk).await;
+        while sent < len {
+            let (r, b) = send_range(self.fd.raw(), buf, start + sent, len - sent).await;
+            buf = b;
             match r {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
                 Ok(n) => sent += n as usize,
                 Err(e) => return Err(e.into()),
             }
         }
-        data.truncate(total);
-        Ok(Buffer::from_vec(data))
+        Ok(buf)
     }
 
     /// Receive into `buf` (sized to its length). Returns bytes read and the
@@ -315,11 +327,181 @@ impl TcpStream {
         (r.map_err(Into::into), b)
     }
 
+    /// Send bytes `[start, start + len)` of the concatenation of `chunks` in
+    /// as few `sendmsg` operations as possible, without copying (each chunk
+    /// becomes an iovec); the chunks come back untouched. This is how a
+    /// batch of `piece` messages leaves: framing bytes and block buffers
+    /// interleaved, one operation.
+    pub async fn send_all_chunks(
+        &self,
+        chunks: Vec<Buffer>,
+        start: usize,
+        len: usize,
+    ) -> Result<Vec<Buffer>> {
+        let total: usize = chunks.iter().map(Buffer::len).sum();
+        if start + len > total {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
+        }
+        let mut chunks = chunks;
+        let mut sent = 0usize;
+        while sent < len {
+            let (r, c) = send_chunks(self.fd.raw(), chunks, start + sent, len - sent).await;
+            chunks = c;
+            match r {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                Ok(n) => sent += n as usize,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(chunks)
+    }
+
+    /// [`send_all_chunks`] with zero-copy sends (`IORING_OP_SENDMSG_ZC`):
+    /// the kernel transmits straight from the chunks and keeps them
+    /// referenced until the peer acknowledges the data, which is why they
+    /// are shared (`Rc`) rather than returned. Requires the `send_zc` probe;
+    /// worth it on real NICs with large payloads, not on loopback (measure).
+    ///
+    /// [`send_all_chunks`]: TcpStream::send_all_chunks
+    pub async fn send_all_chunks_zc(
+        &self,
+        chunks: Rc<Vec<Buffer>>,
+        start: usize,
+        len: usize,
+    ) -> Result<()> {
+        let total: usize = chunks.iter().map(Buffer::len).sum();
+        if start + len > total {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
+        }
+        let mut sent = 0usize;
+        while sent < len {
+            match send_chunks_zc(self.fd.raw(), chunks.clone(), start + sent, len - sent).await {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                Ok(n) => sent += n as usize,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Receive continuously into `ring`'s buffers (multishot `recv` with
+    /// `IOSQE_BUFFER_SELECT`): one SQE serves every chunk until the peer
+    /// closes or an error ends it. See [`RecvMulti`].
+    pub fn recv_multi(&self, ring: &BufRing) -> RecvMulti {
+        RecvMulti {
+            fd: self.fd.raw(),
+            ring: ring.inner().clone(),
+            op: None,
+        }
+    }
+
     /// Graceful close through the ring (awaits the CQE).
     pub async fn close(self) -> Result<()> {
         let fd = self.fd.raw();
         mem::forget(self.fd); // avoid the detached close in Drop
         reactor::close(fd).await.map_err(Into::into)
+    }
+}
+
+/// A multishot receive on a [`TcpStream`]. `next` yields each chunk as it
+/// lands; when the ring runs out of buffers the kernel ends the multishot
+/// with `ENOBUFS` and `next` re-arms it once a buffer is returned, so the
+/// caller only ever sees data, end of stream, or a real socket error.
+/// Dropping the `next` future (a timeout, a `select`) does not cancel the
+/// receive; dropping the `RecvMulti` does.
+pub struct RecvMulti {
+    fd: RawFd,
+    ring: Rc<BufRingInner>,
+    op: Option<MultiOp>,
+}
+
+impl RecvMulti {
+    /// The next received chunk; `Ok(None)` when the peer closed.
+    pub async fn next(&mut self) -> Result<Option<RingBuf>> {
+        loop {
+            if self.op.is_none() {
+                self.wait_for_buffer().await;
+                let ring = self.ring.clone();
+                let fd = self.fd;
+                let bgid = self.ring.bgid();
+                self.op = Some(MultiOp::submit(ring, move |ud| {
+                    io_uring::opcode::RecvMulti::new(io_uring::types::Fd(fd), bgid)
+                        .build()
+                        .user_data(ud)
+                }));
+            }
+            let Some(op) = self.op.as_mut() else { continue };
+            match op.next().await {
+                None => {
+                    // The multishot ended (after an error we already
+                    // reported, or a kernel-side stop); arm again.
+                    self.op = None;
+                }
+                Some((res, flags)) => {
+                    let bid = io_uring::cqueue::buffer_select(flags);
+                    if !io_uring::cqueue::more(flags) {
+                        // Last CQE of this op: drain it on the next call.
+                        self.op = None;
+                    }
+                    if res > 0 {
+                        let Some(bid) = bid else {
+                            return Err(io::Error::other("recv completion without buffer").into());
+                        };
+                        return Ok(Some(self.ring.take(bid, res as usize)));
+                    }
+                    if let Some(bid) = bid {
+                        self.ring.recycle_bid(bid);
+                    }
+                    if res == 0 {
+                        return Ok(None);
+                    }
+                    if res == -libc::ENOBUFS {
+                        self.op = None;
+                        continue;
+                    }
+                    return Err(io::Error::from_raw_os_error(-res).into());
+                }
+            }
+        }
+    }
+
+    /// A chunk that has already arrived, without waiting: `Some(Some(buf))`
+    /// data, `Some(None)` end of stream, `None` nothing queued right now.
+    /// Errors and ring exhaustion are left for the next [`next`] call.
+    ///
+    /// [`next`]: RecvMulti::next
+    pub fn try_next(&mut self) -> Option<Option<RingBuf>> {
+        let op = self.op.as_mut()?;
+        let (res, flags) = op.try_next()??;
+        let bid = io_uring::cqueue::buffer_select(flags);
+        if !io_uring::cqueue::more(flags) {
+            self.op = None;
+        }
+        if res > 0 {
+            let bid = bid?;
+            return Some(Some(self.ring.take(bid, res as usize)));
+        }
+        if let Some(bid) = bid {
+            self.ring.recycle_bid(bid);
+        }
+        if res == 0 {
+            return Some(None);
+        }
+        // An error ended the op: `next` re-arms (and a persistent socket
+        // error recurs there, where it is reported).
+        None
+    }
+
+    async fn wait_for_buffer(&self) {
+        std::future::poll_fn(|cx| {
+            if self.ring.free() > 0 {
+                std::task::Poll::Ready(())
+            } else {
+                self.ring.wait_free(cx.waker());
+                std::task::Poll::Pending
+            }
+        })
+        .await
     }
 }
 

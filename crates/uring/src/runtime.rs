@@ -254,6 +254,7 @@ impl Runtime {
                 for w in wakers {
                     w.wake();
                 }
+                crate::bufring::release_retired(Some(&self.reactor));
             }
         });
 
@@ -292,6 +293,9 @@ impl Drop for Runtime {
             );
             // Leak rather than free memory the kernel may still write to.
             self.reactor.borrow_mut().leak_in_flight();
+            crate::bufring::release_retired(None);
+        } else {
+            crate::bufring::release_retired(Some(&self.reactor));
         }
     }
 }

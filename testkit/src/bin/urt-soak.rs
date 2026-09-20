@@ -88,6 +88,7 @@ fn zero_torrent(name: &str, size: u64, piece_len: u32, salt: u64) -> Vec<u8> {
 }
 
 static DISK_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static ZERO_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn session(ip: Ipv4Addr, max_peers: usize) -> Result<Session> {
     Ok(block_on(
@@ -99,6 +100,7 @@ fn session(ip: Ipv4Addr, max_peers: usize) -> Result<Session> {
             .max_peers_per_torrent(max_peers)
             .hash_threads(2)
             .disk_thread(DISK_THREAD.load(std::sync::atomic::Ordering::Relaxed))
+            .zero_copy_send(ZERO_COPY.load(std::sync::atomic::Ordering::Relaxed))
             .build(),
     )?)
 }
@@ -122,13 +124,29 @@ fn rss_kib() -> (u64, u64) {
     (get("VmRSS:"), get("VmHWM:"))
 }
 
+/// Process CPU time so far: `(user, system)` from `/proc/self/stat`.
+fn cpu_time() -> (Duration, Duration) {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // Fields after the parenthesised command name; utime/stime are the 14th
+    // and 15th fields overall (1-based), i.e. index 11 and 12 after ")".
+    let tail = stat.rsplit_once(')').map(|(_, t)| t).unwrap_or("");
+    let f: Vec<&str> = tail.split_whitespace().collect();
+    let ticks = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let hz = 100u64; // CLK_TCK on every Linux we run on
+    let d = |t: u64| Duration::from_millis(t * 1000 / hz);
+    (d(ticks(11)), d(ticks(12)))
+}
+
 fn report(tag: &str) {
     let (rss, hwm) = rss_kib();
+    let (user, sys) = cpu_time();
     println!(
-        "  [{tag}] fds={} rss={} MiB peak={} MiB",
+        "  [{tag}] fds={} rss={} MiB peak={} MiB cpu user={:.1}s sys={:.1}s",
         open_fds(),
         rss / 1024,
-        hwm / 1024
+        hwm / 1024,
+        user.as_secs_f64(),
+        sys.as_secs_f64(),
     );
 }
 
@@ -149,13 +167,18 @@ fn wait_state(s: &Session, id: urtorrent::TorrentId, want: TorrentState, secs: u
     }
 }
 
-fn transfer(dir: &Path, size: u64) -> Result<()> {
-    println!("transfer: {} MiB", size / (1024 * 1024));
+fn transfer(dir: &Path, size: u64, piece: Option<u32>) -> Result<()> {
+    let piece_len: u32 = piece.unwrap_or(if size >= 4 << 30 { 4 << 20 } else { 1 << 20 });
+    println!(
+        "transfer: {} MiB, {} KiB pieces ({} pieces)",
+        size / (1024 * 1024),
+        piece_len / 1024,
+        size.div_ceil(u64::from(piece_len))
+    );
     let a_dir = dir.join("a");
     let b_dir = dir.join("b");
     std::fs::create_dir_all(&a_dir)?;
     std::fs::create_dir_all(&b_dir)?;
-    let piece_len: u32 = if size >= 4 << 30 { 4 << 20 } else { 1 << 20 };
     let torrent = zero_torrent("soak.bin", size, piece_len, 1);
     // Sparse seed file: correct content (zeros), no disk use.
     std::fs::File::create(a_dir.join("soak.bin"))?.set_len(size)?;
@@ -316,9 +339,11 @@ fn many(dir: &Path, n: usize) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    testkit::init_tracing_with("warn");
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "all".into());
     let mut size: u64 = 2 << 30;
+    let mut piece: Option<u32> = None;
     let mut torrents: usize = 500;
     let mut dir: Option<PathBuf> = None;
     while let Some(k) = args.next() {
@@ -326,9 +351,14 @@ fn main() -> Result<()> {
             DISK_THREAD.store(false, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
+        if k == "--zero-copy" {
+            ZERO_COPY.store(true, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         let v = args.next().with_context(|| format!("{k} needs a value"))?;
         match k.as_str() {
             "--size" => size = parse_size(&v)?,
+            "--piece" => piece = Some(u32::try_from(parse_size(&v)?)?),
             "--torrents" => torrents = v.parse()?,
             "--dir" => dir = Some(PathBuf::from(v)),
             other => bail!("unknown argument {other}"),
@@ -340,11 +370,11 @@ fn main() -> Result<()> {
         dir.unwrap_or_else(|| PathBuf::from("target").join(format!("soak-{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&dir);
     match mode.as_str() {
-        "transfer" => transfer(&dir.join("transfer"), size)?,
+        "transfer" => transfer(&dir.join("transfer"), size, piece)?,
         "many" => many(&dir.join("many"), torrents)?,
         "all" => {
             many(&dir.join("many"), torrents)?;
-            transfer(&dir.join("transfer"), size)?;
+            transfer(&dir.join("transfer"), size, piece)?;
         }
         other => bail!("unknown mode {other} (transfer | many | all)"),
     }

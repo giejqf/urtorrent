@@ -347,12 +347,80 @@ impl Announcer {
     }
 
     fn endpoint_mut(&mut self, job: &AnnounceJob) -> Option<(&mut Tracker, usize)> {
-        let t = self.tiers.get_mut(job.tier)?.get_mut(job.index)?;
+        // Positions can shift under an in-flight job when a tracker is
+        // added or removed meanwhile: trust them only if the URL still
+        // matches, otherwise find the tracker by URL (or drop the result if
+        // it was removed).
+        let at_pos = self
+            .tiers
+            .get(job.tier)
+            .and_then(|t| t.get(job.index))
+            .is_some_and(|t| t.url == job.url);
+        let (ti, i) = if at_pos {
+            (job.tier, job.index)
+        } else {
+            self.tiers.iter().enumerate().find_map(|(ti, tier)| {
+                tier.iter().position(|t| t.url == job.url).map(|i| (ti, i))
+            })?
+        };
+        let t = self.tiers.get_mut(ti)?.get_mut(i)?;
         if job.endpoint < t.endpoints.len() {
             Some((t, job.endpoint))
         } else {
             None
         }
+    }
+
+    /// Add a tracker to `tier` (appending a new tier when `tier` is past the
+    /// end; a URL already present is ignored). While running, the new
+    /// tracker is due at once. Returns whether it was added.
+    pub fn add_tracker(&mut self, url: &str, tier: usize) -> bool {
+        let url = url.trim();
+        if url.is_empty() || self.tiers.iter().flatten().any(|t| t.url == url) {
+            return false;
+        }
+        let tracker = Tracker {
+            url: url.to_string(),
+            tracker_id: None,
+            downloaded: None,
+            endpoints: (0..self.endpoints).map(|_| Endpoint::new()).collect(),
+        };
+        let tier = tier.min(self.tiers.len());
+        if tier == self.tiers.len() {
+            self.tiers.push(vec![tracker]);
+        } else {
+            self.tiers[tier].push(tracker);
+        }
+        true
+    }
+
+    /// Remove the tracker with `url`. Returns the `stopped` announces owed to
+    /// it (one per endpoint that received `started`), or `None` if it was not
+    /// present. Empty tiers are dropped.
+    pub fn remove_tracker(&mut self, url: &str) -> Option<Vec<AnnounceJob>> {
+        let (ti, i) = self
+            .tiers
+            .iter()
+            .enumerate()
+            .find_map(|(ti, tier)| tier.iter().position(|t| t.url == url).map(|i| (ti, i)))?;
+        let t = self.tiers[ti].remove(i);
+        if self.tiers[ti].is_empty() {
+            self.tiers.remove(ti);
+        }
+        let mut jobs = Vec::new();
+        for (ei, e) in t.endpoints.iter().enumerate() {
+            if e.start_sent {
+                jobs.push(AnnounceJob {
+                    tier: ti,
+                    index: i,
+                    endpoint: ei,
+                    url: t.url.clone(),
+                    event: AnnounceEvent::Stopped,
+                    tracker_id: t.tracker_id.clone(),
+                });
+            }
+        }
+        Some(jobs)
     }
 
     /// A job succeeded. Schedules the next regular announce at
@@ -523,6 +591,45 @@ mod tests {
         assert_eq!(stopped.len(), 1);
         assert_eq!(stopped[0].event, AnnounceEvent::Stopped);
         assert!(a.poll(t1 + Duration::from_secs(9999)).is_empty());
+    }
+
+    #[test]
+    fn add_and_remove_trackers_while_running() {
+        let t0 = Instant::now();
+        let mut a = Announcer::new(urls(&[&["http://a/"]]), 1);
+        a.start();
+        let jobs = a.poll(t0);
+        assert_eq!(jobs.len(), 1);
+        // A tracker added to a new tier is due at once and independent.
+        assert!(a.add_tracker("http://b/", 5));
+        assert!(!a.add_tracker("http://b/", 0), "duplicate ignored");
+        assert!(!a.add_tracker("  ", 0));
+        let more = a.poll(t0);
+        assert_eq!(more.len(), 1);
+        assert_eq!(more[0].url, "http://b/");
+        assert_eq!(more[0].tier, 1);
+        a.on_success(&jobs[0], &resp(1800), t0);
+        a.on_success(&more[0], &resp(1800), t0);
+        // Removing the first shifts positions; the in-flight job for the
+        // second still lands on the right tracker (found by URL).
+        let due = t0 + Duration::from_secs(1800);
+        let regular = a.poll(due);
+        assert_eq!(regular.len(), 2);
+        let stopped = a.remove_tracker("http://a/").expect("present");
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].event, AnnounceEvent::Stopped);
+        assert!(a.remove_tracker("http://a/").is_none());
+        let b_job = regular.iter().find(|j| j.url == "http://b/").unwrap();
+        a.on_success(b_job, &resp(60), due);
+        let snap = a.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].url, "http://b/");
+        assert_eq!(snap[0].tier, 0);
+        assert!(snap[0].working);
+        // A stale job for the removed tracker is ignored, not misapplied.
+        let a_job = regular.iter().find(|j| j.url == "http://a/").unwrap();
+        a.on_failure(a_job, "gone".into(), due);
+        assert!(a.snapshot()[0].last_error.is_none());
     }
 
     #[test]

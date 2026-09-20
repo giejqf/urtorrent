@@ -5,9 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-20
+
+Performance and completeness release. The public API grew (new `Session`
+methods, new fields on `TorrentStatus` / `PeerInfo` / `SessionStats` /
+`AddTorrent`), hence the minor bump; nothing was removed. Resume data is now
+format version 3 (every earlier version still loads). Kernel baseline stays
+6.1: multishot receive into provided buffer rings is now required (no
+single-shot fallback for peer sockets).
 
 ### Added
+
+- API completeness: `Session::{remove_torrent_with_files, find_torrent,
+  pause_all, resume_all, add_tracker, remove_tracker, set_max_peers}`;
+  `AddTorrent::preallocate` (`fallocate` on creation); `TorrentStatus::{
+  active_time, seeding_time, max_peers, next_announce_in}` with the two
+  clocks persisted in resume data (format v3); `PeerInfo::{download_rate,
+  upload_rate, connected_for, transport}`; `SessionStats::{connections,
+  disk_jobs_pending, hash_jobs_pending, hash_readback_bytes,
+  recv_buffers_free, recv_buffers}` (`storage::DiskStats`,
+  `HashPool::outstanding`). `tracker::Announcer::{add_tracker,
+  remove_tracker}` (in-flight jobs are matched by URL, so positions may
+  shift underneath them); `Storage::delete_files`; `DiskStore::create_files(
+  preallocate)`.
+- Scale pass for thousands of torrents: `SessionBuilder::{max_open_files,
+  max_checking, max_concurrent_announces}` (LRU file pool shared by every
+  store, one torrent checked at a time with `TorrentState::QueuedForChecking`
+  for the rest, bounded announce and resume-save concurrency), O(1) MSE
+  stream-key lookup (`mse::SkeyIndex`), a session tick queue instead of a
+  timer per torrent, self-timed rate-limiter waits, shared piece-buffer
+  pools; 10 000 torrents in one session verified by `xtask soak many`
+  (numbers in `docs/perf.md`).
+- Peer data path (ADR 0006): every peer socket receives with one multishot
+  `recv` into a session-wide provided buffer ring (`uring::BufRing`,
+  `TcpStream::recv_multi`, `RingBuf` guards; `SessionBuilder::recv_ring`),
+  queued chunks are
+  framed per wakeup, and a batch of `piece` messages leaves as one vectored
+  `sendmsg` over the block buffers read from disk (`wire::Connection::piece`
+  takes the `Vec<u8>`, `take_outbound_chunks`) — no user-space copy of an
+  uploaded block remains. `File::{write_all_at, read_exact_at}` and
+  `TcpStream::send_all` resubmit from an offset instead of copying;
+  `File::read_exact_into`; `Storage::write_block` writes the block buffer
+  itself; receive buffers are no longer zero-filled on reuse. Optional
+  zero-copy sends (`SessionBuilder::zero_copy_send`, `IORING_OP_SENDMSG_ZC`,
+  off by default). Rings use `SINGLE_ISSUER | DEFER_TASKRUN`. `recv_multi`
+  joined the required opcode baseline. `PeerInfo.transport` and the
+  `PeerTransport` enum name the transport (TCP; uTP-ready `Transport` enum in
+  the engine). A 2 GiB loopback transfer: 116 → 180 MiB/s at 28% less CPU.
+- Indexed piece picker: completion, bytes left and end-game are cached
+  counters; `pick` walks partial pieces plus untouched pieces bucketed by
+  priority and availability (pieces nobody has are never scanned) instead of
+  every piece; a `have` from a peer is a constant-time update
+  (`wire::Event::HaveChanged { added }`) and gaining a piece only re-checks
+  interest in peers that have it. Piece extent affinity (libtorrent's
+  `piece_extent_affinity`, ported; **on by default here**, off in the oracle):
+  a few recently started 4 MiB extents are finished before rarest-first
+  moves on, so small pieces are written in runs the kernel can write back
+  (`SessionBuilder::piece_extent_affinity`). A 2 GiB transfer with 16 KiB
+  pieces went from 6 MiB/s (with writeback stalls) to 58 MiB/s; 1 MiB
+  pieces unchanged. `xtask soak transfer --piece N`; the soak reports CPU
+  time.
 
 - External-address voting (libtorrent `ip_voter` semantics): trackers'
   `external ip` and peers' `yourip` vote per listen family; LTEP `p` on

@@ -194,9 +194,11 @@ Only `uring`, `storage` and `session` may perform I/O.
   with `ASYNC_CANCEL` and let the reactor reclaim it. No API takes `&mut [u8]` for an
   async op; use owned pooled buffers. This rule is the main source of `unsafe`; keep all
   of it inside `uring`, with `// SAFETY:` comments and miri/loom-style tests where possible.
-- Network: multishot accept, multishot recv with provided buffer rings for TCP,
+- Network: multishot accept, multishot recv with provided buffer rings for TCP (done,
+  ADR 0006: one ring per network thread, required, no single-shot fallback for peers),
   `recvmsg` multishot for the UDP sockets (UDP tracker now; DHT/uTP demux later),
-  `send_zc` for piece payloads where it measures faster.
+  `send_zc` for piece payloads where it measures faster (implemented behind
+  `SessionBuilder::zero_copy_send`, off by default: no gain on loopback).
 - TLS for HTTPS trackers and web seeds: **rustls** (pure Rust, maintainer decision), used
   through its buffer-in/buffer-out API so ciphertext moves over `uring`. No OpenSSL, no
   native-tls. Note rustls's default crypto providers (the *ring* crypto crate, aws-lc-rs)

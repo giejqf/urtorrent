@@ -161,6 +161,16 @@ impl Message {
         )
     }
 
+    /// Append the framing of a `piece` message carrying `data_len` payload
+    /// bytes (length prefix, id, index, begin) to `out`; the payload itself
+    /// follows separately (see `Connection::take_outbound_chunks`).
+    pub fn encode_piece_header(out: &mut Vec<u8>, index: u32, begin: u32, data_len: u32) {
+        put_u32(out, 9 + data_len);
+        out.push(id::PIECE);
+        put_u32(out, index);
+        put_u32(out, begin);
+    }
+
     /// Append the framed wire encoding (length prefix included) to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
         let start = out.len();

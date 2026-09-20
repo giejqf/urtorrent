@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use metainfo::Bitfield;
 use picker::Picker;
-use uring::{Buffer, TcpStream};
+use uring::Buffer;
+
+use super::transport::Transport;
 use wire::{Connection, ConnectionParams, Event as WireEvent, Handshake, PeerHave, Request, Role};
 
 use super::Ctx;
@@ -54,6 +56,10 @@ pub struct PeerHandle {
     last_have: RefCell<Bitfield>,
     rate: Cell<u64>,
     rate_mark: Cell<u64>,
+    up_rate: Cell<u64>,
+    up_rate_mark: Cell<u64>,
+    /// When the connection was set up.
+    opened_at: Instant,
     /// Requests from the peer waiting to be read from disk and sent.
     upload_queue: RefCell<VecDeque<Request>>,
     upload_notify: Rc<Notify>,
@@ -65,6 +71,8 @@ pub struct PeerHandle {
     cipher: RefCell<Cipher>,
     /// Negotiated encryption, for `PeerInfo`.
     pub encrypted: Cell<bool>,
+    /// The transport under the connection (uTP later).
+    pub transport: Cell<super::transport::TransportKind>,
     /// How we learned of the peer.
     pub source: PeerSource,
     /// The listen port the peer advertised (LTEP `p`).
@@ -121,12 +129,16 @@ impl PeerHandle {
             last_have: RefCell::new(Bitfield::new(pieces)),
             rate: Cell::new(0),
             rate_mark: Cell::new(0),
+            up_rate: Cell::new(0),
+            up_rate_mark: Cell::new(0),
+            opened_at: now,
             upload_queue: RefCell::new(VecDeque::new()),
             upload_notify: Notify::new(),
             drained: Notify::new(),
             last_unchoke: Cell::new(None),
             cipher: RefCell::new(Cipher::default()),
             encrypted: Cell::new(false),
+            transport: Cell::new(super::transport::TransportKind::Tcp),
             source,
             listen_port: Cell::new(None),
             holepunch: Cell::new(false),
@@ -237,6 +249,10 @@ impl PeerHandle {
             outstanding: conn.outstanding().len(),
             encrypted: self.encrypted.get(),
             upload_only: conn.peer_upload_only() || have.is_seed(pieces),
+            transport: self.transport.get(),
+            download_rate: self.rate.get(),
+            upload_rate: self.up_rate.get(),
+            connected_for: Instant::now().saturating_duration_since(self.opened_at),
         }
     }
 
@@ -253,6 +269,22 @@ impl PeerHandle {
                 .any(|i| !picker.have(i) && picker.priority(i) > 0),
             _ => false,
         };
+        self.set_interest(&mut conn, interested);
+    }
+
+    /// [`PeerHandle::update_interest`] after the peer announced one more
+    /// piece: only that piece can change the answer from "no" to "yes".
+    fn update_interest_added(&self, picker: &Picker, piece: usize) {
+        let mut conn = self.conn.borrow_mut();
+        if !conn.is_established() || conn.am_interested() {
+            return;
+        }
+        if !picker.have(piece) && picker.priority(piece) > 0 {
+            self.set_interest(&mut conn, true);
+        }
+    }
+
+    fn set_interest(&self, conn: &mut wire::Connection, interested: bool) {
         let was = conn.am_interested();
         conn.interested(interested);
         if was != interested {
@@ -260,7 +292,8 @@ impl PeerHandle {
         }
     }
 
-    /// Bring this peer's availability contribution up to date.
+    /// Bring this peer's availability contribution up to date after a
+    /// wholesale change (bitfield, have-all/none, metadata).
     fn sync_availability(&self, picker: &mut Picker, pieces: usize) {
         let now = self.conn.borrow().peer_have().to_bitfield(pieces);
         let mut last = self.last_have.borrow_mut();
@@ -268,6 +301,15 @@ impl PeerHandle {
             picker.peer_left(&last);
             picker.peer_joined(&now);
             *last = now;
+        }
+    }
+
+    /// The peer announced piece `i` (`have`): O(1) availability update.
+    fn availability_added(&self, picker: &mut Picker, i: usize) {
+        let mut last = self.last_have.borrow_mut();
+        if i < last.len() && !last.get(i) {
+            last.set(i);
+            picker.peer_has(i);
         }
     }
 
@@ -355,6 +397,9 @@ impl PeerHandle {
         let d = self.downloaded.get() - self.rate_mark.get();
         self.rate_mark.set(self.downloaded.get());
         self.rate.set((self.rate.get() * 3 + d) / 4);
+        let u = self.uploaded.get() - self.up_rate_mark.get();
+        self.up_rate_mark.set(self.uploaded.get());
+        self.up_rate.set((self.up_rate.get() * 3 + u) / 4);
         // Pieces may have been released by others; keep the pipeline full.
         self.fill_requests_locked(t, ctx);
     }
@@ -401,7 +446,7 @@ fn allowed_mask(ctx: &Ctx) -> u32 {
 /// plaintext that followed pe4.
 async fn mse_initiate(
     ctx: &Rc<Ctx>,
-    stream: &TcpStream,
+    stream: &Transport,
     info_hash: metainfo::InfoHash,
     ia: Vec<u8>,
 ) -> Result<(Cipher, Vec<u8>), String> {
@@ -466,10 +511,8 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
             .filter(|a| !a.is_unspecified())
             .map(std::net::IpAddr::V6),
     };
-    let connected = match local {
-        Some(l) => uring::timeout(CONNECT_TIMEOUT, TcpStream::connect_from(l, addr)).await,
-        None => uring::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await,
-    };
+    let connected = uring::timeout(CONNECT_TIMEOUT, Transport::connect_tcp(local, addr)).await;
+    ctx.connection_closed(); // the dial is over; a live connection counts again below
     let (stream, use_mse) = {
         let mut t = torrent.borrow_mut();
         t.half_open = t.half_open.saturating_sub(1);
@@ -556,7 +599,7 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
 
 /// An accepted socket: read the handshake (plaintext, or through an MSE
 /// responder handshake), find the torrent, run.
-pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
+pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
     let Ok(addr) = stream.peer_addr() else { return };
     let local_addr = stream
         .local_addr()
@@ -612,10 +655,10 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
             allowed_mask(&ctx),
             ctx.cfg.profile.mse.prefer_rc4,
         );
-        let torrents = ctx.info_hashes();
         let mut pending = std::mem::take(&mut raw);
         let outcome = loop {
-            match resp.receive(&pending, &torrents, &mut rng) {
+            let step = resp.receive(&pending, &*ctx.skeys.borrow(), &mut rng);
+            match step {
                 Ok(Some(o)) => {
                     let out = resp.take_outbound();
                     if !out.is_empty() && stream.send_all(Buffer::from_vec(out)).await.is_err() {
@@ -681,8 +724,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
             || !t.is_running()
             || t.is_banned(addr.ip())
             || t.peers.len() >= ctx.cfg.max_peers
-            || ctx.connection_count_except(Some(t.id)) + t.peers.len() + t.half_open
-                >= ctx.cfg.max_connections
+            || ctx.connection_count() >= ctx.cfg.max_connections
         {
             return;
         }
@@ -716,7 +758,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
 async fn run_connection(
     ctx: Rc<Ctx>,
     torrent: Rc<RefCell<Torrent>>,
-    stream: TcpStream,
+    stream: Transport,
     conn: Connection,
     addr: SocketAddr,
     local: SocketAddr,
@@ -731,8 +773,10 @@ async fn run_connection(
         key, addr, local, incoming, conn, pieces, source,
     ));
     handle.encrypted.set(cipher.enc.is_some());
+    handle.transport.set(stream.kind());
     *handle.cipher.borrow_mut() = cipher;
     torrent.borrow_mut().peers.insert(key, handle.clone());
+    ctx.connection_opened();
     let stream = Rc::new(stream);
     uring::spawn(writer(
         ctx.clone(),
@@ -750,45 +794,103 @@ async fn run_connection(
     }
     handle.out.notify();
     let down_limit = torrent.borrow().down_limit.clone();
+    // One standing multishot receive into the session's provided buffers;
+    // the kernel pauses the socket when the ring is empty, so a stalled
+    // consumer (disk backpressure) turns into TCP backpressure.
+    let mut rx = stream.receiver(&ctx.recv_ring);
     while reason.is_none() {
-        // Download limits: take a grant before posting the receive and size
-        // the buffer to it; refund what the read did not use.
-        let grant = match select2(
-            acquire_pair(&ctx.down_limit, &down_limit, RECV_SIZE),
+        let buf = match select2(
+            uring::timeout(INACTIVITY_TIMEOUT, rx.next()),
             handle.close.wait(),
         )
         .await
         {
-            Either::Left(g) => g,
+            Either::Left(Ok(Ok(Some(buf)))) => buf,
+            Either::Left(Ok(Ok(None))) => {
+                reason = Some("peer closed the connection".into());
+                break;
+            }
+            Either::Left(Ok(Err(e))) => {
+                reason = Some(format!("recv: {e}"));
+                break;
+            }
+            Either::Left(Err(_)) => {
+                reason = Some("inactive".into());
+                break;
+            }
             Either::Right(()) => break,
         };
-        let mut buf = ctx.recv_pool.take_sized();
-        if (grant as usize) < buf.len() {
-            buf.truncate(grant as usize);
+        handle.last_recv.set(Instant::now());
+        // Everything that arrived while we were busy (e.g. awaiting the disk
+        // for the previous batch) is framed in one go, and the batch's
+        // block writes leave for the disk ring together.
+        let mut chunks = vec![buf];
+        let mut eof = false;
+        while chunks.len() < MAX_RECV_BATCH {
+            match rx.try_next() {
+                Some(Some(b)) => chunks.push(b),
+                Some(None) => {
+                    eof = true;
+                    break;
+                }
+                None => break,
+            }
         }
-        match select2(
-            uring::timeout(INACTIVITY_TIMEOUT, stream.recv(buf)),
-            handle.close.wait(),
-        )
-        .await
-        {
-            Either::Left(Ok((Ok(0), _))) => reason = Some("peer closed the connection".into()),
-            Either::Left(Ok((Ok(n), buf))) => {
-                refund_pair(
-                    &ctx.down_limit,
-                    &down_limit,
-                    grant.saturating_sub(u64::from(n)),
-                );
-                handle.last_recv.set(Instant::now());
-                if let Err(e) = process_bytes(&ctx, &torrent, &handle, buf.as_slice()).await {
-                    reason = Some(e);
+        // Download limits: the bytes are already here (the ring is bounded,
+        // so a limited connection bursts at most one ring's worth); charge
+        // the whole batch before processing it, which delays the next one.
+        if !(ctx.down_limit.is_unlimited() && down_limit.is_unlimited()) {
+            let mut left: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+            while left > 0 {
+                match select2(
+                    acquire_pair(&ctx.down_limit, &down_limit, left),
+                    handle.close.wait(),
+                )
+                .await
+                {
+                    Either::Left(g) => left -= g.min(left),
+                    Either::Right(()) => {
+                        return finish_connection(ctx, torrent, handle, key, addr, incoming, None)
+                            .await;
+                    }
                 }
             }
-            Either::Left(Ok((Err(e), _))) => reason = Some(format!("recv: {e}")),
-            Either::Left(Err(_)) => reason = Some("inactive".into()),
-            Either::Right(()) => break,
+        }
+        if let Err(e) = process_chunks(&ctx, &torrent, &handle, chunks).await {
+            reason = Some(e);
+        } else if eof {
+            reason = Some("peer closed the connection".into());
         }
     }
+    finish_connection(ctx, torrent, handle, key, addr, incoming, reason).await
+}
+
+/// Batches at least this large go out zero-copy when enabled (a block plus
+/// framing; smaller ones are control traffic).
+const ZC_MIN_BYTES: usize = 16 * 1024;
+
+/// A batch on its way out: owned chunks that come back after each send, or
+/// chunks shared with the kernel (zero-copy).
+enum Outbound {
+    Plain(Option<Vec<Buffer>>),
+    ZeroCopy(Rc<Vec<Buffer>>),
+}
+
+/// Chunks framed per receive batch (bounds the events handled before the
+/// batch's writes go out; the ring size bounds it anyway).
+const MAX_RECV_BATCH: usize = 32;
+
+/// Tear a connection down: bookkeeping in the torrent, then the socket closes
+/// through the ring when the last `Rc<Transport>` drops.
+async fn finish_connection(
+    ctx: Rc<Ctx>,
+    torrent: Rc<RefCell<Torrent>>,
+    handle: Rc<PeerHandle>,
+    key: u32,
+    addr: SocketAddr,
+    incoming: bool,
+    reason: Option<String>,
+) {
     let reason = reason.unwrap_or_else(|| {
         handle
             .close_reason
@@ -797,8 +899,7 @@ async fn run_connection(
             .unwrap_or_else(|| "closed".into())
     });
     handle.close(&reason);
-    // Cleanup: bookkeeping in the torrent, then the socket closes through the
-    // ring when the last `Rc<TcpStream>` drops.
+    ctx.connection_closed();
     let id = {
         let mut t = torrent.borrow_mut();
         t.peers.remove(&key);
@@ -843,50 +944,34 @@ async fn run_connection(
 }
 
 /// Feed bytes to the state machine and act on every resulting event.
-async fn process_bytes(
+/// Decrypt (in place) and frame a batch of received chunks, then act on
+/// the events. The ring buffers go back to the kernel as soon as the framer
+/// has consumed them, before any event handling awaits the disk.
+async fn process_chunks(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
     handle: &Rc<PeerHandle>,
-    bytes: &[u8],
+    chunks: Vec<uring::RingBuf>,
 ) -> Result<(), String> {
     let events = {
         let mut cipher = handle.cipher.borrow_mut();
         let mut conn = handle.conn.borrow_mut();
-        match cipher.dec.as_mut() {
-            Some(d) => {
-                let mut plain = bytes.to_vec();
-                d.apply(&mut plain);
-                conn.receive(&plain)
+        let mut events = Vec::new();
+        for mut buf in chunks {
+            if let Some(d) = cipher.dec.as_mut() {
+                d.apply(buf.as_mut_slice());
             }
-            None => conn.receive(bytes),
+            let evs = conn
+                .receive(buf.as_slice())
+                .map_err(|e| format!("protocol: {e}"))?;
+            events.extend(evs);
         }
-        .map_err(|e| format!("protocol: {e}"))?
+        events
     };
-    let mut writes = Vec::new();
-    let mut result = Ok(());
-    for ev in events {
-        match handle_event(ctx, torrent, handle, ev, &mut writes).await {
-            Ok(()) => {}
-            Err(e) => {
-                result = Err(e);
-                break;
-            }
-        }
-        if handle.close.is_set() {
-            break;
-        }
-    }
-    if handle.conn.borrow().has_outbound() {
-        handle.out.notify();
-    }
-    // One disk round trip for the whole buffer.
-    for w in writes {
-        w.finish(ctx, torrent).await;
-    }
-    result
+    process_events(ctx, torrent, handle, events).await
 }
 
-/// Like `process_bytes` for bytes that are already plaintext.
+/// Feed plaintext bytes (the handshake's leftovers) to the connection.
 async fn process_plain(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
@@ -898,6 +983,15 @@ async fn process_plain(
         .borrow_mut()
         .receive(bytes)
         .map_err(|e| format!("protocol: {e}"))?;
+    process_events(ctx, torrent, handle, events).await
+}
+
+async fn process_events(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    handle: &Rc<PeerHandle>,
+    events: Vec<WireEvent>,
+) -> Result<(), String> {
     let mut writes = Vec::new();
     let mut result = Ok(());
     for ev in events {
@@ -1029,17 +1123,27 @@ async fn handle_event(
             }
             super::metadata::on_ext_handshake(&mut t, handle, ext.metadata_size, Instant::now());
         }
-        WireEvent::HaveChanged => {
+        WireEvent::HaveChanged { added } => {
             let mut t = torrent.borrow_mut();
             if !t.has_metadata() {
                 return Ok(());
             }
             let pieces = t.piece_count();
-            handle.sync_availability(&mut t.picker, pieces);
+            match added {
+                // A single `have`: constant-time bookkeeping (a `have` per
+                // peer per piece is the hottest control-plane path).
+                Some(i) if handle.last_have.borrow().len() == pieces => {
+                    handle.availability_added(&mut t.picker, i as usize);
+                    handle.update_interest_added(&t.picker, i as usize);
+                }
+                _ => {
+                    handle.sync_availability(&mut t.picker, pieces);
+                    handle.update_interest(&t.picker);
+                }
+            }
             if t.is_complete() && handle.is_seed(pieces) {
                 return Err("both seeds".into());
             }
-            handle.update_interest(&t.picker);
             handle.fill_requests_locked(&mut t, ctx);
         }
         WireEvent::Unchoked | WireEvent::AllowedFast(_) | WireEvent::Suggest(_) => {
@@ -1140,34 +1244,41 @@ async fn acquire_pair(session: &Limiter, torrent: &Limiter, want: u64) -> u64 {
     g2
 }
 
-fn refund_pair(session: &Limiter, torrent: &Limiter, n: u64) {
-    if n > 0 {
-        session.refund(n);
-        torrent.refund(n);
-    }
-}
-
 /// Flush the connection's outbound bytes as they appear, within the upload
 /// limits.
 async fn writer(
     ctx: Rc<Ctx>,
     torrent: Rc<RefCell<Torrent>>,
-    stream: Rc<TcpStream>,
+    stream: Rc<Transport>,
     handle: Rc<PeerHandle>,
 ) {
     let up_limit = torrent.borrow().up_limit.clone();
     loop {
-        let mut out = handle.conn.borrow_mut().take_outbound();
+        // Chunks are sent as they are (piece payloads are the block buffers
+        // read from disk); the cipher runs over them in order, in place.
+        let mut chunks = handle.conn.borrow_mut().take_outbound_chunks();
         if let Some(e) = handle.cipher.borrow_mut().enc.as_mut() {
-            e.apply(&mut out);
+            for c in &mut chunks {
+                e.apply(c);
+            }
         }
-        if out.is_empty() {
+        if chunks.is_empty() {
             match select2(handle.out.wait(), handle.close.wait()).await {
                 Either::Left(()) => continue,
                 Either::Right(()) => break,
             }
         }
-        let total = out.len();
+        // One vectored send for the whole batch (framing + block buffers),
+        // or grant-sized slices of it under an upload limit. Payload-sized
+        // batches go zero-copy when configured; the chunks are then shared
+        // with the kernel until acknowledged.
+        let total: usize = chunks.iter().map(Vec::len).sum();
+        let bufs: Vec<Buffer> = chunks.into_iter().map(Buffer::from_vec).collect();
+        let mut out = if ctx.send_zc && total >= ZC_MIN_BYTES {
+            Outbound::ZeroCopy(Rc::new(bufs))
+        } else {
+            Outbound::Plain(Some(bufs))
+        };
         let mut offset = 0usize;
         while offset < total {
             let remaining = (total - offset) as u64;
@@ -1184,21 +1295,44 @@ async fn writer(
                     Either::Right(()) => return,
                 }
             } as usize;
-            let chunk = if offset == 0 && grant == total {
-                Buffer::from_vec(out.clone())
-            } else {
-                Buffer::from_vec(out[offset..offset + grant].to_vec())
+            let sent = match &mut out {
+                Outbound::ZeroCopy(shared) => {
+                    match select2(
+                        stream.send_all_chunks_zc(shared.clone(), offset, grant),
+                        handle.close.wait(),
+                    )
+                    .await
+                    {
+                        Either::Left(r) => r,
+                        Either::Right(()) => return,
+                    }
+                }
+                Outbound::Plain(slot) => {
+                    let Some(bufs) = slot.take() else { return };
+                    match select2(
+                        stream.send_all_chunks(bufs, offset, grant),
+                        handle.close.wait(),
+                    )
+                    .await
+                    {
+                        Either::Left(Ok(b)) => {
+                            *slot = Some(b);
+                            Ok(())
+                        }
+                        Either::Left(Err(e)) => Err(e),
+                        Either::Right(()) => return,
+                    }
+                }
             };
-            match select2(stream.send_all(chunk), handle.close.wait()).await {
-                Either::Left(Ok(_)) => {
+            match sent {
+                Ok(()) => {
                     handle.last_send.set(Instant::now());
                     offset += grant;
                 }
-                Either::Left(Err(e)) => {
+                Err(e) => {
                     handle.close(&format!("send: {e}"));
                     return;
                 }
-                Either::Right(()) => return,
             }
         }
         handle.drained.notify();
@@ -1257,7 +1391,7 @@ async fn uploader(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, handle: Rc<PeerHa
                 Ok(data) => {
                     let mut conn = handle.conn.borrow_mut();
                     if conn.incoming_requests().contains(&r) {
-                        conn.piece(r, &data);
+                        conn.piece(r, data);
                         drop(conn);
                         let n = u64::from(r.length);
                         handle.uploaded.set(handle.uploaded.get() + n);

@@ -35,7 +35,8 @@ observable semantics without copying its code.
    keeps counting the skipped bytes: the announce stays truthful (rule 1) and
    matches libtorrent.
 4. **Priorities persist in resume data** (format version 2; version 1 files
-   read as "all default"). The caller's `AddTorrent::file_priorities` win over
+   read as "all default"; version 3, 0.2.0, adds `active_time` /
+   `seeding_time` seconds and reads v1/v2 with zero times). The caller's `AddTorrent::file_priorities` win over
    the resume data's.
 5. **Move storage quiesces, then renames.** `move_storage` raises a gate that
    disk reads/writes of that torrent wait on, waits for in-flight writes and

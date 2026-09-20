@@ -38,6 +38,7 @@ compile_error!(
 
 mod bridge;
 mod bufpool;
+mod bufring;
 mod error;
 mod fs;
 mod net;
@@ -49,9 +50,10 @@ mod timer;
 
 pub use bridge::{Bridge, Completer, Ticket};
 pub use bufpool::{Buffer, BufferPool};
+pub use bufring::{BufRing, RingBuf};
 pub use error::{Error, Result};
 pub use fs::File;
-pub use net::{TcpListener, TcpStream, UdpSocket};
+pub use net::{RecvMulti, TcpListener, TcpStream, UdpSocket};
 pub use notify::{Notifier, NotifyHandle};
 pub use probe::{Features, probe};
 pub use runtime::{JoinHandle, Runtime, spawn};

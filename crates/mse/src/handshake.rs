@@ -320,6 +320,72 @@ enum RState {
     },
 }
 
+/// Resolves the MSE stream key hash `SHA1("req2" + info_hash)` (what the
+/// initiator sends XORed with `req3`) to the torrent it names.
+pub trait SkeyLookup {
+    /// The info-hash whose `req2` hash is `req2`, if we serve it.
+    fn resolve(&self, req2: &[u8; 20]) -> Option<InfoHash>;
+}
+
+/// `SHA1("req2" + info_hash)`: the key an initiator identifies a torrent by.
+pub fn req2_hash(info_hash: &InfoHash) -> [u8; 20] {
+    sha1(&[b"req2", info_hash])
+}
+
+/// Linear lookup over a few hashes (tests, tap peers).
+impl SkeyLookup for [InfoHash] {
+    fn resolve(&self, req2: &[u8; 20]) -> Option<InfoHash> {
+        self.iter().copied().find(|ih| req2_hash(ih) == *req2)
+    }
+}
+
+impl<const N: usize> SkeyLookup for [InfoHash; N] {
+    fn resolve(&self, req2: &[u8; 20]) -> Option<InfoHash> {
+        self[..].resolve(req2)
+    }
+}
+
+/// A precomputed `req2 -> info_hash` map for every torrent a session serves:
+/// one SHA-1 per torrent at add time instead of one per torrent per incoming
+/// encrypted connection.
+#[derive(Debug, Default, Clone)]
+pub struct SkeyIndex {
+    map: std::collections::HashMap<[u8; 20], InfoHash>,
+}
+
+impl SkeyIndex {
+    /// An empty index.
+    pub fn new() -> SkeyIndex {
+        SkeyIndex::default()
+    }
+
+    /// Start serving `info_hash`.
+    pub fn insert(&mut self, info_hash: InfoHash) {
+        self.map.insert(req2_hash(&info_hash), info_hash);
+    }
+
+    /// Stop serving `info_hash`.
+    pub fn remove(&mut self, info_hash: &InfoHash) {
+        self.map.remove(&req2_hash(info_hash));
+    }
+
+    /// Torrents indexed.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether nothing is indexed.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+impl SkeyLookup for SkeyIndex {
+    fn resolve(&self, req2: &[u8; 20]) -> Option<InfoHash> {
+        self.map.get(req2).copied()
+    }
+}
+
 /// The accepting side.
 pub struct Responder {
     private: [u8; 20],
@@ -364,13 +430,15 @@ impl Responder {
         std::mem::take(&mut self.out)
     }
 
-    /// Feed received bytes. `torrents` are the info-hashes we serve (to
-    /// resolve the stream key). `Some(outcome)` once complete; the outcome's
+    /// Feed received bytes. `torrents` resolves the stream key (`req2 ^ req3`)
+    /// to one of the info-hashes we serve: a [`SkeyIndex`] for a session (O(1)
+    /// per connection whatever the torrent count), or a plain slice for a
+    /// handful of hashes. `Some(outcome)` once complete; the outcome's
     /// `plaintext` starts with the peer's BitTorrent handshake (IA).
     pub fn receive(
         &mut self,
         bytes: &[u8],
-        torrents: &[InfoHash],
+        torrents: &dyn SkeyLookup,
         rng: &mut dyn Rng,
     ) -> Result<Option<Outcome>, Error> {
         self.buf.extend_from_slice(bytes);
@@ -413,11 +481,7 @@ impl Responder {
                         req2[i] = self.buf[i] ^ req3[i];
                     }
                     self.buf.drain(..20);
-                    let info_hash = torrents
-                        .iter()
-                        .copied()
-                        .find(|ih| sha1(&[b"req2", ih]) == req2)
-                        .ok_or(Error::UnknownSkey)?;
+                    let info_hash = torrents.resolve(&req2).ok_or(Error::UnknownSkey)?;
                     self.info_hash = info_hash;
                     self.dec = Some(Rc4Stream::new(&sha1(&[b"keyA", &self.secret, &info_hash])));
                     self.state = RState::WaitHead;

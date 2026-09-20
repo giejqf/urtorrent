@@ -179,7 +179,7 @@ pub fn spawn_seeder(info_hash: [u8; 20], data: Arc<Vec<u8>>, piece_len: usize) -
                             WireEvent::Request(r) => {
                                 let start = r.index as usize * piece_len + r.begin as usize;
                                 let end = start + r.length as usize;
-                                conn.piece(r, &data[start..end]);
+                                conn.piece(r, data[start..end].to_vec());
                             }
                             _ => {}
                         }

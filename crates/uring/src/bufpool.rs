@@ -14,6 +14,10 @@ use std::rc::Rc;
 /// preserved across pool reuse.
 pub struct Buffer {
     data: Vec<u8>,
+    /// High-water mark of bytes of `data`'s allocation that were ever
+    /// initialised (written by us or by the kernel). Reusing a buffer as a
+    /// receive target below this mark needs no zero-fill.
+    init: usize,
     pool: Option<Rc<PoolInner>>,
 }
 
@@ -22,13 +26,18 @@ impl Buffer {
     pub fn with_capacity(cap: usize) -> Buffer {
         Buffer {
             data: Vec::with_capacity(cap),
+            init: 0,
             pool: None,
         }
     }
 
     /// A standalone buffer owning `data`.
     pub fn from_vec(data: Vec<u8>) -> Buffer {
-        Buffer { data, pool: None }
+        Buffer {
+            init: data.len(),
+            data,
+            pool: None,
+        }
     }
 
     /// The meaningful bytes (`&data[..len]`).
@@ -60,17 +69,34 @@ impl Buffer {
     /// Used to size a receive buffer to the pool's read size before a `recv`.
     pub fn resize(&mut self, n: usize) {
         self.data.resize(n, 0);
+        self.init = self.init.max(n);
     }
 
     /// Replace the contents with `bytes`.
     pub fn set(&mut self, bytes: &[u8]) {
         self.data.clear();
         self.data.extend_from_slice(bytes);
+        self.init = self.init.max(self.data.len());
     }
 
     /// Truncate to `n` bytes (used to record how many bytes a recv filled).
     pub fn truncate(&mut self, n: usize) {
         self.data.truncate(n);
+    }
+
+    /// Set the length to `n` for use as a receive/read target, zero-filling
+    /// only bytes this allocation never held before (a recycled buffer's
+    /// bytes are still initialised memory, so the fill is skipped).
+    pub(crate) fn set_len_filled(&mut self, n: usize) {
+        if n <= self.init && n <= self.data.capacity() {
+            // SAFETY: `n <= capacity`, and every byte below `init` was
+            // initialised earlier in this allocation's life (`init` only
+            // grows, and the pool keeps it with the allocation), so the
+            // elements in `len..n` are valid `u8`s.
+            unsafe { self.data.set_len(n) };
+        } else {
+            self.resize(n);
+        }
     }
 
     /// Consume and return the inner `Vec`.
@@ -96,7 +122,7 @@ impl Drop for Buffer {
         if let Some(pool) = self.pool.take() {
             let mut data = std::mem::take(&mut self.data);
             data.clear();
-            pool.recycle(data);
+            pool.recycle(data, self.init);
         }
     }
 }
@@ -114,14 +140,15 @@ impl std::fmt::Debug for Buffer {
 struct PoolInner {
     buf_size: usize,
     max_idle: usize,
-    free: RefCell<Vec<Vec<u8>>>,
+    /// Free allocations with their initialised high-water mark.
+    free: RefCell<Vec<(Vec<u8>, usize)>>,
 }
 
 impl PoolInner {
-    fn recycle(&self, buf: Vec<u8>) {
+    fn recycle(&self, buf: Vec<u8>, init: usize) {
         let mut free = self.free.borrow_mut();
         if free.len() < self.max_idle && buf.capacity() >= self.buf_size {
-            free.push(buf);
+            free.push((buf, init));
         }
         // else: let it drop
     }
@@ -150,23 +177,25 @@ impl BufferPool {
     /// Take a buffer (length 0, capacity >= `buf_size`). Reuses a free one if
     /// available.
     pub fn take(&self) -> Buffer {
-        let data = self
+        let (data, init) = self
             .inner
             .free
             .borrow_mut()
             .pop()
-            .unwrap_or_else(|| Vec::with_capacity(self.inner.buf_size));
+            .unwrap_or_else(|| (Vec::with_capacity(self.inner.buf_size), 0));
         Buffer {
             data,
+            init,
             pool: Some(self.inner.clone()),
         }
     }
 
-    /// Take a buffer already sized to `buf_size` (zero-filled), ready for a
-    /// `recv`/`read`.
+    /// Take a buffer already sized to `buf_size`, ready for a `recv`/`read`.
+    /// A fresh allocation is zero-filled once; a recycled one keeps its old
+    /// bytes (every read path truncates to the count the kernel reports).
     pub fn take_sized(&self) -> Buffer {
         let mut b = self.take();
-        b.resize(self.inner.buf_size);
+        b.set_len_filled(self.inner.buf_size);
         b
     }
 
@@ -184,8 +213,9 @@ impl BufferPool {
     /// (e.g. after a round trip to a worker thread) so it can be reused.
     pub fn put(&self, data: Vec<u8>) {
         let mut data = data;
+        let init = data.len();
         data.clear();
-        self.inner.recycle(data);
+        self.inner.recycle(data, init);
     }
 }
 
@@ -206,6 +236,19 @@ mod tests {
         assert_eq!(b2.len(), 0);
         assert!(b2.capacity() >= 4096);
         assert_eq!(pool.idle(), 0);
+    }
+
+    #[test]
+    fn recycled_buffer_is_resized_without_refill() {
+        let pool = BufferPool::new(1024, 4);
+        let mut b = pool.take_sized();
+        b.as_mut_slice()[..4].copy_from_slice(b"abcd");
+        drop(b);
+        let b = pool.take_sized();
+        // Same allocation, no zero-fill: the old bytes are still there.
+        assert_eq!(b.len(), 1024);
+        assert_eq!(&b.as_slice()[..4], b"abcd");
+        assert_eq!(b.init, 1024);
     }
 
     #[test]

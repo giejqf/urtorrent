@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 urtorrent contributors
+// Piece extent affinity follows libtorrent-rasterbar (BSD-3-Clause),
+// Copyright (c) Arvid Norberg and contributors; see NOTICE.
 
 //! The piece picker: decides which blocks to request from which peer.
 //!
@@ -9,9 +11,23 @@
 //! sequential mode, and end-game (duplicate requests to other peers once every
 //! remaining block is already requested) with cancellation of the losers.
 //!
+//! Piece extent affinity (libtorrent's `piece_extent_affinity`, on by default
+//! here): with pieces smaller than 4 MiB, a few recently started 4 MiB
+//! extents are finished before rarest-first chooses the next one, so the
+//! disk sees runs of contiguous writes rather than 16 KiB scattered over the
+//! whole file (which leaves the kernel's writeback with random I/O). Piece
+//! order is L3 behaviour; the oracle ships the option off.
+//!
 //! Pure state: no I/O, no clock, randomness injected through
 //! [`profile::Rng`]. The session owns the mapping from its peers to
 //! [`PeerKey`]s and turns [`Block`]s into wire requests.
+//!
+//! Every hot query is O(1) or proportional to what it returns, never to the
+//! piece count: completion, bytes left and end-game come from counters kept
+//! up to date by every state change, and `pick` walks an index (partial
+//! pieces in one list, untouched wanted pieces bucketed by priority and
+//! availability, plus an ordered set for sequential mode) instead of
+//! scanning every piece.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -44,6 +60,17 @@ enum BlockState {
     Received,
 }
 
+/// Where a piece sits in the pick index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Loc {
+    /// Have, or priority 0: not a candidate.
+    None,
+    /// Being downloaded (block state allocated): `open[slot]`.
+    Open,
+    /// Untouched and wanted: `fresh[prio][avail][slot]`.
+    Fresh { prio: u8, avail: u32 },
+}
+
 #[derive(Debug, Clone)]
 struct Piece {
     availability: u32,
@@ -53,6 +80,15 @@ struct Piece {
     blocks: Option<Vec<BlockState>>,
     free: u32,
     received: u32,
+    loc: Loc,
+    /// Index within its `Loc` container.
+    slot: u32,
+}
+
+impl Piece {
+    fn wanted(&self) -> bool {
+        !self.have && self.priority > 0
+    }
 }
 
 /// What happened to a received block.
@@ -81,13 +117,50 @@ pub struct Picker {
     /// Wanted blocks not requested by anyone and not received.
     free_blocks: u64,
     have_count: usize,
+    /// Pieces with priority > 0, and how many of those we have.
+    wanted_count: usize,
+    wanted_have: usize,
+    /// Bytes of pieces we have, and of wanted pieces we have / in total.
+    have_bytes: u64,
+    wanted_bytes: u64,
+    wanted_have_bytes: u64,
     /// Pieces only one peer may download (after a hash failure with several
     /// suppliers, so the next failure has a single culprit).
     exclusive: std::collections::HashMap<usize, PeerKey>,
+    /// Pieces being downloaded.
+    open: Vec<usize>,
+    /// Untouched wanted pieces: `fresh[priority][availability]`.
+    fresh: Vec<Vec<Vec<usize>>>,
+    /// Untouched wanted pieces *someone has* ordered by `(7 - priority,
+    /// index)`, for sequential picking. Pieces with availability 0 are only
+    /// in `fresh[prio][0]`, which no pick path visits: nobody can serve them.
+    fresh_seq: std::collections::BTreeSet<(u8, usize)>,
+    /// Extents (runs of `extent_len` pieces) we recently started downloading
+    /// and prefer to finish, oldest first; at most `MAX_RECENT_EXTENTS`.
+    recent_extents: Vec<usize>,
+    /// Whether extent affinity is on (it never applies to pieces of 4 MiB or
+    /// more, nor in sequential mode).
+    extent_affinity: bool,
 }
+
+/// Size of a piece extent for affinity purposes (libtorrent
+/// `max_piece_affinity_extent`, 4 MiB expressed in blocks there).
+const EXTENT_BYTES: u64 = 4 << 20;
+/// How many extents are kept "recent" (libtorrent hardcodes 5).
+const MAX_RECENT_EXTENTS: usize = 5;
 
 /// Maximum distinct pieces one `pick` call opens (keeps a single call cheap).
 const MAX_PIECES_PER_PICK: usize = 16;
+
+/// The fixed inputs of one `pick` call.
+struct PickCtx<'a> {
+    peer: PeerKey,
+    has: &'a dyn Fn(usize) -> bool,
+    /// Pieces already opened by this call.
+    used: &'a [usize],
+    end_game: bool,
+    sequential: bool,
+}
 
 impl Picker {
     /// A picker for `piece_count` pieces of `piece_length` bytes (`total_length`
@@ -102,6 +175,8 @@ impl Picker {
                     blocks: None,
                     free: 0,
                     received: 0,
+                    loc: Loc::None,
+                    slot: 0,
                 };
                 piece_count
             ],
@@ -110,10 +185,104 @@ impl Picker {
             sequential: false,
             free_blocks: 0,
             have_count: 0,
+            wanted_count: 0,
+            wanted_have: 0,
+            have_bytes: 0,
+            wanted_bytes: 0,
+            wanted_have_bytes: 0,
             exclusive: std::collections::HashMap::new(),
+            open: Vec::new(),
+            fresh: vec![Vec::new(); 8],
+            fresh_seq: std::collections::BTreeSet::new(),
+            recent_extents: Vec::new(),
+            extent_affinity: true,
         };
-        p.recount_free();
+        p.rebuild();
         p
+    }
+
+    /// Turn piece extent affinity on or off (default on).
+    pub fn set_extent_affinity(&mut self, on: bool) {
+        self.extent_affinity = on;
+        if !on {
+            self.recent_extents.clear();
+        }
+    }
+
+    /// Pieces per extent, or `None` when a single piece is already 4 MiB.
+    fn extent_len(&self) -> Option<usize> {
+        let n = (EXTENT_BYTES / u64::from(self.piece_length)) as usize;
+        (self.extent_affinity && n >= 2).then_some(n)
+    }
+
+    /// The pieces of extent `e`.
+    fn extent_range(&self, e: usize, len: usize) -> std::ops::Range<usize> {
+        let begin = e * len;
+        begin..(begin + len).min(self.pieces.len())
+    }
+
+    /// We started downloading `piece`: remember its extent so the next picks
+    /// stay nearby (libtorrent `record_downloading_piece`). Not recorded when
+    /// the extent mixes priorities (probably a file boundary) or when we have
+    /// every other piece of it already.
+    fn record_downloading_piece(&mut self, piece: usize) {
+        let Some(len) = self.extent_len() else {
+            return;
+        };
+        let e = piece / len;
+        if self.recent_extents.contains(&e) || self.recent_extents.len() >= MAX_RECENT_EXTENTS {
+            return;
+        }
+        let prio = self.pieces[piece].priority;
+        let mut have_all_others = true;
+        for i in self.extent_range(e, len) {
+            if i == piece {
+                continue;
+            }
+            let p = &self.pieces[i];
+            if p.priority != prio {
+                return;
+            }
+            if !p.have {
+                have_all_others = false;
+            }
+        }
+        if have_all_others {
+            return;
+        }
+        self.recent_extents.push(e);
+    }
+
+    /// A pickable piece from the oldest recent extent that has one: a piece
+    /// already being downloaded before an untouched one (our "partial first"
+    /// rule keeps holding inside the extent), lowest index otherwise.
+    /// Extents we have completely are dropped on the way.
+    fn pick_in_recent_extents(&mut self, c: &PickCtx<'_>) -> Option<usize> {
+        let len = self.extent_len()?;
+        let mut found = None;
+        let mut keep = Vec::with_capacity(self.recent_extents.len());
+        for &e in &self.recent_extents {
+            let mut have_all = true;
+            let mut fresh = None;
+            for i in self.extent_range(e, len) {
+                let p = &self.pieces[i];
+                have_all &= p.have;
+                if found.is_some() || !p.wanted() || !self.eligible(i, c) {
+                    continue;
+                }
+                if p.blocks.is_some() {
+                    found = Some(i);
+                } else if fresh.is_none() {
+                    fresh = Some(i);
+                }
+            }
+            found = found.or(fresh);
+            if !have_all {
+                keep.push(e);
+            }
+        }
+        self.recent_extents = keep;
+        found
     }
 
     // --- geometry ---
@@ -158,19 +327,118 @@ impl Picker {
         Some((piece, b))
     }
 
-    fn recount_free(&mut self) {
-        let mut free = 0u64;
-        for i in 0..self.pieces.len() {
-            let p = &self.pieces[i];
-            if p.have || p.priority == 0 {
-                continue;
-            }
-            free += match &p.blocks {
-                Some(_) => u64::from(p.free),
-                None => u64::from(self.blocks_in(i)),
-            };
+    // --- counters and index maintenance ---
+
+    /// Free (unrequested, unreceived) blocks of a wanted piece.
+    fn free_in(&self, i: usize) -> u64 {
+        let p = &self.pieces[i];
+        match &p.blocks {
+            Some(_) => u64::from(p.free),
+            None => u64::from(self.blocks_in(i)),
         }
-        self.free_blocks = free;
+    }
+
+    /// Recompute every counter and the whole index (bulk changes only).
+    fn rebuild(&mut self) {
+        self.free_blocks = 0;
+        self.have_count = 0;
+        self.wanted_count = 0;
+        self.wanted_have = 0;
+        self.have_bytes = 0;
+        self.wanted_bytes = 0;
+        self.wanted_have_bytes = 0;
+        self.open.clear();
+        for b in &mut self.fresh {
+            b.clear();
+        }
+        self.fresh_seq.clear();
+        for i in 0..self.pieces.len() {
+            let size = u64::from(self.piece_size(i));
+            let p = &self.pieces[i];
+            if p.have {
+                self.have_count += 1;
+                self.have_bytes += size;
+            }
+            if p.priority > 0 {
+                self.wanted_count += 1;
+                self.wanted_bytes += size;
+                if p.have {
+                    self.wanted_have += 1;
+                    self.wanted_have_bytes += size;
+                }
+            }
+            if p.wanted() {
+                self.free_blocks += self.free_in(i);
+            }
+            self.pieces[i].loc = Loc::None;
+            self.place(i);
+        }
+    }
+
+    /// Put piece `i` where its state says it belongs (removing it from where
+    /// it was).
+    fn place(&mut self, i: usize) {
+        self.unplace(i);
+        let p = &self.pieces[i];
+        let loc = if !p.wanted() {
+            Loc::None
+        } else if p.blocks.is_some() {
+            Loc::Open
+        } else {
+            Loc::Fresh {
+                prio: p.priority,
+                avail: p.availability,
+            }
+        };
+        match loc {
+            Loc::None => {}
+            Loc::Open => {
+                self.pieces[i].slot = self.open.len() as u32;
+                self.open.push(i);
+            }
+            Loc::Fresh { prio, avail } => {
+                let by_prio = &mut self.fresh[prio as usize];
+                if by_prio.len() <= avail as usize {
+                    by_prio.resize(avail as usize + 1, Vec::new());
+                }
+                let bucket = &mut by_prio[avail as usize];
+                self.pieces[i].slot = bucket.len() as u32;
+                bucket.push(i);
+                if avail > 0 {
+                    self.fresh_seq.insert((7 - prio, i));
+                }
+            }
+        }
+        self.pieces[i].loc = loc;
+    }
+
+    /// Remove piece `i` from its container.
+    fn unplace(&mut self, i: usize) {
+        let (loc, slot) = (self.pieces[i].loc, self.pieces[i].slot as usize);
+        match loc {
+            Loc::None => return,
+            Loc::Open => {
+                let last = self.open.len() - 1;
+                self.open.swap_remove(slot);
+                if slot != last {
+                    let moved = self.open[slot];
+                    self.pieces[moved].slot = slot as u32;
+                }
+            }
+            Loc::Fresh { prio, avail } => {
+                let bucket = &mut self.fresh[prio as usize][avail as usize];
+                let last = bucket.len() - 1;
+                bucket.swap_remove(slot);
+                if slot != last {
+                    let moved = bucket[slot];
+                    self.pieces[moved].slot = slot as u32;
+                }
+                if avail > 0 {
+                    self.fresh_seq.remove(&(7 - prio, i));
+                }
+            }
+        }
+        self.pieces[i].loc = Loc::None;
     }
 
     // --- our state ---
@@ -186,8 +454,7 @@ impl Picker {
                 p.received = 0;
             }
         }
-        self.have_count = self.pieces.iter().filter(|p| p.have).count();
-        self.recount_free();
+        self.rebuild();
     }
 
     /// Only `peer` may download piece `i` from now on (until the piece
@@ -206,38 +473,86 @@ impl Picker {
     /// Piece `i` verified: we have it.
     pub fn piece_verified(&mut self, i: usize) {
         self.exclusive.remove(&i);
-        let Some(p) = self.pieces.get_mut(i) else {
+        if i >= self.pieces.len() {
             return;
-        };
+        }
+        if self.pieces[i].wanted() {
+            self.free_blocks -= self.free_in(i);
+        }
+        let size = u64::from(self.piece_size(i));
+        let p = &mut self.pieces[i];
         if !p.have {
             p.have = true;
             self.have_count += 1;
+            self.have_bytes += size;
+            if p.priority > 0 {
+                self.wanted_have += 1;
+                self.wanted_have_bytes += size;
+            }
         }
         p.blocks = None;
         p.free = 0;
         p.received = 0;
-        self.recount_free();
+        self.place(i);
     }
 
     /// Piece `i` failed its hash: every block goes back to free (the caller
     /// attributes blame to the peers that supplied it).
     pub fn piece_failed(&mut self, i: usize) {
         self.exclusive.remove(&i);
-        let Some(p) = self.pieces.get_mut(i) else {
+        if i >= self.pieces.len() {
             return;
-        };
+        }
+        if self.pieces[i].wanted() {
+            self.free_blocks -= self.free_in(i);
+        }
+        let p = &mut self.pieces[i];
         p.blocks = None;
         p.free = 0;
         p.received = 0;
-        self.recount_free();
+        if self.pieces[i].wanted() {
+            self.free_blocks += self.free_in(i);
+        }
+        self.place(i);
     }
 
     /// Set the priority of piece `i` (0 = do not download, 1..7).
     pub fn set_priority(&mut self, i: usize, priority: u8) {
-        if let Some(p) = self.pieces.get_mut(i) {
-            p.priority = priority.min(7);
-            self.recount_free();
+        if i >= self.pieces.len() {
+            return;
         }
+        let priority = priority.min(7);
+        let size = u64::from(self.piece_size(i));
+        if self.pieces[i].wanted() {
+            self.free_blocks -= self.free_in(i);
+        }
+        {
+            let p = &self.pieces[i];
+            if p.priority > 0 {
+                self.wanted_count -= 1;
+                self.wanted_bytes -= size;
+                if p.have {
+                    self.wanted_have -= 1;
+                    self.wanted_have_bytes -= size;
+                }
+            }
+        }
+        self.pieces[i].priority = priority;
+        {
+            let p = &self.pieces[i];
+            if p.priority > 0 {
+                self.wanted_count += 1;
+                self.wanted_bytes += size;
+                if p.have {
+                    self.wanted_have += 1;
+                    self.wanted_have_bytes += size;
+                }
+            }
+        }
+        if self.pieces[i].wanted() {
+            self.free_blocks += self.free_in(i);
+        }
+        self.place(i);
     }
 
     /// Priority of piece `i`.
@@ -278,7 +593,7 @@ impl Picker {
 
     /// Whether every *wanted* piece is ours.
     pub fn is_complete(&self) -> bool {
-        self.pieces.iter().all(|p| p.have || p.priority == 0)
+        self.wanted_have == self.wanted_count
     }
 
     /// Whether every piece is ours (a true seed).
@@ -288,18 +603,17 @@ impl Picker {
 
     /// Bytes of the whole torrent we do not have yet (the announce `left`).
     pub fn bytes_left(&self) -> u64 {
-        (0..self.pieces.len())
-            .filter(|&i| !self.pieces[i].have)
-            .map(|i| u64::from(self.piece_size(i)))
-            .sum()
+        self.total_length.saturating_sub(self.have_bytes)
     }
 
     /// Bytes of wanted pieces we do not have yet.
     pub fn wanted_bytes_left(&self) -> u64 {
-        (0..self.pieces.len())
-            .filter(|&i| !self.pieces[i].have && self.pieces[i].priority > 0)
-            .map(|i| u64::from(self.piece_size(i)))
-            .sum()
+        self.wanted_bytes.saturating_sub(self.wanted_have_bytes)
+    }
+
+    /// Bytes of pieces with priority > 0, and those of them we have.
+    pub fn wanted_totals(&self) -> (u64, u64) {
+        (self.wanted_bytes, self.wanted_have_bytes)
     }
 
     /// Whether we are in end-game: nothing left to request except blocks
@@ -310,11 +624,53 @@ impl Picker {
 
     // --- peer availability ---
 
+    fn set_availability(&mut self, i: usize, avail: u32) {
+        let p = &self.pieces[i];
+        if p.availability == avail {
+            return;
+        }
+        let Loc::Fresh { prio, avail: old } = p.loc else {
+            self.pieces[i].availability = avail;
+            return;
+        };
+        // Move between availability buckets of the same priority without
+        // going through `place`: `fresh_seq` only cares whether anyone has
+        // the piece.
+        let slot = p.slot as usize;
+        let by_prio = &mut self.fresh[prio as usize];
+        let bucket = &mut by_prio[old as usize];
+        let last = bucket.len() - 1;
+        bucket.swap_remove(slot);
+        if slot != last {
+            let moved = bucket[slot];
+            self.pieces[moved].slot = slot as u32;
+        }
+        if by_prio.len() <= avail as usize {
+            by_prio.resize(avail as usize + 1, Vec::new());
+        }
+        let bucket = &mut by_prio[avail as usize];
+        let p = &mut self.pieces[i];
+        p.slot = bucket.len() as u32;
+        p.availability = avail;
+        p.loc = Loc::Fresh { prio, avail };
+        bucket.push(i);
+        match (old == 0, avail == 0) {
+            (true, false) => {
+                self.fresh_seq.insert((7 - prio, i));
+            }
+            (false, true) => {
+                self.fresh_seq.remove(&(7 - prio, i));
+            }
+            _ => {}
+        }
+    }
+
     /// A peer with this bitfield joined (or sent its bitfield).
     pub fn peer_joined(&mut self, has: &Bitfield) {
         for i in has.iter_set() {
-            if let Some(p) = self.pieces.get_mut(i) {
-                p.availability += 1;
+            if i < self.pieces.len() {
+                let a = self.pieces[i].availability + 1;
+                self.set_availability(i, a);
             }
         }
     }
@@ -322,16 +678,18 @@ impl Picker {
     /// A peer with this bitfield left (or replaced its bitfield).
     pub fn peer_left(&mut self, had: &Bitfield) {
         for i in had.iter_set() {
-            if let Some(p) = self.pieces.get_mut(i) {
-                p.availability = p.availability.saturating_sub(1);
+            if i < self.pieces.len() {
+                let a = self.pieces[i].availability.saturating_sub(1);
+                self.set_availability(i, a);
             }
         }
     }
 
     /// A peer announced one more piece (`have`).
     pub fn peer_has(&mut self, i: usize) {
-        if let Some(p) = self.pieces.get_mut(i) {
-            p.availability += 1;
+        if i < self.pieces.len() {
+            let a = self.pieces[i].availability + 1;
+            self.set_availability(i, a);
         }
     }
 
@@ -344,11 +702,12 @@ impl Picker {
 
     fn ensure_blocks(&mut self, piece: usize) {
         let n = self.blocks_in(piece);
-        let p = &mut self.pieces[piece];
-        if p.blocks.is_none() {
+        if self.pieces[piece].blocks.is_none() {
+            let p = &mut self.pieces[piece];
             p.blocks = Some(vec![BlockState::Free; n as usize]);
             p.free = n;
             p.received = 0;
+            self.place(piece);
         }
     }
 
@@ -366,6 +725,16 @@ impl Picker {
                             .any(|b| matches!(b, BlockState::Requested(by) if !by.contains(&peer))))
             }
         }
+    }
+
+    /// Whether the peer may pick `piece` at all (has it, not reserved for
+    /// someone else, not already opened in this call, something to request).
+    fn eligible(&self, piece: usize, c: &PickCtx<'_>) -> bool {
+        (c.has)(piece)
+            && !c.used.contains(&piece)
+            && (self.exclusive.is_empty()
+                || !self.exclusive.get(&piece).is_some_and(|k| *k != c.peer))
+            && self.pickable(piece, c.peer, c.end_game)
     }
 
     /// Choose up to `want` blocks for `peer`, whose have-set is `has`.
@@ -396,6 +765,89 @@ impl Picker {
         self.pick_mode(peer, has, want, rng, true)
     }
 
+    /// The best partial (open) piece for the peer: highest priority, then
+    /// rarest (or lowest index when sequential), random tie-break.
+    fn best_open(&self, c: &PickCtx<'_>, rng: &mut dyn Rng) -> Option<(u64, usize)> {
+        let mut best: Option<(u64, usize)> = None;
+        let mut ties = 0u32;
+        for &i in &self.open {
+            if !self.eligible(i, c) {
+                continue;
+            }
+            let p = &self.pieces[i];
+            let key = if c.sequential {
+                ((7 - u64::from(p.priority)) << 40) | (i as u64)
+            } else {
+                ((7 - u64::from(p.priority)) << 40) | u64::from(p.availability)
+            };
+            match best {
+                None => {
+                    best = Some((key, i));
+                    ties = 1;
+                }
+                Some((bk, _)) if key < bk => {
+                    best = Some((key, i));
+                    ties = 1;
+                }
+                Some((bk, _)) if key == bk && !c.sequential => {
+                    ties += 1;
+                    if rng.below(ties) == 0 {
+                        best = Some((key, i));
+                    }
+                }
+                _ => {}
+            }
+        }
+        best
+    }
+
+    /// The best untouched piece for the peer at a priority strictly above
+    /// `above_prio` (partial pieces win ties at equal priority): rarest
+    /// first, random within a bucket; or lowest index when sequential.
+    fn best_fresh(
+        &self,
+        c: &PickCtx<'_>,
+        above_prio: u8,
+        rng: &mut dyn Rng,
+    ) -> Option<(u64, usize)> {
+        if c.sequential {
+            // `fresh_seq` is ordered by (7 - priority, index): the first
+            // eligible entry above the bound is the answer.
+            for &(inv, i) in &self.fresh_seq {
+                let prio = 7 - inv;
+                if prio <= above_prio {
+                    return None;
+                }
+                if self.eligible(i, c) {
+                    return Some(((u64::from(inv) << 40) | (i as u64), i));
+                }
+            }
+            return None;
+        }
+        for prio in ((above_prio + 1)..=7).rev() {
+            let by_avail = &self.fresh[prio as usize];
+            // Availability 0 is skipped: no peer can have those pieces (the
+            // caller keeps availability in step with the peers' have-sets,
+            // web seeds included).
+            for (avail, bucket) in by_avail.iter().enumerate().skip(1) {
+                if bucket.is_empty() {
+                    continue;
+                }
+                // Random start, first eligible piece from there.
+                let n = bucket.len();
+                let start = rng.below(n as u32) as usize;
+                for k in 0..n {
+                    let i = bucket[(start + k) % n];
+                    if self.eligible(i, c) {
+                        let key = ((7 - u64::from(prio)) << 40) | avail as u64;
+                        return Some((key, i));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn pick_mode(
         &mut self,
         peer: PeerKey,
@@ -408,49 +860,55 @@ impl Picker {
         let mut used: Vec<usize> = Vec::new();
         let end_game = self.end_game();
         while out.len() < want && used.len() < MAX_PIECES_PER_PICK {
-            // Best candidate: highest priority, partial first, rarest, random
-            // tie-break (or lowest index in sequential mode).
-            let mut best: Option<(u64, usize)> = None;
-            let mut ties = 0u32;
-            for i in 0..self.pieces.len() {
-                let p = &self.pieces[i];
-                if p.have || p.priority == 0 || !has(i) || used.contains(&i) {
-                    continue;
-                }
-                if self.exclusive.get(&i).is_some_and(|k| *k != peer) {
-                    continue;
-                }
-                if !self.pickable(i, peer, end_game) {
-                    continue;
-                }
-                let partial = u64::from(p.blocks.is_none());
-                let key = if sequential {
-                    ((7 - u64::from(p.priority)) << 40) | (i as u64)
+            let c = PickCtx {
+                peer,
+                has,
+                used: &used,
+                end_game,
+                sequential,
+            };
+            // Recently started extents first (rarest-first mode only), then
+            // partial pieces at equal priority; a fresh piece only wins with
+            // a strictly higher priority (or, in sequential mode, a lower
+            // index at the same priority).
+            let affine = if sequential {
+                None
+            } else {
+                self.pick_in_recent_extents(&c)
+            };
+            let piece = if let Some(i) = affine {
+                i
+            } else {
+                let partial = self.best_open(&c, rng);
+                let bound = partial.map_or(0, |(_, i)| self.pieces[i].priority);
+                let fresh = if sequential {
+                    // Sequential: index decides within a priority, so compare
+                    // keys.
+                    self.best_fresh(&c, bound.saturating_sub(1), rng)
                 } else {
-                    ((7 - u64::from(p.priority)) << 40)
-                        | (partial << 32)
-                        | u64::from(p.availability)
+                    self.best_fresh(&c, bound, rng)
                 };
-                match best {
-                    None => {
-                        best = Some((key, i));
-                        ties = 1;
-                    }
-                    Some((bk, _)) if key < bk => {
-                        best = Some((key, i));
-                        ties = 1;
-                    }
-                    Some((bk, _)) if key == bk && !sequential => {
-                        ties += 1;
-                        if rng.below(ties) == 0 {
-                            best = Some((key, i));
+                match (partial, fresh) {
+                    (None, None) => break,
+                    (Some((_, i)), None) => i,
+                    (None, Some((_, i))) => i,
+                    // Sequential: the lower key (priority, then index) wins.
+                    (Some((kp, ip)), Some((kf, jf))) if sequential => {
+                        if kf < kp {
+                            jf
+                        } else {
+                            ip
                         }
                     }
-                    _ => {}
+                    // Rarest-first: `best_fresh` only returned a piece at a
+                    // strictly higher priority than the partial one.
+                    (Some(_), Some((_, jf))) => jf,
                 }
-            }
-            let Some((_, piece)) = best else { break };
+            };
             used.push(piece);
+            if self.pieces[piece].blocks.is_none() {
+                self.record_downloading_piece(piece);
+            }
             self.ensure_blocks(piece);
             let n = self.blocks_in(piece);
             // First pass: free blocks. Second pass (end-game): duplicates,
@@ -581,7 +1039,9 @@ impl Picker {
     pub fn peer_gone(&mut self, peer: PeerKey) -> Vec<Block> {
         self.exclusive.retain(|_, k| *k != peer);
         let mut released = Vec::new();
-        for piece in 0..self.pieces.len() {
+        // Only open pieces have block state.
+        let open: Vec<usize> = self.open.clone();
+        for piece in open {
             let n = self.blocks_in(piece);
             let Some(blocks) = self.pieces[piece].blocks.as_ref() else {
                 continue;
@@ -603,7 +1063,7 @@ impl Picker {
     /// Blocks `peer` currently has outstanding according to the picker.
     pub fn outstanding_for(&self, peer: PeerKey) -> Vec<Block> {
         let mut v = Vec::new();
-        for piece in 0..self.pieces.len() {
+        for &piece in &self.open {
             if let Some(blocks) = &self.pieces[piece].blocks {
                 for (b, st) in blocks.iter().enumerate() {
                     if let BlockState::Requested(by) = st
@@ -619,19 +1079,118 @@ impl Picker {
 
     /// A piece with no requested or received blocks needs no bookkeeping.
     fn maybe_drop_empty(&mut self, piece: usize) {
-        let p = &mut self.pieces[piece];
-        if let Some(blocks) = &p.blocks
-            && blocks.iter().all(|b| *b == BlockState::Free)
-        {
+        let drop = matches!(&self.pieces[piece].blocks, Some(blocks) if blocks.iter().all(|b| *b == BlockState::Free));
+        if drop {
+            let p = &mut self.pieces[piece];
             p.blocks = None;
             p.free = 0;
             p.received = 0;
+            self.place(piece);
         }
     }
 
     /// Number of pieces currently being downloaded (block state allocated).
     pub fn open_pieces(&self) -> usize {
-        self.pieces.iter().filter(|p| p.blocks.is_some()).count()
+        self.open.len()
+    }
+
+    /// Recompute every counter from scratch and check the index against the
+    /// piece states. Test-only: this is the O(pieces) walk the counters exist
+    /// to avoid.
+    #[cfg(test)]
+    fn check_invariants(&self) -> Result<(), String> {
+        let mut fresh_seen = 0usize;
+        let mut fresh_seq = std::collections::BTreeSet::new();
+        for (prio, by_avail) in self.fresh.iter().enumerate() {
+            for (avail, bucket) in by_avail.iter().enumerate() {
+                for (slot, &i) in bucket.iter().enumerate() {
+                    let p = &self.pieces[i];
+                    if p.loc
+                        != (Loc::Fresh {
+                            prio: prio as u8,
+                            avail: avail as u32,
+                        })
+                        || p.slot as usize != slot
+                        || p.priority as usize != prio
+                        || p.availability as usize != avail
+                        || !p.wanted()
+                        || p.blocks.is_some()
+                    {
+                        return Err(format!("fresh index wrong for piece {i}: {p:?}"));
+                    }
+                    fresh_seen += 1;
+                    if avail > 0 {
+                        fresh_seq.insert((7 - prio as u8, i));
+                    }
+                }
+            }
+        }
+        if fresh_seq != self.fresh_seq {
+            return Err("fresh_seq out of sync".into());
+        }
+        for (slot, &i) in self.open.iter().enumerate() {
+            let p = &self.pieces[i];
+            if p.loc != Loc::Open || p.slot as usize != slot || !p.wanted() || p.blocks.is_none() {
+                return Err(format!("open index wrong for piece {i}: {p:?}"));
+            }
+        }
+        let mut free = 0u64;
+        let (mut hc, mut wc, mut wh, mut hb, mut wb, mut whb) = (0, 0, 0, 0u64, 0u64, 0u64);
+        let mut candidates = 0usize;
+        for (i, p) in self.pieces.iter().enumerate() {
+            let size = u64::from(self.piece_size(i));
+            if p.have {
+                hc += 1;
+                hb += size;
+            }
+            if p.priority > 0 {
+                wc += 1;
+                wb += size;
+                if p.have {
+                    wh += 1;
+                    whb += size;
+                }
+            }
+            if p.wanted() {
+                candidates += 1;
+                match &p.blocks {
+                    None => free += u64::from(self.blocks_in(i)),
+                    Some(blocks) => {
+                        let f = blocks.iter().filter(|b| **b == BlockState::Free).count() as u32;
+                        let r = blocks
+                            .iter()
+                            .filter(|b| **b == BlockState::Received)
+                            .count() as u32;
+                        if f != p.free || r != p.received {
+                            return Err(format!("block counters wrong for piece {i}"));
+                        }
+                        free += u64::from(f);
+                    }
+                }
+            } else if p.loc != Loc::None {
+                return Err(format!("unwanted piece {i} is indexed"));
+            }
+        }
+        if candidates != fresh_seen + self.open.len() {
+            return Err(format!(
+                "index covers {} pieces, {candidates} wanted",
+                fresh_seen + self.open.len()
+            ));
+        }
+        let got = (
+            self.free_blocks,
+            self.have_count,
+            self.wanted_count,
+            self.wanted_have,
+            self.have_bytes,
+            self.wanted_bytes,
+            self.wanted_have_bytes,
+        );
+        let want = (free, hc, wc, wh, hb, wb, whb);
+        if got != want {
+            return Err(format!("counters {got:?} != recount {want:?}"));
+        }
+        Ok(())
     }
 }
 
@@ -900,6 +1459,211 @@ mod tests {
             }
             prop_assert_eq!(p.bytes_left(), 0);
             prop_assert!(p.is_seed());
+            p.check_invariants().map_err(TestCaseError::fail)?;
         }
+
+        /// Any interleaving of the mutating operations keeps the cached
+        /// counters equal to a full recount and the pick index consistent
+        /// with the piece states.
+        #[test]
+        fn counters_and_index_match_recount(
+            pieces in 1usize..40,
+            blocks_per_piece in 1u32..4,
+            ops in prop::collection::vec((0u8..10, any::<u32>(), any::<u32>()), 1..300),
+        ) {
+            let plen = BLOCK_SIZE * blocks_per_piece;
+            let total = u64::from(plen) * pieces as u64 - 7;
+            let mut p = Picker::new(pieces, plen, total);
+            let mut rng = Lcg(ops.len() as u64);
+            let mut out: Vec<(PeerKey, Block)> = Vec::new();
+            for (op, a, b) in ops {
+                let i = a as usize % pieces;
+                let peer = b % 4;
+                match op {
+                    0 => { p.peer_has(i); }
+                    1 => {
+                        let mut bf = Bitfield::new(pieces);
+                        for k in 0..pieces { if (b >> (k % 32)) & 1 == 1 { bf.set(k); } }
+                        p.peer_joined(&bf);
+                    }
+                    2 => {
+                        let mut bf = Bitfield::new(pieces);
+                        for k in 0..pieces { if (a >> (k % 32)) & 1 == 1 { bf.set(k); } }
+                        p.peer_left(&bf);
+                    }
+                    3 => p.set_priority(i, (b % 9) as u8),
+                    4 => {
+                        p.set_sequential(b % 2 == 0);
+                        for blk in p.pick(peer, &all, 1 + (b % 5) as usize, &mut rng) {
+                            out.push((peer, blk));
+                        }
+                    }
+                    5 => if !out.is_empty() {
+                        let (k, blk) = out.swap_remove(b as usize % out.len());
+                        if let Received::Accepted { cancel, piece_complete } = p.block_received(k, &blk) {
+                            for c in cancel { out.retain(|(k2, x)| !(*k2 == c && *x == blk)); }
+                            if piece_complete && b % 3 != 0 { p.piece_verified(blk.piece as usize); }
+                            else if piece_complete { p.piece_failed(blk.piece as usize); out.retain(|(_, x)| x.piece != blk.piece); }
+                        }
+                    }
+                    6 => if !out.is_empty() {
+                        let (k, blk) = out.swap_remove(b as usize % out.len());
+                        p.release(k, &blk);
+                    }
+                    7 => { p.peer_gone(peer); out.retain(|(k, _)| *k != peer); }
+                    8 => {
+                        let mut bf = Bitfield::new(pieces);
+                        for k in 0..pieces { if (a >> (k % 32)) & 1 == 1 { bf.set(k); } }
+                        p.set_have(&bf);
+                        out.retain(|(_, x)| !bf.get(x.piece as usize));
+                    }
+                    _ => p.set_exclusive(i, peer),
+                }
+                p.check_invariants().map_err(TestCaseError::fail)?;
+                // The public O(1) views agree with a recount too.
+                let have_bytes: u64 = (0..pieces).filter(|k| p.have(*k)).map(|k| u64::from(p.piece_size(k))).sum();
+                prop_assert_eq!(p.bytes_left(), total - have_bytes);
+                let wanted_left: u64 = (0..pieces)
+                    .filter(|k| !p.have(*k) && p.priority(*k) > 0)
+                    .map(|k| u64::from(p.piece_size(k)))
+                    .sum();
+                prop_assert_eq!(p.wanted_bytes_left(), wanted_left);
+                prop_assert_eq!(p.is_complete(), wanted_left == 0);
+            }
+        }
+    }
+
+    /// With small pieces, picks stay within a few 4 MiB extents instead of
+    /// scattering 16 KiB writes over the whole file; with affinity off (or
+    /// large pieces) the rarest-first tie-break is random.
+    #[test]
+    fn extent_affinity_keeps_picks_local() {
+        let pieces = 8192; // 128 MiB of 16 KiB pieces = 32 extents of 256
+        let all_set = Bitfield::all_set(pieces);
+        let run = |affinity: bool, seed: u64| {
+            let mut p = Picker::new(pieces, BLOCK_SIZE, u64::from(BLOCK_SIZE) * pieces as u64);
+            p.set_extent_affinity(affinity);
+            p.peer_joined(&all_set);
+            let mut rng = Lcg(seed);
+            let mut extents = std::collections::BTreeSet::new();
+            // 40 picks of 8 blocks = 320 pieces = 1.25 extents' worth.
+            for k in 0..40u32 {
+                for b in p.pick(k % 3, &all, 8, &mut rng) {
+                    extents.insert(b.piece as usize / 256);
+                    if let Received::Accepted {
+                        piece_complete: true,
+                        ..
+                    } = p.block_received(k % 3, &b)
+                    {
+                        p.piece_verified(b.piece as usize);
+                    }
+                }
+            }
+            p.check_invariants().unwrap();
+            extents.len()
+        };
+        assert!(run(true, 1) <= 3, "affinity: {} extents", run(true, 1));
+        assert!(run(false, 1) >= 10, "random: {} extents", run(false, 1));
+        // 4 MiB pieces: affinity is moot and never records anything.
+        let mut big = Picker::new(64, 4 << 20, 64 << 22);
+        big.peer_joined(&Bitfield::all_set(64));
+        let mut rng = Lcg(3);
+        big.pick(0, &all, 4, &mut rng);
+        assert!(big.recent_extents.is_empty());
+        assert_eq!(big.have_count(), 0);
+    }
+
+    /// A seed joining or leaving touches every wanted piece once, with no
+    /// ordered-set churn: 200 000 pieces in a few milliseconds even in debug.
+    #[test]
+    fn bulk_availability_updates_are_cheap() {
+        let pieces = 200_000;
+        let mut p = Picker::new(
+            pieces,
+            BLOCK_SIZE * 4,
+            u64::from(BLOCK_SIZE) * 4 * pieces as u64,
+        );
+        let all = Bitfield::all_set(pieces);
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            p.peer_joined(&all);
+        }
+        for _ in 0..5 {
+            p.peer_left(&all);
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(p.availability(0), 5);
+        assert_eq!(p.availability(pieces - 1), 5);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "15 bulk updates took {elapsed:?}"
+        );
+        p.check_invariants().unwrap();
+    }
+
+    /// Picking from a 200 000-piece torrent with a partial swarm does not
+    /// walk every piece: a pick costs the candidates ahead of the peer's
+    /// pieces in rarest-first order (as in libtorrent), never the pieces
+    /// nobody has, so thousands of picks finish quickly even unoptimised.
+    /// Like the engine, the test only picks from a peer that still has
+    /// something we want.
+    #[test]
+    fn pick_cost_is_independent_of_piece_count() {
+        let pieces = 200_000;
+        let mut p = Picker::new(
+            pieces,
+            BLOCK_SIZE * 4,
+            u64::from(BLOCK_SIZE) * 4 * pieces as u64,
+        );
+        let mut rng = Lcg(7);
+        // Two peers have every piece with index % 3 != 0; a third has 1000 of
+        // the others (rare); the rest (~65 000) nobody has.
+        let mut bf = Bitfield::new(pieces);
+        for i in 0..pieces {
+            if i % 3 != 0 {
+                bf.set(i);
+            }
+        }
+        p.peer_joined(&bf);
+        p.peer_joined(&bf);
+        let mut rare = Bitfield::new(pieces);
+        for i in 0..1000 {
+            rare.set(i * 3);
+        }
+        p.peer_joined(&rare);
+        let started = std::time::Instant::now();
+        let mut picked = 0;
+        let mut rare_done = 0;
+        let (has_bf, has_rare) = (|i: usize| bf.get(i), |i: usize| rare.get(i));
+        for k in 0..4000u32 {
+            let from_rare = k % 2 == 1 && rare_done < 1000;
+            let has: &dyn Fn(usize) -> bool = if from_rare { &has_rare } else { &has_bf };
+            let got = p.pick(k % 16, has, 8, &mut rng);
+            assert!(!got.is_empty());
+            picked += got.len();
+            for b in got {
+                if let Received::Accepted {
+                    piece_complete: true,
+                    ..
+                } = p.block_received(k % 16, &b)
+                {
+                    p.piece_verified(b.piece as usize);
+                    if b.piece % 3 == 0 {
+                        rare_done += 1;
+                    }
+                }
+            }
+        }
+        // The rare peer's pieces were preferred (availability 1) and are all in.
+        assert_eq!(rare_done, 1000);
+        assert!(picked > 0);
+        assert!(!p.is_complete());
+        assert_eq!(p.have_count(), p.have_bitfield().count());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "picks took {elapsed:?}"
+        );
+        p.check_invariants().unwrap();
     }
 }

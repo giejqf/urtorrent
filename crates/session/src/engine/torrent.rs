@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use metainfo::{Bitfield, InfoHash, Torrent as Metainfo};
 use picker::{Picker, Received};
 use storage::{DiskStore, ResumeData};
-use tracker::Announcer;
+use tracker::{AnnounceJob, Announcer};
 use wire::Request;
 
 use super::Ctx;
@@ -102,6 +102,10 @@ pub struct Torrent {
     pub writes_in_flight: usize,
     /// The tracker / tick tasks are running.
     pub tasks_running: bool,
+    /// An entry for this torrent sits in the session's tick queue.
+    pub tick_scheduled: bool,
+    /// A periodic resume save is in flight.
+    pub resume_saving: bool,
     pub announcer: Announcer,
     pub announce_key: u32,
     /// The peer id used for this torrent's announces and handshakes (per
@@ -109,8 +113,22 @@ pub struct Torrent {
     pub peer_id: [u8; 20],
     /// Stopped by the caller.
     pub paused: bool,
-    /// A check (initial or forced) is running.
+    /// Per-torrent connection cap (`None` = the session default).
+    pub max_peers: Option<usize>,
+    /// Preallocate files when creating them (`fallocate`).
+    pub preallocate: bool,
+    /// Time spent active (not paused / stopped), excluding the current run.
+    pub active_time: Duration,
+    /// When the current run began, while running.
+    pub active_since: Option<Instant>,
+    /// Time spent active as a complete torrent, excluding the current run.
+    pub seeding_time: Duration,
+    /// When the current seeding run began, while running and complete.
+    pub seeding_since: Option<Instant>,
+    /// A check (initial or forced) is running or queued.
     pub checking: bool,
+    /// The check waits for a slot (`max_checking`).
+    pub check_queued: bool,
     pub error: Option<String>,
     pub stats: Stats,
     /// Per-torrent rate limits (0 = unlimited; the session limits apply too).
@@ -164,6 +182,46 @@ impl Torrent {
         self.info.is_some()
     }
 
+    /// Connection cap for this torrent.
+    pub fn max_peers(&self, ctx: &Ctx) -> usize {
+        self.max_peers.unwrap_or(ctx.cfg.max_peers)
+    }
+
+    /// Total active / seeding time including the current run.
+    pub fn times(&self, now: Instant) -> (Duration, Duration) {
+        let run = |since: Option<Instant>| {
+            since.map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
+        };
+        (
+            self.active_time + run(self.active_since),
+            self.seeding_time + run(self.seeding_since),
+        )
+    }
+
+    /// Fold the current run into the totals (a run ends).
+    fn fold_times(&mut self, now: Instant) {
+        let (a, s) = self.times(now);
+        self.active_time = a;
+        self.seeding_time = s;
+        self.active_since = None;
+        self.seeding_since = None;
+    }
+
+    /// The seeding clock follows completeness while running.
+    fn sync_seeding_clock(&mut self, now: Instant) {
+        if self.active_since.is_none() {
+            return;
+        }
+        match (self.is_complete(), self.seeding_since) {
+            (true, None) => self.seeding_since = Some(now),
+            (false, Some(since)) => {
+                self.seeding_time += now.saturating_duration_since(since);
+                self.seeding_since = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Pieces in the torrent (0 before the metadata is known).
     pub fn piece_count(&self) -> usize {
         self.info.as_ref().map_or(0, |i| i.piece_count())
@@ -184,7 +242,11 @@ impl Torrent {
         if self.error.is_some() {
             TorrentState::Error
         } else if self.checking {
-            TorrentState::Checking
+            if self.check_queued {
+                TorrentState::QueuedForChecking
+            } else {
+                TorrentState::Checking
+            }
         } else if self.paused {
             TorrentState::Paused
         } else if self.info.is_none() {
@@ -262,6 +324,16 @@ impl Torrent {
             total_wanted: self.wanted().0,
             total_wanted_done: self.wanted().1,
             save_path: self.save_path.clone(),
+            active_time: self.times(now).0,
+            seeding_time: self.times(now).1,
+            max_peers: self.max_peers,
+            next_announce_in: self
+                .announcer
+                .snapshot()
+                .into_iter()
+                .filter_map(|t| t.next_announce)
+                .min()
+                .map(|a| a.saturating_duration_since(now)),
         }
     }
 
@@ -430,9 +502,24 @@ impl Torrent {
         }
     }
 
-    /// Re-evaluate interest in every peer after our have-set changed.
+    /// Re-evaluate interest in every peer after our have-set changed
+    /// wholesale (priorities, recheck).
     fn refresh_interest(&self) {
         for p in self.peers.values() {
+            p.update_interest(&self.picker);
+        }
+    }
+
+    /// Re-evaluate interest after we gained `piece`: only a peer we are
+    /// interested in and that has this piece can become uninteresting
+    /// (libtorrent `torrent::we_have`).
+    fn refresh_interest_after(&self, piece: u32) {
+        for p in self.peers.values() {
+            let conn = p.conn.borrow();
+            if !conn.am_interested() || !conn.peer_have().has(piece as usize) {
+                continue;
+            }
+            drop(conn);
             p.update_interest(&self.picker);
         }
     }
@@ -528,11 +615,20 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         move_gate: Notify::new(),
         writes_in_flight: 0,
         tasks_running: false,
+        tick_scheduled: false,
+        resume_saving: false,
         announcer,
         announce_key: ctx.new_announce_key(),
         peer_id: ctx.new_torrent_peer_id(),
         paused: params.paused,
+        max_peers: None,
+        preallocate: params.preallocate,
+        active_time: Duration::ZERO,
+        active_since: None,
+        seeding_time: Duration::ZERO,
+        seeding_since: None,
         checking: parsed.is_some(),
+        check_queued: false,
         error: None,
         stats: Stats::default(),
         up_limit: Limiter::new(0, now),
@@ -560,7 +656,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         metadata_size: 0,
     }));
     ctx.torrents.borrow_mut().insert(id, torrent.clone());
-    ctx.by_hash.borrow_mut().insert(info_hash, id);
+    ctx.index_torrent(info_hash, id);
     ctx.emit(Event::TorrentAdded { id });
     match parsed {
         Some((info, raw)) => {
@@ -666,6 +762,7 @@ fn attach_metadata(
     let storage = Rc::new(ctx.disk.open(info.clone(), t.save_path.clone(), initial));
     let mut picker = Picker::new(info.piece_count(), info.piece_length, info.total_length);
     picker.set_sequential(t.sequential);
+    picker.set_extent_affinity(ctx.cfg.piece_extent_affinity);
     for (i, p) in storage.piece_priorities().into_iter().enumerate() {
         picker.set_priority(i, p);
     }
@@ -680,9 +777,12 @@ fn attach_metadata(
 }
 
 async fn create_files(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
-    let storage = torrent.borrow().storage.clone();
+    let (storage, preallocate) = {
+        let t = torrent.borrow();
+        (t.storage.clone(), t.preallocate)
+    };
     if let Some(s) = storage {
-        s.create_files().await?;
+        s.create_files(preallocate).await?;
     }
     Ok(())
 }
@@ -763,6 +863,9 @@ async fn initial_check(
         Some(r) if r.matches(&info) && files_present => {
             have = r.have.clone();
             carried = Some((r.downloaded, r.uploaded));
+            let mut t = torrent.borrow_mut();
+            t.active_time = Duration::from_secs(r.active_time);
+            t.seeding_time = Duration::from_secs(r.seeding_time);
         }
         _ => {
             let any_data = info
@@ -770,17 +873,46 @@ async fn initial_check(
                 .any(|f| std::fs::metadata(f.path.to_path(&save_path)).is_ok_and(|m| m.len() > 0))
                 || std::fs::metadata(storage.parts_path()).is_ok_and(|m| m.len() > 0);
             if any_data {
-                match storage.check_all().await {
-                    Ok(h) => have = h,
-                    Err(e) => {
+                let result = checked(&ctx, &torrent, storage.check_all()).await;
+                match result {
+                    Some(Ok(h)) => have = h,
+                    Some(Err(e)) => {
                         fail_torrent(&ctx, &torrent, format!("check failed: {e}"));
                         return;
                     }
+                    None => return,
                 }
             }
         }
     }
     finish_check(&ctx, &torrent, have, carried);
+}
+
+/// Run a hash check behind the session's checking gate (`max_checking`),
+/// marking the torrent queued while it waits. `None` when the torrent was
+/// removed / errored meanwhile.
+async fn checked<F>(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    check: F,
+) -> Option<Result<Bitfield, storage::Error>>
+where
+    F: std::future::Future<Output = Result<Bitfield, storage::Error>>,
+{
+    if ctx.check_gate.available() == 0 {
+        torrent.borrow_mut().check_queued = true;
+    }
+    let permit = ctx.check_gate.acquire().await;
+    {
+        let mut t = torrent.borrow_mut();
+        t.check_queued = false;
+        if t.error.is_some() {
+            return None;
+        }
+    }
+    let r = check.await;
+    drop(permit);
+    Some(r)
 }
 
 /// Apply a check result and start (unless paused). When the tasks are already
@@ -852,7 +984,10 @@ pub async fn recheck(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
         };
         storage
     };
-    match storage.check_all().await {
+    let Some(result) = checked(&ctx, &torrent, storage.check_all()).await else {
+        return;
+    };
+    match result {
         Ok(have) => {
             let mut t = torrent.borrow_mut();
             t.resume_dirty = true;
@@ -903,9 +1038,12 @@ fn start_tasks(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
         t.paused = false;
         t.tasks_running = true;
         t.announcer.start();
+        let now = Instant::now();
+        t.active_since = Some(now);
+        t.sync_seeding_clock(now);
     }
     uring::spawn(super::tracker_task::run(ctx.clone(), torrent.clone()));
-    uring::spawn(tick(ctx.clone(), torrent.clone()));
+    ctx.schedule_tick(torrent);
     super::lsd::announce_now(ctx, torrent);
     super::webseed::start(ctx, torrent);
 }
@@ -957,6 +1095,7 @@ pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, _final: bool) {
     let (closing, jobs, peers) = {
         let mut t = torrent.borrow_mut();
         t.tasks_running = false;
+        t.fold_times(Instant::now());
         let jobs = t.announcer.stop();
         let peers: Vec<Rc<PeerHandle>> = t.peers.values().cloned().collect();
         (t.closing.clone(), jobs, peers)
@@ -981,7 +1120,7 @@ pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, _final: bool) {
     for h in handles {
         h.await;
     }
-    if let Err(e) = save_resume(torrent).await {
+    if let Err(e) = save_resume(ctx, torrent).await {
         tracing::warn!("saving resume data failed: {e}");
     }
     // Give peer tasks a moment to observe the flag and release their sockets.
@@ -993,10 +1132,45 @@ pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, _final: bool) {
     }
 }
 
+/// Fire the `stopped` announces a removed tracker is owed (bounded, in the
+/// background).
+pub fn announce_stopped(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, jobs: Vec<AnnounceJob>) {
+    for job in jobs {
+        let ctx2 = ctx.clone();
+        let t2 = torrent.clone();
+        uring::spawn(async move {
+            let _ = uring::timeout(
+                Duration::from_secs(10),
+                super::tracker_task::announce_once(&ctx2, &t2, job),
+            )
+            .await;
+        });
+    }
+}
+
+/// Delete a removed torrent's content (files, parts file, emptied
+/// directories) and its resume file.
+pub async fn delete_files(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
+    let (storage, resume_path) = {
+        let t = torrent.borrow();
+        (t.storage.clone(), t.resume_path.clone())
+    };
+    if let Some(s) = storage {
+        s.delete_files().await?;
+    }
+    if let Some(p) = resume_path
+        && let Err(e) = std::fs::remove_file(&p)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(Error::Io(format!("removing {}: {e}", p.display())));
+    }
+    Ok(())
+}
+
 /// Persist resume data: fsync content first so the have-set never claims data
 /// the disk does not hold.
-pub async fn save_resume(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
-    let (storage, path, have, downloaded, uploaded, info) = {
+pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
+    let (storage, path, have, downloaded, uploaded, info, times) = {
         let t = torrent.borrow();
         let Some(path) = t.resume_path.clone() else {
             return Ok(());
@@ -1013,9 +1187,18 @@ pub async fn save_resume(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
             t.stats.downloaded,
             t.stats.uploaded,
             info,
+            t.times(Instant::now()),
         )
     };
+    // Bounded concurrency: each save fsyncs the torrent's files.
+    let _permit = ctx.resume_gate.acquire().await;
+    let started = Instant::now();
     storage.sync_all().await?;
+    tracing::debug!(
+        torrent = torrent.borrow().id.0,
+        sync_ms = started.elapsed().as_millis() as u64,
+        "resume save: content synced"
+    );
     let data = ResumeData {
         format_version: storage::FORMAT_VERSION,
         info_hash: info.info_hash,
@@ -1025,6 +1208,8 @@ pub async fn save_resume(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
         uploaded,
         downloaded,
         file_priorities: storage.file_priorities(),
+        active_time: times.0.as_secs(),
+        seeding_time: times.1.as_secs(),
     };
     data.save(&path)?;
     let mut t = torrent.borrow_mut();
@@ -1033,42 +1218,53 @@ pub async fn save_resume(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
     Ok(())
 }
 
-/// The one-second tick.
-async fn tick(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
-    let closing = torrent.borrow().closing.clone();
-    loop {
-        match super::local::select2(uring::sleep(Duration::from_secs(1)), closing.wait()).await {
-            super::local::Either::Left(()) => {}
-            super::local::Either::Right(()) => break,
+/// One torrent's once-a-second housekeeping, driven by the session ticker's
+/// due-queue (one timer for the whole session instead of one per torrent):
+/// rates, per-peer timeouts and keep-alives, PEX and metadata steps, dialling,
+/// and a periodic resume save (bounded by the resume gate). Returns whether
+/// the torrent wants to be ticked again.
+pub fn tick_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, now: Instant) -> bool {
+    let save = {
+        let mut t = torrent.borrow_mut();
+        if !t.is_active() || !t.tasks_running || t.closing.is_set() {
+            t.tick_scheduled = false;
+            return false;
         }
-        let now = Instant::now();
-        let save = {
-            let mut t = torrent.borrow_mut();
-            if !t.is_active() {
-                break;
-            }
-            // Rates: exponential moving average over 1 s samples.
-            let d = t.stats.downloaded - t.stats.last_downloaded;
-            let u = t.stats.uploaded - t.stats.last_uploaded;
-            t.stats.last_downloaded = t.stats.downloaded;
-            t.stats.last_uploaded = t.stats.uploaded;
-            t.stats.download_rate = (t.stats.download_rate * 3 + d) / 4;
-            t.stats.upload_rate = (t.stats.upload_rate * 3 + u) / 4;
+        // Rates: exponential moving average over 1 s samples.
+        let d = t.stats.downloaded - t.stats.last_downloaded;
+        let u = t.stats.uploaded - t.stats.last_uploaded;
+        t.stats.last_downloaded = t.stats.downloaded;
+        t.stats.last_uploaded = t.stats.uploaded;
+        t.stats.download_rate = (t.stats.download_rate * 3 + d) / 4;
+        t.stats.upload_rate = (t.stats.upload_rate * 3 + u) / 4;
 
-            // Per-peer housekeeping.
-            let peers: Vec<Rc<PeerHandle>> = t.peers.values().cloned().collect();
-            for p in &peers {
-                p.tick(&mut t, &ctx, now);
-            }
-            super::pex::tick(&ctx, &mut t, now);
-            super::metadata::tick(&mut t, now);
-            connect_more(&ctx, &torrent, &mut t, now);
-            t.resume_dirty && now.duration_since(t.last_resume_save) > RESUME_SAVE_EVERY
-        };
-        if save && let Err(e) = save_resume(&torrent).await {
-            tracing::warn!("periodic resume save failed: {e}");
+        // Per-peer housekeeping.
+        let peers: Vec<Rc<PeerHandle>> = t.peers.values().cloned().collect();
+        for p in &peers {
+            p.tick(&mut t, ctx, now);
         }
+        super::pex::tick(ctx, &mut t, now);
+        super::metadata::tick(&mut t, now);
+        connect_more(ctx, torrent, &mut t, now);
+        let save = t.resume_dirty
+            && !t.resume_saving
+            && now.duration_since(t.last_resume_save) > RESUME_SAVE_EVERY;
+        if save {
+            t.resume_saving = true;
+        }
+        save
+    };
+    if save {
+        let ctx = ctx.clone();
+        let torrent = torrent.clone();
+        uring::spawn(async move {
+            if let Err(e) = save_resume(&ctx, &torrent).await {
+                tracing::warn!("periodic resume save failed: {e}");
+            }
+            torrent.borrow_mut().resume_saving = false;
+        });
     }
+    true
 }
 
 /// Open connections up to the limits. Candidates are ranked by BEP 40
@@ -1079,7 +1275,7 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
     if !t.is_running() {
         return;
     }
-    let max_peers = ctx.cfg.max_peers;
+    let max_peers = t.max_peers(ctx);
     let max_half_open = ctx.cfg.max_half_open;
     if t.candidates_dirty {
         t.candidates_dirty = false;
@@ -1105,12 +1301,10 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
         });
         t.candidates.extend(v);
     }
-    // Session-wide limit: the other torrents' connections plus ours.
-    let others = ctx.connection_count_except(Some(t.id));
     for _ in 0..t.candidates.len() {
         if t.peers.len() + t.half_open >= max_peers
             || t.half_open >= max_half_open
-            || others + t.peers.len() + t.half_open >= ctx.cfg.max_connections
+            || ctx.connection_count() >= ctx.cfg.max_connections
         {
             break;
         }
@@ -1128,6 +1322,7 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
             continue;
         }
         t.half_open += 1;
+        ctx.connection_opened();
         t.connecting.insert(addr);
         uring::spawn(super::peer::run_outgoing(
             ctx.clone(),
@@ -1257,7 +1452,7 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
                 }
                 t.resume_dirty = true;
                 t.broadcast_have(piece);
-                t.refresh_interest();
+                t.refresh_interest_after(piece);
                 ctx.emit(Event::PieceFinished { id, piece });
                 maybe_finished(&ctx, &mut t, now)
             }
@@ -1308,7 +1503,7 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
             }
         }
     };
-    if finished && let Err(e) = save_resume(&torrent).await {
+    if finished && let Err(e) = save_resume(&ctx, &torrent).await {
         tracing::warn!("resume save after completion failed: {e}");
     }
 }
@@ -1322,6 +1517,7 @@ fn maybe_finished(ctx: &Ctx, t: &mut Torrent, now: Instant) -> bool {
         return false;
     }
     t.finished_emitted = true;
+    t.sync_seeding_clock(now);
     if t.picker.is_seed() {
         t.announcer.completed(now);
         t.tracker_kick.notify();
@@ -1382,6 +1578,7 @@ pub async fn set_file_priorities(
         // peers hear we are no longer upload-only, and seeds we parted from
         // as "both seeds" may be dialled again right away.
         t.finished_emitted = false;
+        t.sync_seeding_clock(Instant::now());
         for p in t.peers.values() {
             p.send_upload_only(false);
         }

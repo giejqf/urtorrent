@@ -74,6 +74,9 @@ impl Features {
             (self.openat, "openat"),
             (self.timeout, "timeout"),
             (self.async_cancel, "async_cancel"),
+            // Peer sockets receive with multishot recv into provided buffer
+            // rings (5.19 / 6.0); there is no single-shot fallback.
+            (self.recv_multi, "recv_multi"),
         ] {
             if !present {
                 m.push(name);
@@ -105,7 +108,6 @@ impl Features {
         let mut fast = Vec::new();
         for (present, name) in [
             (self.accept_multi, "accept_multi"),
-            (self.recv_multi, "recv_multi"),
             (self.send_zc, "send_zc"),
             (self.recvmsg, "recvmsg"),
             (self.sendmsg, "sendmsg"),

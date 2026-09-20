@@ -26,6 +26,65 @@ bottleneck (both engines, both disk rings and four SHA-1 workers share two
 cores). A first version with one global barrier per verify cost ~35%: a
 verify must only wait for earlier writes to *its* piece (ADR 0004 §4).
 
+### Scale pass (2026-09-20)
+
+`soak many` at 5 000 and 10 000 torrents (two engines, every torrent
+downloaded by B from A):
+
+| Torrents | Add (both engines) | All downloaded | fds loaded | peak RSS |
+|---|---|---|---|---|
+| 5 000 | 1.8 s | 7.2 s | 1 040 | 195 MiB |
+| 10 000 | 3.7 s | 40 s | 1 039 | 234 MiB |
+
+Before the pass, 5 000 torrents held 10 016 fds (every content file of both
+engines open forever) and peaked at 288 MiB. What changed: an LRU file pool
+capped at `max_open_files` (512) shared by every store on the disk ring,
+shared piece-buffer pools per piece length (each store used to keep two idle
+piece-sized buffers: megabytes per torrent at large piece sizes), one
+session-level tick queue instead of a timer per torrent, self-timed rate
+limiter waits instead of a 100 ms walk over every limiter, O(1) MSE stream-key
+lookup (one SHA-1 per torrent at add time instead of one per torrent per
+incoming encrypted connection), a session connection counter instead of a
+walk, and concurrency gates for checking (1), announces (32) and resume
+saves (4). The remaining per-torrent footprint is dominated by receive
+buffers while peers are connected (64 KiB per connection); provided buffer
+rings (step 3) remove that.
+
+### Data path: buffer rings, batched receive, vectored sends (2026-09-20)
+
+`soak transfer --size 2G` (1 MiB pieces), interleaved with the previous
+binary, `cpu` = user + system of the whole process (both engines):
+
+| Build | Rate | CPU | Notes |
+|---|---|---|---|
+| picker build | 109–119 MiB/s | 13.0 + 8.3 s | single-shot 64 KiB recv per connection, 4 copies per uploaded block |
+| + multishot recv ring, chunked sends, copy-free file ops | 116–126 MiB/s | 13.3 + 14.0 s | *worse*: `io_uring_enter` 570k → 1.26M, context switches 743k → 1.37M — an always-armed receive delivers small chunks and each woke the disk ring for one block |
+| + drain queued chunks per wakeup (`try_next`, ≤32) | 176–182 MiB/s | 10.7 + 4.8 s | −28% CPU, +50% throughput; 16 KiB pieces: 58 → 172 MiB/s |
+| + `zero_copy_send` (SENDMSG_ZC) | 167–176 MiB/s | 10.8 + 5.3 s | within noise, a little more system time: default off |
+
+RSS: 27 MiB with two rings of 256 × 32 KiB (8 MiB each) versus 11 MiB
+before; per connection the receive memory went from 64 KiB to nothing while
+idle. `xtask syscalls` still shows no off-ring data syscalls. ADR 0006 has
+the design.
+
+### Picker index and extent affinity (2026-09-20)
+
+`soak transfer --size 2G` with 16 KiB pieces (131 072 pieces, one block
+each), interleaved with the previous binary:
+
+| Build | Rate | Notes |
+|---|---|---|
+| before | 6 MiB/s (331 s) | every pick scanned all 131k pieces |
+| indexed picker | 21 MiB/s (98 s) | bursts of 50 MiB/s then stalls at 0: dirty pages pinned at the 20% limit with `Writeback` stuck at ~1 MB, because random 16 KiB writes across a 2 GiB sparse file leave the kernel random I/O to write back |
+| + extent affinity | 58 MiB/s (35 s) | no stalls; CPU-bound now (30 s CPU for 131k pieces: per-piece verify/have/event overhead, step 3 territory) |
+
+1 MiB pieces: 119 → 126 → 160 MiB/s across the same three builds (the last
+is within the ±20% noise plus better write locality). Rarest-first cost model
+is libtorrent's: a pick costs the candidates ahead of the peer's pieces in
+(priority, availability) order, never the piece count; pieces nobody has are
+skipped outright; a seed joining moves every wanted piece one bucket (200k
+pieces in ~7 ms release).
+
 ### Hash-as-you-write (2026-09-20)
 
 Pieces are hashed as their blocks are written (a per-piece SHA-1 cursor over

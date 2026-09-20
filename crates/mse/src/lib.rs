@@ -27,8 +27,8 @@ mod rc4s;
 
 pub use dh::{DH_KEY_LEN, dh_public, dh_secret};
 pub use handshake::{
-    CryptoMethod, Initiator, MAX_PAD, Observed, Outcome, Responder, SKEY_UNKNOWN, allowed_mask,
-    select,
+    CryptoMethod, Initiator, MAX_PAD, Observed, Outcome, Responder, SKEY_UNKNOWN, SkeyIndex,
+    SkeyLookup, allowed_mask, req2_hash, select,
 };
 pub use rc4s::Rc4Stream;
 

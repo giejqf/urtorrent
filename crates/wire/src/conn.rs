@@ -125,9 +125,12 @@ pub enum Event {
     Interested,
     /// The peer is no longer interested.
     NotInterested,
-    /// The peer's have-set changed (`have`, `bitfield`, `have_all`,
-    /// `have_none`); inspect [`Connection::peer_have`].
-    HaveChanged,
+    /// The peer's have-set changed; inspect [`Connection::peer_have`].
+    HaveChanged {
+        /// The single piece a `have` added, when the change was just that
+        /// (`None` for `bitfield`, `have_all`, `have_none` and metadata).
+        added: Option<u32>,
+    },
     /// A block we requested arrived.
     Block {
         /// The request it satisfies.
@@ -181,7 +184,10 @@ const MAX_INCOMING_HARD: usize = 4096;
 pub struct Connection {
     params: ConnectionParams,
     framer: Framer,
-    outbound: Vec<u8>,
+    /// Bytes to send, in order. Control messages accumulate in the last
+    /// chunk; a piece payload is its own chunk (the block buffer as read from
+    /// disk, never copied), followed by a fresh control chunk.
+    outbound: Vec<Vec<u8>>,
     established: bool,
     sent_handshake: bool,
     peer_handshake: Option<Handshake>,
@@ -215,7 +221,7 @@ impl Connection {
     pub fn new(params: ConnectionParams) -> Connection {
         let mut c = Connection {
             framer: Framer::new(),
-            outbound: Vec::with_capacity(256),
+            outbound: vec![Vec::with_capacity(256)],
             established: false,
             sent_handshake: false,
             peer_handshake: None,
@@ -251,7 +257,7 @@ impl Connection {
             info_hash: self.params.info_hash,
             peer_id: self.params.our_peer_id,
         };
-        self.outbound.extend_from_slice(&hs.encode());
+        self.control_out().extend_from_slice(&hs.encode());
         self.sent_handshake = true;
     }
 
@@ -333,17 +339,39 @@ impl Connection {
 
     /// Take everything queued for sending. The caller writes it to the socket.
     pub fn take_outbound(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.outbound)
+        let chunks = self.take_outbound_chunks();
+        match chunks.len() {
+            0 => Vec::new(),
+            1 => chunks.into_iter().next().unwrap_or_default(),
+            _ => chunks.concat(),
+        }
+    }
+
+    /// Drain the bytes queued for sending as ordered chunks (piece payloads
+    /// are separate chunks, so the caller can send them without copying).
+    pub fn take_outbound_chunks(&mut self) -> Vec<Vec<u8>> {
+        let mut chunks = std::mem::replace(&mut self.outbound, vec![Vec::with_capacity(256)]);
+        chunks.retain(|c| !c.is_empty());
+        chunks
     }
 
     /// Whether there are bytes queued for sending.
     pub fn has_outbound(&self) -> bool {
-        !self.outbound.is_empty()
+        self.outbound.iter().any(|c| !c.is_empty())
     }
 
     /// Bytes queued for sending.
     pub fn outbound_len(&self) -> usize {
-        self.outbound.len()
+        self.outbound.iter().map(Vec::len).sum()
+    }
+
+    /// The control chunk messages are appended to.
+    fn control_out(&mut self) -> &mut Vec<u8> {
+        if self.outbound.is_empty() {
+            self.outbound.push(Vec::with_capacity(256));
+        }
+        let last = self.outbound.len() - 1;
+        &mut self.outbound[last]
     }
 
     /// Pieces we granted the peer allowed-fast for.
@@ -354,7 +382,7 @@ impl Connection {
     // --- outgoing actions ---
 
     fn push(&mut self, m: &Message) {
-        m.encode(&mut self.outbound);
+        m.encode(self.control_out());
     }
 
     /// Queue a keep-alive.
@@ -433,16 +461,15 @@ impl Connection {
     }
 
     /// Send a block the peer requested. Removes it from the incoming queue.
-    pub fn piece(&mut self, r: Request, data: &[u8]) {
+    pub fn piece(&mut self, r: Request, data: Vec<u8>) {
         if let Some(pos) = self.incoming.iter().position(|x| *x == r) {
             self.incoming.remove(pos);
         }
         self.payload_out += data.len() as u64;
-        self.push(&Message::Piece {
-            index: r.index,
-            begin: r.begin,
-            data: data.to_vec(),
-        });
+        Message::encode_piece_header(self.control_out(), r.index, r.begin, data.len() as u32);
+        // The payload travels as its own chunk: no copy into the byte queue.
+        self.outbound.push(data);
+        self.outbound.push(Vec::with_capacity(256));
     }
 
     /// Reject a request the peer made (fast extension only; a no-op without
@@ -642,9 +669,9 @@ impl Connection {
                     .ok_or(Error::Protocol("bitfield length mismatch"))?;
                 self.peer_have = PeerHave::Pieces(bf);
             }
-            ev = Some(Event::HaveChanged);
+            ev = Some(Event::HaveChanged { added: None });
         } else if matches!(self.peer_have, PeerHave::All) {
-            ev = Some(Event::HaveChanged);
+            ev = Some(Event::HaveChanged { added: None });
         }
         if self.established {
             self.send_have_state();
@@ -761,16 +788,20 @@ impl Connection {
             }
             Message::Have(i) => {
                 self.check_index(i)?;
+                let mut added = None;
                 match &mut self.peer_have {
                     PeerHave::All => {}
                     PeerHave::Raw(_) => {} // cannot apply until metadata is known
                     _ => {
-                        if let Some(b) = self.peer_pieces_mut() {
+                        if let Some(b) = self.peer_pieces_mut()
+                            && !b.get(i as usize)
+                        {
                             b.set(i as usize);
+                            added = Some(i);
                         }
                     }
                 }
-                events.push(Event::HaveChanged);
+                events.push(Event::HaveChanged { added });
             }
             Message::Bitfield(bytes) => {
                 match self.params.piece_count {
@@ -781,12 +812,12 @@ impl Connection {
                     }
                     None => self.peer_have = PeerHave::Raw(bytes),
                 }
-                events.push(Event::HaveChanged);
+                events.push(Event::HaveChanged { added: None });
             }
             Message::HaveAll => {
                 self.need_fast()?;
                 self.peer_have = PeerHave::All;
-                events.push(Event::HaveChanged);
+                events.push(Event::HaveChanged { added: None });
             }
             Message::HaveNone => {
                 self.need_fast()?;
@@ -794,7 +825,7 @@ impl Connection {
                     Some(n) => PeerHave::Pieces(Bitfield::new(n)),
                     None => PeerHave::Raw(Vec::new()),
                 };
-                events.push(Event::HaveChanged);
+                events.push(Event::HaveChanged { added: None });
             }
             Message::Request(r) => {
                 self.check_block(&r)?;
@@ -1061,7 +1092,7 @@ mod tests {
         let mut have = Bitfield::new(16);
         have.set(9);
         let ev = c.set_metadata(16, have).unwrap();
-        assert!(matches!(ev, Some(Event::HaveChanged)));
+        assert!(matches!(ev, Some(Event::HaveChanged { .. })));
         assert_eq!(c.peer_have().to_bitfield(16).count(), 8);
         let msgs = decode_all(&c.take_outbound(), false);
         assert_eq!(msgs[0], Message::Bitfield(vec![0x00, 0x40]));
@@ -1193,7 +1224,7 @@ mod tests {
         let ev = c.receive(&Message::Request(r).to_bytes()).unwrap();
         assert_eq!(ev, vec![Event::Request(r)]);
         assert_eq!(c.incoming_requests(), &[r]);
-        c.piece(r, &[1; 16384]);
+        c.piece(r, vec![1; 16384]);
         assert!(c.incoming_requests().is_empty());
         assert_eq!(c.payload_out(), 16384);
         // choking again rejects queued requests

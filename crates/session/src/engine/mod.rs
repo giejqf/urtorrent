@@ -23,6 +23,7 @@ mod rng;
 mod tls;
 mod torrent;
 mod tracker_task;
+mod transport;
 mod udp;
 mod webseed;
 
@@ -30,13 +31,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use metainfo::InfoHash;
 use profile::Profile;
 use storage::DiskRing;
 use tokio::sync::{mpsc, oneshot};
-use uring::{BufferPool, Notifier, NotifyHandle, Runtime, TcpListener};
+use uring::{Notifier, NotifyHandle, Runtime, TcpListener};
 
 use crate::Error;
 use crate::api::{
@@ -76,7 +77,34 @@ pub struct EngineConfig {
     /// Torrent file I/O on its own `urt-disk` ring thread (default) rather
     /// than on the network ring.
     pub disk_thread: bool,
+    /// Torrents hashed (checked) at once; the rest queue (libtorrent's
+    /// `active_checking`, 1).
+    pub max_checking: usize,
+    /// Tracker announces / scrapes in flight at once across the session.
+    pub max_concurrent_announces: usize,
+    /// Resume saves (each an fsync of the torrent's files) at once.
+    pub max_concurrent_resume_saves: usize,
+    /// Torrent files kept open at once (an LRU; libtorrent's file pool).
+    pub max_open_files: usize,
+    /// Finish a few recently started 4 MiB extents before rarest-first moves
+    /// on (libtorrent `piece_extent_affinity`), so small pieces are written
+    /// in runs rather than scattered over the file.
+    pub piece_extent_affinity: bool,
+    /// Provided receive buffers shared by every peer socket (a power of two)
+    /// and the size of each. A connection holds no receive memory until data
+    /// arrives; when all buffers are in use the kernel pauses the sockets
+    /// until one is returned (TCP backpressure).
+    pub recv_ring_entries: u16,
+    pub recv_buf_size: usize,
+    /// Send piece payloads with zero-copy `sendmsg` (`IORING_OP_SENDMSG_ZC`)
+    /// when the kernel supports it. Off by default: on loopback and small
+    /// payloads the notification round trip costs more than the copy it
+    /// saves (`docs/perf.md`); worth trying on real NICs at high rates.
+    pub zero_copy_send: bool,
 }
+
+/// Buffer group id of the peer receive ring.
+const RECV_RING_GROUP: u16 = 1;
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -98,6 +126,14 @@ impl Default for EngineConfig {
             pex: true,
             lsd: true,
             disk_thread: true,
+            max_checking: 1,
+            max_concurrent_announces: 32,
+            max_concurrent_resume_saves: 4,
+            max_open_files: 512,
+            piece_extent_affinity: true,
+            recv_ring_entries: 256,
+            recv_buf_size: 32 * 1024,
+            zero_copy_send: false,
         }
     }
 }
@@ -105,9 +141,16 @@ impl Default for EngineConfig {
 /// Messages from `Session` handles.
 pub enum Command {
     AddTorrent(Box<AddTorrent>, oneshot::Sender<Result<TorrentId, Error>>),
-    Remove(TorrentId, oneshot::Sender<Result<(), Error>>),
+    /// Remove; `true` deletes the content files too.
+    Remove(TorrentId, bool, oneshot::Sender<Result<(), Error>>),
+    Find(InfoHash, oneshot::Sender<Option<TorrentId>>),
     Pause(TorrentId, oneshot::Sender<Result<(), Error>>),
     Resume(TorrentId, oneshot::Sender<Result<(), Error>>),
+    PauseAll(oneshot::Sender<()>),
+    ResumeAll(oneshot::Sender<()>),
+    AddTracker(TorrentId, String, usize, oneshot::Sender<Result<(), Error>>),
+    RemoveTracker(TorrentId, String, oneshot::Sender<Result<(), Error>>),
+    SetMaxPeers(TorrentId, Option<usize>, oneshot::Sender<Result<(), Error>>),
     Status(TorrentId, oneshot::Sender<Result<TorrentStatus, Error>>),
     Statuses(oneshot::Sender<Vec<TorrentStatus>>),
     Peers(TorrentId, oneshot::Sender<Result<Vec<PeerInfo>, Error>>),
@@ -161,7 +204,10 @@ pub struct Ctx {
     pub external: RefCell<[external_ip::IpVoter; 2]>,
     pub rng: rng::Rng,
     pub kick: NotifyHandle,
-    pub recv_pool: BufferPool,
+    /// Provided buffers every peer socket receives into (multishot recv).
+    pub recv_ring: uring::BufRing,
+    /// Zero-copy sends: configured on and supported by the kernel.
+    pub send_zc: bool,
     pub closing: Rc<Flag>,
     /// Session-wide rate limits.
     pub up_limit: Rc<rate::Limiter>,
@@ -171,6 +217,17 @@ pub struct Ctx {
     subscribers: RefCell<Vec<Subscriber>>,
     torrents: RefCell<HashMap<TorrentId, Rc<RefCell<Torrent>>>>,
     by_hash: RefCell<HashMap<InfoHash, TorrentId>>,
+    /// MSE stream-key index over every torrent (O(1) per incoming
+    /// encrypted connection).
+    skeys: RefCell<mse::SkeyIndex>,
+    /// Connections plus dials in progress across every torrent.
+    connections: Cell<usize>,
+    /// Torrents due for their once-a-second tick, earliest first.
+    ticks: RefCell<std::collections::BinaryHeap<std::cmp::Reverse<(Instant, TorrentId)>>>,
+    /// Concurrency gates (see `EngineConfig`).
+    pub check_gate: Rc<local::Semaphore>,
+    pub announce_gate: Rc<local::Semaphore>,
+    pub resume_gate: Rc<local::Semaphore>,
     next_id: Cell<u64>,
     next_peer_key: Cell<u32>,
     /// Torrents still winding down during shutdown.
@@ -209,20 +266,6 @@ impl Ctx {
         self.torrents.borrow().get(&id).cloned()
     }
 
-    /// Connections (plus dials in progress) across every torrent except
-    /// `except` (which the caller may hold borrowed).
-    pub fn connection_count_except(&self, except: Option<TorrentId>) -> usize {
-        self.torrents
-            .borrow()
-            .iter()
-            .filter(|(id, _)| Some(**id) != except)
-            .map(|(_, t)| {
-                let t = t.borrow();
-                t.peers.len() + t.half_open
-            })
-            .sum()
-    }
-
     pub fn torrent_by_hash(&self, h: &InfoHash) -> Option<Rc<RefCell<Torrent>>> {
         let id = *self.by_hash.borrow().get(h)?;
         self.torrent(id)
@@ -239,9 +282,65 @@ impl Ctx {
         (self.rng.next_u64() >> 32) as u32
     }
 
-    /// Every torrent we serve (for the MSE responder's stream-key lookup).
-    pub fn info_hashes(&self) -> Vec<InfoHash> {
-        self.by_hash.borrow().keys().copied().collect()
+    /// Put a torrent on the tick queue (spread across the second by id so a
+    /// mass start does not tick everything at once).
+    pub fn schedule_tick(&self, torrent: &Rc<RefCell<Torrent>>) {
+        let mut t = torrent.borrow_mut();
+        if t.tick_scheduled {
+            return;
+        }
+        t.tick_scheduled = true;
+        let phase = Duration::from_millis(t.id.0.wrapping_mul(0x9e37_79b9) % 1000);
+        self.ticks
+            .borrow_mut()
+            .push(std::cmp::Reverse((Instant::now() + phase, t.id)));
+    }
+
+    /// Run every due torrent tick and requeue the ones that continue.
+    fn run_due_ticks(self: &Rc<Self>, now: Instant) {
+        loop {
+            let next = {
+                let mut q = self.ticks.borrow_mut();
+                match q.peek() {
+                    Some(std::cmp::Reverse((due, _))) if *due <= now => q.pop(),
+                    _ => None,
+                }
+            };
+            let Some(std::cmp::Reverse((due, id))) = next else {
+                break;
+            };
+            let Some(t) = self.torrent(id) else { continue };
+            if torrent::tick_once(self, &t, now) {
+                // Keep the phase: schedule from the previous due time.
+                let next_due = (due + Duration::from_secs(1)).max(now);
+                self.ticks
+                    .borrow_mut()
+                    .push(std::cmp::Reverse((next_due, id)));
+            }
+        }
+    }
+
+    /// Register a torrent's info-hash (lookup by hash, MSE stream keys).
+    pub fn index_torrent(&self, hash: InfoHash, id: TorrentId) {
+        self.by_hash.borrow_mut().insert(hash, id);
+        self.skeys.borrow_mut().insert(hash);
+    }
+
+    /// Bookkeeping for the session-wide connection limit: a connection or a
+    /// dial started / ended.
+    pub fn connection_opened(&self) {
+        self.connections.set(self.connections.get() + 1);
+    }
+
+    /// See [`Ctx::connection_opened`].
+    pub fn connection_closed(&self) {
+        self.connections
+            .set(self.connections.get().saturating_sub(1));
+    }
+
+    /// Connections plus dials in progress across every torrent.
+    pub fn connection_count(&self) -> usize {
+        self.connections.get()
     }
 
     /// 20 random bytes for a DH exponent.
@@ -318,6 +417,7 @@ impl Ctx {
         let t = self.torrents.borrow_mut().remove(&id)?;
         let h = t.borrow().info_hash();
         self.by_hash.borrow_mut().remove(&h);
+        self.skeys.borrow_mut().remove(&h);
         Some(t)
     }
 
@@ -427,7 +527,7 @@ pub fn run(
             (rng.next_u64() >> 32) as u32,
         ));
         let disk = if cfg.disk_thread {
-            match DiskRing::start(cfg.hash_threads, kick.clone()) {
+            match DiskRing::start(cfg.hash_threads, cfg.max_open_files, kick.clone()) {
                 Ok(d) => Rc::new(d),
                 Err(e) => {
                     let _ = ready.send(Err(Error::Io(format!("disk thread: {e}"))));
@@ -435,7 +535,11 @@ pub fn run(
                 }
             }
         } else {
-            Rc::new(DiskRing::inline(cfg.hash_threads, kick.clone()))
+            Rc::new(DiskRing::inline(
+                cfg.hash_threads,
+                cfg.max_open_files,
+                kick.clone(),
+            ))
         };
         let lsd = if cfg.lsd {
             lsd::Lsd::open(
@@ -447,6 +551,16 @@ pub fn run(
             None
         };
         let now = Instant::now();
+        // Peer receive buffers: one ring for every connection on this thread
+        // (kernel 6.1 baseline: multishot recv + provided buffer rings).
+        let recv_ring =
+            match uring::BufRing::new(RECV_RING_GROUP, cfg.recv_ring_entries, cfg.recv_buf_size) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = ready.send(Err(Error::Io(format!("provided buffer ring: {e}"))));
+                    return;
+                }
+            };
         let ctx = Rc::new(Ctx {
             dns: Dns::new(kick.clone()),
             tls,
@@ -466,11 +580,18 @@ pub fn run(
             disk,
             rng,
             kick: kick.clone(),
-            recv_pool: BufferPool::new(64 * 1024, 64),
+            recv_ring,
+            send_zc: cfg.zero_copy_send && uring::probe().is_ok_and(|f| f.send_zc),
             closing: Flag::new(),
             subscribers: RefCell::new(Vec::new()),
             torrents: RefCell::new(HashMap::new()),
             by_hash: RefCell::new(HashMap::new()),
+            skeys: RefCell::new(mse::SkeyIndex::new()),
+            connections: Cell::new(0),
+            ticks: RefCell::new(std::collections::BinaryHeap::new()),
+            check_gate: local::Semaphore::new(cfg.max_checking),
+            announce_gate: local::Semaphore::new(cfg.max_concurrent_announces),
+            resume_gate: local::Semaphore::new(cfg.max_concurrent_resume_saves),
             next_id: Cell::new(1),
             next_peer_key: Cell::new(1),
             stopping: Cell::new(0),
@@ -528,7 +649,10 @@ async fn accept_loop(ctx: Rc<Ctx>, listener: TcpListener) {
     loop {
         match select2(listener.accept(), ctx.closing.wait()).await {
             Either::Left(Ok(stream)) => {
-                uring::spawn(peer::run_incoming(ctx.clone(), stream));
+                uring::spawn(peer::run_incoming(
+                    ctx.clone(),
+                    transport::Transport::Tcp(stream),
+                ));
             }
             Either::Left(Err(e)) => {
                 tracing::warn!("accept failed: {e}");
@@ -558,30 +682,24 @@ async fn ticker(ctx: Rc<Ctx>) {
             Either::Right(()) => break,
         }
         let now = Instant::now();
-        ctx.up_limit.tick(now);
-        ctx.down_limit.tick(now);
-        let torrents: Vec<Rc<RefCell<torrent::Torrent>>> =
-            ctx.torrents.borrow().values().cloned().collect();
-        for t in &torrents {
-            let t = t.borrow();
-            t.up_limit.tick(now);
-            t.down_limit.tick(now);
-        }
+        ctx.run_due_ticks(now);
         if now.duration_since(last_choke) >= choker::UNCHOKE_INTERVAL {
             last_choke = now;
             let rotate = now.duration_since(last_optimistic) >= choker::OPTIMISTIC_INTERVAL;
             if rotate {
                 last_optimistic = now;
             }
+            let torrents: Vec<Rc<RefCell<torrent::Torrent>>> =
+                ctx.torrents.borrow().values().cloned().collect();
             choke_round(&ctx, &torrents, rotate, now);
         }
         // LSD: one torrent every `interval / torrents`, round-robin
         // (libtorrent `on_lsd_announce`).
         if now >= next_lsd {
-            let n = torrents.len().max(1);
+            let mut ids: Vec<TorrentId> = ctx.torrents.borrow().keys().copied().collect();
+            let n = ids.len().max(1);
             next_lsd = now + lsd::ANNOUNCE_INTERVAL / n as u32;
-            if !torrents.is_empty() {
-                let mut ids: Vec<TorrentId> = torrents.iter().map(|t| t.borrow().id).collect();
+            if !ids.is_empty() {
                 ids.sort();
                 lsd_index %= ids.len();
                 if let Some(t) = ctx.torrent(ids[lsd_index]) {
@@ -686,14 +804,85 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 let _ = reply.send(r);
             });
         }
-        Command::Remove(id, reply) => match ctx.remove_torrent_entry(id) {
+        Command::Remove(id, delete_files, reply) => match ctx.remove_torrent_entry(id) {
             Some(t) => {
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
                     torrent::stop(&ctx2, &t, true).await;
+                    let r = if delete_files {
+                        torrent::delete_files(&t).await
+                    } else {
+                        Ok(())
+                    };
                     ctx2.emit(Event::TorrentRemoved { id });
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(r);
                 });
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::Find(hash, reply) => {
+            let _ = reply.send(ctx.by_hash.borrow().get(&hash).copied());
+        }
+        Command::PauseAll(reply) => {
+            let all: Vec<Rc<RefCell<Torrent>>> = ctx.torrents.borrow().values().cloned().collect();
+            let ctx2 = ctx.clone();
+            uring::spawn(async move {
+                for t in all {
+                    torrent::pause(&ctx2, &t).await;
+                }
+                let _ = reply.send(());
+            });
+        }
+        Command::ResumeAll(reply) => {
+            let all: Vec<Rc<RefCell<Torrent>>> = ctx.torrents.borrow().values().cloned().collect();
+            for t in all {
+                torrent::resume(ctx, &t);
+            }
+            let _ = reply.send(());
+        }
+        Command::AddTracker(id, url, tier, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let added = {
+                    let mut t = t.borrow_mut();
+                    let added = t.announcer.add_tracker(&url, tier);
+                    if added {
+                        t.tracker_kick.notify();
+                    }
+                    added
+                };
+                let _ = reply.send(if added {
+                    Ok(())
+                } else {
+                    Err(Error::Io("tracker URL empty or already present".into()))
+                });
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::RemoveTracker(id, url, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let jobs = t.borrow_mut().announcer.remove_tracker(&url);
+                match jobs {
+                    Some(jobs) => {
+                        torrent::announce_stopped(ctx, &t, jobs);
+                        let _ = reply.send(Ok(()));
+                    }
+                    None => {
+                        let _ = reply.send(Err(Error::Io("no such tracker".into())));
+                    }
+                }
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::SetMaxPeers(id, max, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                t.borrow_mut().max_peers = max;
+                let _ = reply.send(Ok(()));
             }
             None => {
                 let _ = reply.send(Err(Error::NoSuchTorrent));
@@ -761,12 +950,22 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 s.download_rate += t.stats.download_rate;
                 s.upload_rate += t.stats.upload_rate;
             }
+            s.connections = ctx.connection_count();
+            let disk = ctx.disk.stats();
+            s.disk_jobs_pending = disk.jobs_pending.load(std::sync::atomic::Ordering::Relaxed);
+            s.hash_jobs_pending = disk.hash_pending.load(std::sync::atomic::Ordering::Relaxed);
+            s.hash_readback_bytes = disk
+                .readback_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            s.recv_buffers_free = ctx.recv_ring.free();
+            s.recv_buffers = usize::from(ctx.cfg.recv_ring_entries);
             let _ = reply.send(s);
         }
         Command::SaveResume(id, reply) => match ctx.torrent(id) {
             Some(t) => {
+                let ctx2 = ctx.clone();
                 uring::spawn(async move {
-                    let r = torrent::save_resume(&t).await;
+                    let r = torrent::save_resume(&ctx2, &t).await;
                     let _ = reply.send(r);
                 });
             }

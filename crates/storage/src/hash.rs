@@ -123,6 +123,9 @@ pub struct HashPool {
     tx: Option<Sender<Job>>,
     workers: Vec<JoinHandle<()>>,
     shared: Arc<Shared>,
+    /// Jobs handed to workers and not yet finished (readable from any
+    /// thread: the session's stats).
+    outstanding: Arc<std::sync::atomic::AtomicUsize>,
     /// Async jobs awaiting completion, keyed by job id (ring thread only).
     pending: RefCell<HashMap<u64, Rc<RefCell<Slot>>>>,
     next_id: RefCell<u64>,
@@ -131,6 +134,15 @@ pub struct HashPool {
 impl HashPool {
     /// Start a pool with `threads` workers (at least 1).
     pub fn new(threads: usize) -> HashPool {
+        Self::with_counter(threads, Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+    }
+
+    /// [`HashPool::new`] counting in-flight jobs in `outstanding` (shared
+    /// with whoever reports them).
+    pub fn with_counter(
+        threads: usize,
+        outstanding: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> HashPool {
         let threads = threads.max(1);
         let (tx, rx) = channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
@@ -142,6 +154,7 @@ impl HashPool {
         for i in 0..threads {
             let rx = rx.clone();
             let shared = shared.clone();
+            let outstanding = outstanding.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("urt-hash-{i}"))
                 .spawn(move || {
@@ -153,6 +166,7 @@ impl HashPool {
                         };
                         let Ok(job) = job else { break };
                         let outcome = run_work(job.work);
+                        outstanding.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         match job.reply {
                             Reply::Sync(tx) => {
                                 let _ = tx.send((job.id, outcome));
@@ -188,9 +202,15 @@ impl HashPool {
             tx: Some(tx),
             workers,
             shared,
+            outstanding,
             pending: RefCell::new(HashMap::new()),
             next_id: RefCell::new(1),
         }
+    }
+
+    /// Jobs handed to the workers and not finished yet.
+    pub fn outstanding(&self) -> usize {
+        self.outstanding.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A pool sized to the machine (capped), a reasonable default.
@@ -222,6 +242,8 @@ impl HashPool {
     /// back for reuse). Blocks the caller until the worker finishes.
     pub fn hash(&self, data: Vec<u8>) -> ([u8; 20], Vec<u8>) {
         let (reply, rx) = channel::<HashReply>();
+        self.outstanding
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let data = match &self.tx {
             Some(tx) => match tx.send(Job {
                 id: self.alloc_id(),
@@ -252,6 +274,8 @@ impl HashPool {
         };
         // Hash inline so the result is still correct (accounting must be
         // truthful, AGENTS.md rule 1) and callers never deadlock.
+        self.outstanding
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let digest = sha1(&data);
         (digest, data)
     }
@@ -284,6 +308,8 @@ impl HashPool {
         {
             let id = self.alloc_id();
             self.pending.borrow_mut().insert(id, slot.clone());
+            self.outstanding
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match tx.send(Job {
                 id,
                 work,
@@ -291,6 +317,8 @@ impl HashPool {
             }) {
                 Ok(()) => return slot,
                 Err(std::sync::mpsc::SendError(job)) => {
+                    self.outstanding
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     self.pending.borrow_mut().remove(&id);
                     work = job.work;
                 }

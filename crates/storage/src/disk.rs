@@ -26,7 +26,7 @@ use metainfo::{Bitfield, Info};
 use uring::{Bridge, Completer, Notifier, NotifyHandle, Runtime, Ticket};
 
 use crate::hash::HashPool;
-use crate::store::Storage;
+use crate::store::{DiskResources, DiskStats, Storage};
 use crate::{Error, layout};
 
 /// A job for the disk thread.
@@ -38,6 +38,11 @@ enum Job {
         prios: Option<Vec<u8>>,
     },
     CreateFiles {
+        id: u64,
+        preallocate: bool,
+        done: Done,
+    },
+    DeleteFiles {
         id: u64,
         done: Done,
     },
@@ -181,7 +186,11 @@ enum Mode {
     },
     /// On the caller's own ring (no thread hop; for hosts without a spare
     /// core, see `docs/perf.md`).
-    Inline { stores: Stores, pool: Rc<HashPool> },
+    Inline {
+        stores: Stores,
+        pool: Rc<HashPool>,
+        res: Rc<DiskResources>,
+    },
 }
 
 /// The disk ring handle (owned by the engine; dropping it joins the thread).
@@ -190,29 +199,47 @@ pub struct DiskRing {
     /// Completions back to the engine's ring.
     bridge: Bridge<Reply>,
     next_id: RefCell<u64>,
+    stats: Arc<DiskStats>,
 }
 
 impl DiskRing {
     /// Run storage on the caller's ring (the ring that polls the futures
     /// must be the one the caller's `notify` belongs to). `hash_threads`
     /// SHA-1 workers complete through `notify` as well.
-    pub fn inline(hash_threads: usize, notify: NotifyHandle) -> DiskRing {
-        let pool = Rc::new(HashPool::new(hash_threads));
+    pub fn inline(hash_threads: usize, max_open_files: usize, notify: NotifyHandle) -> DiskRing {
+        let stats = Arc::new(DiskStats::default());
+        let pool = Rc::new(HashPool::with_counter(
+            hash_threads,
+            stats.hash_pending.clone(),
+        ));
         pool.attach_notifier(notify.clone());
         DiskRing {
             mode: Mode::Inline {
                 stores: Rc::new(RefCell::new(HashMap::new())),
                 pool,
+                res: DiskResources::with_stats(max_open_files, stats.clone()),
             },
             bridge: Bridge::new(notify),
             next_id: RefCell::new(1),
+            stats,
         }
     }
 
-    /// Start the disk thread with `hash_threads` SHA-1 workers. `notify` is
-    /// the engine ring's eventfd, rung on every completion; the engine calls
-    /// [`DiskRing::drain`] when it fires.
-    pub fn start(hash_threads: usize, notify: NotifyHandle) -> Result<DiskRing, Error> {
+    /// The disk side's counters (jobs pending, hash jobs pending, read-back
+    /// bytes).
+    pub fn stats(&self) -> &Arc<DiskStats> {
+        &self.stats
+    }
+
+    /// Start the disk thread with `hash_threads` SHA-1 workers and at most
+    /// `max_open_files` torrent files open at once (an LRU; libtorrent's file
+    /// pool). `notify` is the engine ring's eventfd, rung on every
+    /// completion; the engine calls [`DiskRing::drain`] when it fires.
+    pub fn start(
+        hash_threads: usize,
+        max_open_files: usize,
+        notify: NotifyHandle,
+    ) -> Result<DiskRing, Error> {
         // The disk thread's own eventfd must be created on that thread's ring?
         // No: an eventfd is a plain fd; only the read op must run there. It is
         // created here so the handle is available before the thread runs.
@@ -223,10 +250,21 @@ impl DiskRing {
             wake,
         });
         let shared2 = shared.clone();
+        let stats = Arc::new(DiskStats::default());
+        let stats2 = stats.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let thread = std::thread::Builder::new()
             .name("urt-disk".into())
-            .spawn(move || run(shared2, notifier, hash_threads, ready_tx))
+            .spawn(move || {
+                run(
+                    shared2,
+                    notifier,
+                    hash_threads,
+                    max_open_files,
+                    stats2,
+                    ready_tx,
+                )
+            })
             .map_err(Error::Io)?;
         match ready_rx.recv() {
             Ok(Ok(())) => {}
@@ -244,6 +282,7 @@ impl DiskRing {
             },
             bridge: Bridge::new(notify),
             next_id: RefCell::new(1),
+            stats,
         })
     }
 
@@ -253,6 +292,9 @@ impl DiskRing {
     }
 
     fn submit(&self, job: Job) {
+        self.stats
+            .jobs_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match &self.mode {
             Mode::Thread { shared, .. } => {
                 let was_empty = match shared.jobs.lock() {
@@ -267,7 +309,7 @@ impl DiskRing {
                     shared.wake.notify();
                 }
             }
-            Mode::Inline { stores, pool } => dispatch(stores, pool, job),
+            Mode::Inline { stores, pool, res } => dispatch(stores, pool, res, job),
         }
     }
 
@@ -432,10 +474,22 @@ impl DiskStore {
         layout::file_done(&self.info, &self.have.borrow(), index)
     }
 
-    /// Create the wanted files (see [`Storage::create_files`]).
-    pub async fn create_files(&self) -> Result<(), Error> {
+    /// Create the wanted files (see [`Storage::create_files`]), fully
+    /// allocated when `preallocate` (see [`Storage::preallocate`]).
+    pub async fn create_files(&self, preallocate: bool) -> Result<(), Error> {
         let (t, done) = self.ticket();
-        self.ring.submit(Job::CreateFiles { id: self.id, done });
+        self.ring.submit(Job::CreateFiles {
+            id: self.id,
+            preallocate,
+            done,
+        });
+        unit(t.await)
+    }
+
+    /// Delete the torrent's files (see [`Storage::delete_files`]).
+    pub async fn delete_files(&self) -> Result<(), Error> {
+        let (t, done) = self.ticket();
+        self.ring.submit(Job::DeleteFiles { id: self.id, done });
         unit(t.await)
     }
 
@@ -624,6 +678,7 @@ fn is_barrier(j: &Job) -> bool {
             | Job::MoveTo { .. }
             | Job::SyncAll { .. }
             | Job::CreateFiles { .. }
+            | Job::DeleteFiles { .. }
     )
 }
 
@@ -644,6 +699,8 @@ fn run(
     shared: Arc<Shared>,
     notifier: Notifier,
     hash_threads: usize,
+    max_open_files: usize,
+    stats: Arc<DiskStats>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let rt = match Runtime::with_defaults() {
@@ -654,8 +711,12 @@ fn run(
         }
     };
     rt.block_on(async move {
-        let pool = Rc::new(HashPool::new(hash_threads));
+        let pool = Rc::new(HashPool::with_counter(
+            hash_threads,
+            stats.hash_pending.clone(),
+        ));
         pool.attach_notifier(notifier.handle());
+        let res = DiskResources::with_stats(max_open_files, stats);
         let _ = ready.send(Ok(()));
         let stores: Stores = Rc::new(RefCell::new(HashMap::new()));
         loop {
@@ -672,7 +733,7 @@ fn run(
                 if matches!(job, Job::Shutdown) {
                     shutdown = true;
                 } else {
-                    dispatch(&stores, &pool, job);
+                    dispatch(&stores, &pool, &res, job);
                 }
             }
             if shutdown {
@@ -687,16 +748,21 @@ fn run(
 
 /// Route one job on the ring that owns `stores`: open / close a store, or
 /// queue the job on its store.
-fn dispatch(stores: &Stores, pool: &Rc<HashPool>, job: Job) {
+fn dispatch(stores: &Stores, pool: &Rc<HashPool>, res: &Rc<DiskResources>, job: Job) {
+    let done_now = |n: usize| {
+        res.stats()
+            .jobs_pending
+            .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+    };
     match job {
-        Job::Shutdown => {}
+        Job::Shutdown => done_now(1),
         Job::Open {
             id,
             info,
             root,
             prios,
         } => {
-            let storage = Storage::new(info, root, pool.clone());
+            let storage = Storage::with_resources(info, root, pool.clone(), res.clone());
             if let Some(p) = prios {
                 storage.init_priorities(&p);
             }
@@ -711,16 +777,21 @@ fn dispatch(stores: &Stores, pool: &Rc<HashPool>, job: Job) {
                     barrier: false,
                 })),
             );
+            done_now(1);
         }
         Job::Close { id } => {
             stores.borrow_mut().remove(&id);
+            done_now(1);
         }
         other => {
             let id = job_id(&other);
             let entry = stores.borrow().get(&id).cloned();
             match entry {
                 Some(e) => enqueue(e, other),
-                None => fail(other, "store is closed"),
+                None => {
+                    fail(other, "store is closed");
+                    done_now(1);
+                }
             }
         }
     }
@@ -730,6 +801,7 @@ fn job_id(j: &Job) -> u64 {
     match j {
         Job::Open { id, .. }
         | Job::CreateFiles { id, .. }
+        | Job::DeleteFiles { id, .. }
         | Job::Write { id, .. }
         | Job::ReadBlock { id, .. }
         | Job::VerifyPiece { id, .. }
@@ -748,6 +820,7 @@ fn fail(job: Job, why: &str) {
     let err = || Error::Io(std::io::Error::other(why.to_string()));
     match job {
         Job::CreateFiles { done, .. }
+        | Job::DeleteFiles { done, .. }
         | Job::Write { done, .. }
         | Job::SetPriorities { done, .. }
         | Job::MoveTo { done, .. }
@@ -835,8 +908,18 @@ async fn run_job(entry: Rc<RefCell<Entry>>, job: Job) {
     let piece = job_piece(&job);
     let verify = matches!(job, Job::VerifyPiece { .. });
     match job {
-        Job::CreateFiles { done, .. } => {
-            done.complete(Reply::Unit(storage.create_files().await));
+        Job::CreateFiles {
+            preallocate, done, ..
+        } => {
+            let r = if preallocate {
+                storage.preallocate().await
+            } else {
+                storage.create_files().await
+            };
+            done.complete(Reply::Unit(r));
+        }
+        Job::DeleteFiles { done, .. } => {
+            done.complete(Reply::Unit(storage.delete_files().await));
         }
         Job::Write {
             piece,
@@ -882,6 +965,10 @@ async fn run_job(entry: Rc<RefCell<Entry>>, job: Job) {
         }
         Job::Open { .. } | Job::Close { .. } | Job::Shutdown => {}
     }
+    storage
+        .stats()
+        .jobs_pending
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     {
         let mut e = entry.borrow_mut();
         e.inflight -= 1;

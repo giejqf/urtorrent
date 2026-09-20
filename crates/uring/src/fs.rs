@@ -15,7 +15,9 @@ use std::rc::Rc;
 
 use crate::bufpool::Buffer;
 use crate::error::Result;
-use crate::reactor::{self, close_fd_detached, fallocate, fsync, read_at, write_at};
+use crate::reactor::{
+    self, close_fd_detached, fallocate, fsync, read_at, read_range_at, write_at, write_range_at,
+};
 
 /// A torrent file opened for positional (offset-based) I/O.
 pub struct File {
@@ -62,21 +64,35 @@ impl File {
     /// Errors with `UnexpectedEof` if the file ends first.
     pub async fn read_exact_at(&self, offset: u64, buf: Buffer) -> Result<Buffer> {
         let want = buf.len();
-        let mut data = buf.into_vec();
+        self.read_exact_into(offset, buf, 0, want).await
+    }
+
+    /// Read exactly `len` bytes at `offset` into `buf[start..start + len]`
+    /// (the rest of `buf` is untouched), resubmitting short reads. Lets a
+    /// caller assemble a multi-file range in one buffer without temporaries.
+    pub async fn read_exact_into(
+        &self,
+        offset: u64,
+        buf: Buffer,
+        start: usize,
+        len: usize,
+    ) -> Result<Buffer> {
+        if start + len > buf.len() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
+        }
+        let mut buf = buf;
         let mut got = 0usize;
-        while got < want {
-            let chunk = Buffer::from_vec(vec![0u8; want - got]);
-            let (r, filled) = read_at(self.fd, offset + got as u64, chunk).await;
+        while got < len {
+            let (r, b) =
+                read_range_at(self.fd, offset + got as u64, buf, start + got, len - got).await;
+            buf = b;
             match r {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-                Ok(n) => {
-                    data[got..got + n as usize].copy_from_slice(filled.as_slice());
-                    got += n as usize;
-                }
+                Ok(n) => got += n as usize,
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(Buffer::from_vec(data))
+        Ok(buf)
     }
 
     /// Write `buf` at `offset`. Returns bytes written and the buffer back.
@@ -88,19 +104,19 @@ impl File {
     /// Write all of `buf` at `offset`, resubmitting short writes.
     pub async fn write_all_at(&self, offset: u64, buf: Buffer) -> Result<Buffer> {
         let total = buf.len();
-        let mut data = buf.into_vec();
+        let mut buf = buf;
         let mut done = 0usize;
         while done < total {
-            let chunk = Buffer::from_vec(data[done..].to_vec());
-            let (r, _b) = write_at(self.fd, offset + done as u64, chunk).await;
+            let (r, b) =
+                write_range_at(self.fd, offset + done as u64, buf, done, total - done).await;
+            buf = b;
             match r {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
                 Ok(n) => done += n as usize,
                 Err(e) => return Err(e.into()),
             }
         }
-        data.truncate(total);
-        Ok(Buffer::from_vec(data))
+        Ok(buf)
     }
 
     /// Preallocate `len` bytes from `offset` (`fallocate`).

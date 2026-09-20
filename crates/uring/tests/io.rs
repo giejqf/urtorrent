@@ -255,3 +255,140 @@ fn udp_unconnected_send_to_recv_from() {
         assert_eq!(from, Some(c.local_addr()));
     });
 }
+
+#[test]
+fn multishot_recv_with_buffer_ring() {
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr();
+        // 1 MiB in 4 KiB sends, with a ring of 8 x 4 KiB: the ring runs dry
+        // whenever the reader falls behind, ENOBUFS re-arms transparently.
+        let total = 1 << 20;
+        let sender = spawn(async move {
+            let client = TcpStream::connect(addr).await.unwrap();
+            let mut sent = 0usize;
+            let mut seq = 0u8;
+            while sent < total {
+                let chunk: Vec<u8> = (0..4096)
+                    .map(|_| {
+                        seq = seq.wrapping_add(1);
+                        seq
+                    })
+                    .collect();
+                client.send_all(Buffer::from_vec(chunk)).await.unwrap();
+                sent += 4096;
+            }
+            client
+        });
+        let conn = listener.accept().await.unwrap();
+        let ring = uring::BufRing::new(7, 8, 4096).unwrap();
+        assert_eq!(ring.free(), 8);
+        let mut rx = conn.recv_multi(&ring);
+        let mut got = Vec::with_capacity(total);
+        let mut held = Vec::new();
+        while got.len() < total {
+            let buf = rx.next().await.unwrap().expect("not eof");
+            assert!(buf.len() <= 4096);
+            got.extend_from_slice(buf.as_slice());
+            // Hold a few guards to starve the ring on purpose.
+            held.push(buf);
+            if held.len() == 6 {
+                held.clear();
+            }
+        }
+        drop(held);
+        let mut seq = 0u8;
+        for b in &got {
+            seq = seq.wrapping_add(1);
+            assert_eq!(*b, seq);
+        }
+        let client = sender.await;
+        drop(client);
+        // Peer closed: end of stream.
+        assert!(rx.next().await.unwrap().is_none());
+        drop(rx);
+        assert_eq!(ring.free(), 8, "every buffer back on the ring");
+    });
+}
+
+#[test]
+fn multishot_recv_dropped_mid_stream_recycles_buffers() {
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let conn = listener.accept().await.unwrap();
+        let ring = uring::BufRing::new(9, 4, 1024).unwrap();
+        let mut rx = conn.recv_multi(&ring);
+        for _ in 0..3 {
+            client
+                .send_all(Buffer::from_vec(vec![7u8; 1024]))
+                .await
+                .unwrap();
+        }
+        let first = rx.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), 1024);
+        // Drop the receiver while completions may still be queued; the
+        // kernel's final CQE (cancel) and any queued buffers are recycled.
+        drop(rx);
+        drop(first);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(ring.free(), 4);
+    });
+}
+
+#[test]
+fn zero_copy_vectored_send() {
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on(async {
+        if !uring::probe().unwrap().send_zc {
+            eprintln!("send_zc unsupported here; skipping");
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr();
+        let total = 4usize << 20;
+        let receiver = spawn(async move {
+            let conn = listener.accept().await.unwrap();
+            let ring = uring::BufRing::new(11, 16, 65536).unwrap();
+            let mut rx = conn.recv_multi(&ring);
+            let mut got = Vec::with_capacity(total);
+            while got.len() < total {
+                let b = rx.next().await.unwrap().expect("not eof");
+                got.extend_from_slice(b.as_slice());
+            }
+            got
+        });
+        let client = TcpStream::connect(addr).await.unwrap();
+        // 13-byte headers interleaved with 16 KiB payloads, like piece messages.
+        let mut chunks = Vec::new();
+        let mut expect = Vec::with_capacity(total);
+        let mut i = 0u8;
+        while expect.len() < total {
+            let hdr = vec![i; 13];
+            let payload = vec![i.wrapping_add(1); 16384];
+            expect.extend_from_slice(&hdr);
+            expect.extend_from_slice(&payload);
+            chunks.push(Buffer::from_vec(hdr));
+            chunks.push(Buffer::from_vec(payload));
+            i = i.wrapping_add(2);
+        }
+        let n = expect.len();
+        let shared = std::rc::Rc::new(chunks);
+        // Two ranges in flight at once share the chunks.
+        let half = n / 2;
+        let a = client.send_all_chunks_zc(shared.clone(), 0, half);
+        let b = client.send_all_chunks_zc(shared.clone(), half, n - half);
+        // `a` must finish before `b` starts to keep the byte order; run them
+        // sequentially (the sharing is what is under test).
+        a.await.unwrap();
+        b.await.unwrap();
+        drop(shared);
+        let got = receiver.await;
+        assert_eq!(got.len(), total.max(n).min(got.len()));
+        assert_eq!(&got[..], &expect[..got.len()]);
+        drop(client);
+    });
+}

@@ -152,9 +152,9 @@ fn replay_oracle_leeching_from_us() {
                 }
                 Event::Request(r) => {
                     requests += 1;
-                    conn.piece(r, &vec![0u8; r.length as usize]);
+                    conn.piece(r, vec![0u8; r.length as usize]);
                 }
-                Event::HaveChanged => haves += 1,
+                Event::HaveChanged { .. } => haves += 1,
                 Event::Interested | Event::NotInterested | Event::KeepAlive => {}
                 other => panic!("unexpected event {other:?}"),
             }

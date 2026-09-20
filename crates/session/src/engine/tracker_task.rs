@@ -113,6 +113,9 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
         return;
     }
     let family = http::Families::only(v6);
+    // Bounded concurrency across the session (an announce storm at start-up
+    // with thousands of torrents would otherwise open thousands of sockets).
+    let permit = ctx.announce_gate.acquire().await;
     let result: Result<(AnnounceResponse, Option<(SocketAddr, SocketAddr)>), String> = async {
         let url = Url::parse(&job.url).map_err(|e| e.to_string())?;
         let profile = &ctx.cfg.profile;
@@ -133,6 +136,7 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
             .map_err(|e| e.to_string())
     }
     .await;
+    drop(permit);
     let now = Instant::now();
     match result {
         Ok((resp, endpoints)) => {

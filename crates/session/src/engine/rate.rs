@@ -2,8 +2,10 @@
 // Copyright (c) 2026 urtorrent contributors
 
 //! Token-bucket rate limiting, shared by every peer of a session (or of a
-//! torrent). Pure bookkeeping plus a local notify: the engine's 100 ms ticker
-//! refills the buckets and wakes waiters; peers `acquire` before sending or
+//! torrent). Pure bookkeeping plus a local notify: buckets refill lazily from
+//! the clock when tokens are taken, and a starved waiter sleeps for the time
+//! its minimal grant takes to accrue (so nothing has to walk every limiter on
+//! a timer); `set_rate` wakes waiters. Peers `acquire` before sending or
 //! posting a receive.
 
 use std::cell::RefCell;
@@ -74,21 +76,6 @@ impl Limiter {
         self.rate() == 0
     }
 
-    /// Refill from the clock and wake waiters if anything became available.
-    /// Called by the ticker.
-    pub fn tick(&self, now: Instant) {
-        let mut b = self.bucket.borrow_mut();
-        if b.rate == 0 {
-            return;
-        }
-        b.refill(now);
-        let has = b.tokens >= MIN_GRANT.min(b.rate);
-        drop(b);
-        if has {
-            self.ready.notify();
-        }
-    }
-
     /// Try to take up to `want` tokens now; returns how many were granted
     /// (0 if none available). Unlimited limiters grant everything.
     pub fn try_take(&self, want: u64, now: Instant) -> u64 {
@@ -110,11 +97,20 @@ impl Limiter {
     /// `want`. Returns the grant (> 0).
     pub async fn acquire(&self, want: u64) -> u64 {
         loop {
-            let got = self.try_take(want, Instant::now());
+            let now = Instant::now();
+            let got = self.try_take(want, now);
             if got > 0 {
                 return got;
             }
-            self.ready.wait().await;
+            // Time for the minimal grant to accrue at the current rate (the
+            // rate may change meanwhile: `set_rate` notifies).
+            let wait = {
+                let b = self.bucket.borrow();
+                let need = MIN_GRANT.min(b.rate).saturating_sub(b.tokens).max(1);
+                let nanos = (need as u128 * 1_000_000_000 / b.rate.max(1) as u128) as u64;
+                std::time::Duration::from_nanos(nanos.clamp(1_000_000, 1_000_000_000))
+            };
+            super::local::select2(self.ready.wait(), uring::sleep(wait)).await;
         }
     }
 

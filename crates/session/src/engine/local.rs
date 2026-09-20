@@ -115,3 +115,77 @@ pub async fn select2<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::O
     })
     .await
 }
+
+/// A counting semaphore for the ring thread: bounds how many of something run
+/// at once (checks, announces, resume saves). Waiters are woken in no
+/// particular order; fairness is not needed for these uses.
+pub struct Semaphore {
+    free: Cell<usize>,
+    notify: Rc<Notify>,
+}
+
+/// A held permit; dropping it releases the slot.
+pub struct Permit {
+    sem: Rc<Semaphore>,
+}
+
+impl Semaphore {
+    /// `n` permits.
+    pub fn new(n: usize) -> Rc<Semaphore> {
+        Rc::new(Semaphore {
+            free: Cell::new(n.max(1)),
+            notify: Notify::new(),
+        })
+    }
+
+    /// Wait for a permit.
+    pub async fn acquire(self: &Rc<Self>) -> Permit {
+        loop {
+            let free = self.free.get();
+            if free > 0 {
+                self.free.set(free - 1);
+                return Permit { sem: self.clone() };
+            }
+            self.notify.wait().await;
+        }
+    }
+
+    /// Permits available right now.
+    pub fn available(&self) -> usize {
+        self.free.get()
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.sem.free.set(self.sem.free.get() + 1);
+        self.sem.notify.notify();
+    }
+}
+
+#[cfg(test)]
+mod semaphore_tests {
+    use super::*;
+
+    #[test]
+    fn permits_bound_concurrency_and_come_back_on_drop() {
+        let rt = uring::Runtime::with_defaults().unwrap();
+        rt.block_on(async {
+            let sem = Semaphore::new(2);
+            let a = sem.acquire().await;
+            let _b = sem.acquire().await;
+            assert_eq!(sem.available(), 0);
+            // A third acquire waits until one permit is dropped.
+            let sem2 = sem.clone();
+            let waiter = uring::spawn(async move {
+                let _c = sem2.acquire().await;
+                sem2.available()
+            });
+            uring::sleep(std::time::Duration::from_millis(20)).await;
+            drop(a);
+            let avail_inside = waiter.await;
+            assert_eq!(avail_inside, 0, "the waiter took the released permit");
+            assert_eq!(sem.available(), 1);
+        });
+    }
+}
