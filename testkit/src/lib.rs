@@ -17,6 +17,7 @@
 
 pub mod bencode;
 pub mod capture;
+pub mod client;
 pub mod fixtures;
 pub mod http;
 pub mod lab;

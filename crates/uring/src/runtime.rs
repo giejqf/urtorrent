@@ -263,8 +263,14 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        // Best-effort drain: reap any completions still owed to abandoned ops
-        // so their resources are freed before the ring is torn down.
+        // Teardown: operations abandoned by tasks that never ran again (an
+        // `accept` on a listener, a timer) would otherwise keep us waiting.
+        // Cancel everything, then reap until the slab is empty so every
+        // buffer the kernel might still touch is reclaimed before the ring
+        // goes away. Each wait is bounded, so a misbehaving kernel cannot
+        // hang the thread.
+        let displaced = self.reactor.borrow_mut().cancel_all();
+        drop(displaced);
         let mut guard = 0;
         while self.reactor.borrow().in_flight() > 0 && guard < 1024 {
             // Bind the returned wakers to a local so the `RefMut` from
@@ -272,9 +278,20 @@ impl Drop for Runtime {
             // the wakers may drop tasks whose pending futures abandon in-flight
             // ops (which re-borrows the reactor), so that must happen after the
             // borrow ends — never while it is still held.
-            let wakers = self.reactor.borrow_mut().tick(true);
+            let wakers = self
+                .reactor
+                .borrow_mut()
+                .tick_timeout(std::time::Duration::from_millis(100));
             drop(wakers);
             guard += 1;
+        }
+        if self.reactor.borrow().in_flight() > 0 {
+            tracing::warn!(
+                in_flight = self.reactor.borrow().in_flight(),
+                "io_uring teardown: operations still in flight; leaking their buffers"
+            );
+            // Leak rather than free memory the kernel may still write to.
+            self.reactor.borrow_mut().leak_in_flight();
         }
     }
 }

@@ -204,9 +204,11 @@ Only `uring`, `storage` and `session` may perform I/O.
   RustCrypto-based provider and accept that it is less mature. Record the choice in an ADR.
 - CPU work (SHA-1/SHA-256 hashing, RC4 on bulk data if it shows up in profiles) goes to a
   small dedicated thread pool. That is compute, not I/O, and is allowed.
-- Threading model: one network ring thread to start; disk ring(s) separate. Shard later
-  only with benchmarks in hand. The engine owns its threads; the caller's tokio runtime
-  never polls a uring future. See 5.6 for how the two meet.
+- Threading model: one network ring thread to start; disk ring(s) separate once
+  benchmarks justify them (M2 runs torrent file I/O on the network ring; `storage` is
+  agnostic about which ring polls it, see ADR 0004). Shard later only with benchmarks
+  in hand. The engine owns its threads; the caller's tokio runtime never polls a uring
+  future. See 5.6 for how the two meet.
 
 ### 5.4 Storage
 

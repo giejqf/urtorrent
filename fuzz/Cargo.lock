@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -151,6 +157,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -170,6 +185,10 @@ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "profile"
+version = "0.1.0"
 
 [[package]]
 name = "quote"
@@ -289,6 +308,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracker"
+version = "0.1.0"
+dependencies = [
+ "bencode",
+ "metainfo",
+ "miniz_oxide",
+ "profile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -317,7 +348,10 @@ dependencies = [
  "bencode",
  "libfuzzer-sys",
  "metainfo",
+ "profile",
  "storage",
+ "tracker",
+ "wire",
 ]
 
 [[package]]
@@ -325,3 +359,14 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "wire"
+version = "0.1.0"
+dependencies = [
+ "bencode",
+ "metainfo",
+ "profile",
+ "thiserror",
+ "tracing",
+]

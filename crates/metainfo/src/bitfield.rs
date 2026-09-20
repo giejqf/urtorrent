@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 urtorrent contributors
 
-//! A piece bitfield: which pieces we have. The wire format (BEP 3) is
-//! big-endian, bit 0 = piece 0 in the most significant bit of byte 0.
+//! A piece bitfield: which pieces a side has. The wire format (BEP 3) is
+//! big-endian, bit 0 = piece 0 in the most significant bit of byte 0. It lives
+//! here (pure data next to the piece maths) so that `wire`, `picker` and
+//! `storage` share one type.
 
 /// A fixed-size bitfield over `len` pieces.
 #[derive(Clone, PartialEq, Eq)]
@@ -105,6 +107,22 @@ impl Bitfield {
     /// Iterate the indices of set pieces.
     pub fn iter_set(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.len).filter(move |&i| self.raw_get(i))
+    }
+
+    /// Set every piece.
+    pub fn set_all(&mut self) {
+        *self = Bitfield::all_set(self.len);
+    }
+
+    /// Clear every piece.
+    pub fn clear_all(&mut self) {
+        self.bytes.iter_mut().for_each(|b| *b = 0);
+    }
+
+    /// Whether `other` has at least one piece that `self` lacks (i.e. whether
+    /// we would be interested in a peer advertising `other`).
+    pub fn has_missing_from(&self, other: &Bitfield) -> bool {
+        other.iter_set().any(|i| !self.get(i))
     }
 }
 

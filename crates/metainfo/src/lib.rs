@@ -16,6 +16,7 @@
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod bitfield;
 mod magnet;
 pub mod path;
 mod span;
@@ -23,6 +24,7 @@ mod span;
 use bencode::{Decoder, Value};
 use sha1::{Digest, Sha1};
 
+pub use bitfield::Bitfield;
 pub use magnet::MagnetLink;
 pub use path::SafePath;
 pub use span::{FileSlice, PieceLocation};

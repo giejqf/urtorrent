@@ -19,7 +19,7 @@ use bencode::{Decoder, Value};
 use metainfo::InfoHash;
 
 use crate::Error;
-use crate::bitfield::Bitfield;
+use metainfo::Bitfield;
 
 /// Current resume-data format version.
 pub const FORMAT_VERSION: i64 = 1;

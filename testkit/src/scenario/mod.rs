@@ -15,6 +15,7 @@ use crate::lab::{Actor, Lab, Shape};
 use crate::oracle::{Oracle, OracleConfig};
 
 pub mod m0;
+pub mod m2;
 
 /// Which command a scenario belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +88,18 @@ impl Ctx {
         Oracle::launch(&actor, config, &wl).with_context(|| format!("launching oracle {name}"))
     }
 
+    /// Launch the library under test (`urt-client`) as an actor.
+    pub fn client(
+        &mut self,
+        name: &str,
+        config: crate::client::ClientConfig,
+        torrent: &Path,
+    ) -> Result<crate::client::UrtClient> {
+        let actor = self.actor(name)?;
+        crate::client::UrtClient::launch(&actor, config, torrent)
+            .with_context(|| format!("launching client {name}"))
+    }
+
     /// Register a file produced by the scenario as an artifact (golden candidate).
     pub fn artifact(&mut self, name: &str, path: &Path) {
         self.artifacts.push((name.to_string(), path.to_path_buf()));
@@ -111,6 +124,7 @@ impl Ctx {
 pub fn all() -> Vec<ScenarioDef> {
     let mut v = Vec::new();
     v.extend(m0::scenarios());
+    v.extend(m2::scenarios());
     v
 }
 

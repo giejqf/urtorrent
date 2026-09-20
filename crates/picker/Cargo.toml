@@ -1,0 +1,19 @@
+[package]
+name = "picker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Piece picker and block request scheduling (rarest-first, priorities, sequential, end-game) for urtorrent"
+
+[lints]
+workspace = true
+
+[dependencies]
+metainfo = { path = "../metainfo", version = "0.1.0" }
+profile = { path = "../profile", version = "0.1.0" }
+
+[dev-dependencies]
+proptest.workspace = true

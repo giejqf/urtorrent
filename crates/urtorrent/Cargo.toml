@@ -1,0 +1,25 @@
+[package]
+name = "urtorrent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "A BitTorrent library for Linux on io_uring: downloading and seeding with IPv4/IPv6 and qBittorrent-compatible wire behaviour"
+
+[lints]
+workspace = true
+
+[features]
+default = ["tokio"]
+# Stream conveniences (`StreamExt`) for `Session::events()`. Pulls only
+# `tokio-stream` without its `time` feature, so no tokio runtime feature
+# enters the graph (AGENTS.md rule 4).
+tokio = ["dep:tokio-stream"]
+
+[dependencies]
+session = { path = "../session", version = "0.1.0" }
+metainfo = { path = "../metainfo", version = "0.1.0" }
+profile = { path = "../profile", version = "0.1.0" }
+tokio-stream = { version = "0.1", default-features = false, optional = true }

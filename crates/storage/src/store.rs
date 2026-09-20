@@ -15,8 +15,8 @@ use metainfo::{FileSlice, Info};
 use uring::{Buffer, File};
 
 use crate::Error;
-use crate::bitfield::Bitfield;
 use crate::hash::HashPool;
+use metainfo::Bitfield;
 
 /// A per-torrent piece store rooted at a save directory.
 pub struct Storage {
@@ -43,6 +43,16 @@ impl Storage {
     /// The torrent metainfo.
     pub fn info(&self) -> &Info {
         &self.info
+    }
+
+    /// The hash pool this store verifies with.
+    pub fn pool(&self) -> &Rc<HashPool> {
+        &self.pool
+    }
+
+    /// The save directory.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
     }
 
     /// A snapshot of the pieces we currently have verified.
@@ -195,7 +205,7 @@ impl Storage {
             self.have.borrow_mut().clear(piece);
             return Ok(false);
         }
-        let (ok, _buf) = self.pool.verify(piece as u64, data, &expected);
+        let (ok, _buf) = self.pool.verify_async(data, expected).await;
         if ok {
             self.have.borrow_mut().set(piece);
         } else {
@@ -220,7 +230,7 @@ impl Storage {
             return Ok(None);
         }
         let expected = *self.info.piece_hash(piece).ok_or(Error::OutOfRange)?;
-        let (ok, _) = self.pool.verify(piece as u64, bytes, &expected);
+        let (ok, _) = self.pool.verify_async(bytes, expected).await;
         if ok {
             self.have.borrow_mut().set(piece);
         }
@@ -239,7 +249,7 @@ impl Storage {
             };
             let (data, complete) = self.read_piece(p).await?;
             if complete {
-                let (ok, _) = self.pool.verify(p as u64, data, &expected);
+                let (ok, _) = self.pool.verify_async(data, expected).await;
                 if ok {
                     have.set(p);
                 }

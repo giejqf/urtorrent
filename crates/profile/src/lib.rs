@@ -1,0 +1,586 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 urtorrent contributors
+
+//! Identity and wire-shape profiles (AGENTS.md 6). Identity is **data, not
+//! code**: everything a tracker or a peer can observe that is not dictated by
+//! the protocol itself — peer-id prefix and tail generator, `User-Agent`, LTEP
+//! `v`, announce parameter *order*, header set and order, `key` format,
+//! reserved bits, the LTEP `m` map, the first-messages sequence — is described
+//! by a [`Profile`] and consumed by `tracker`, `wire` and `session`. Nothing
+//! else in the codebase may hardcode an identity string or an ordering that a
+//! profile owns.
+//!
+//! Two profiles ship:
+//!
+//! - [`Profile::native`]: our own honest identity.
+//! - [`Profile::qbt_5_2_3_lt2_0_14`]: the conformance target, whose values are
+//!   transcribed from the golden captures in `testkit/golden` (the oracle's
+//!   captured behaviour is the spec; nothing here comes from memory). Fields
+//!   the current captures cannot pin down are marked `UNVERIFIED` in comments
+//!   and are on the M4 list.
+//!
+//! This crate is pure data plus the two generators that need randomness
+//! (peer-id tail, announce key); both take an injected [`Rng`] so the
+//! consuming state machines stay deterministic in tests.
+
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+/// A source of randomness injected into the generators (sans-IO rule: no
+/// ambient randomness in protocol crates).
+pub trait Rng {
+    /// A uniformly random 32-bit value.
+    fn next_u32(&mut self) -> u32;
+
+    /// A uniformly random value in `0..n` (`n > 0`). Uses rejection sampling
+    /// so small alphabets are not biased.
+    fn below(&mut self, n: u32) -> u32 {
+        if n <= 1 {
+            return 0;
+        }
+        let zone = u32::MAX - (u32::MAX % n);
+        loop {
+            let v = self.next_u32();
+            if v < zone {
+                return v % n;
+            }
+        }
+    }
+}
+
+/// How the 20-byte peer id is built: a fixed prefix plus a random tail drawn
+/// from an alphabet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdShape {
+    /// The fixed prefix (e.g. `-qB5230-`).
+    pub prefix: &'static str,
+    /// Alphabet the random tail is drawn from.
+    pub tail_alphabet: &'static [u8],
+}
+
+impl PeerIdShape {
+    /// Generate a peer id: `prefix` followed by `20 - prefix.len()` random
+    /// characters from `tail_alphabet`.
+    pub fn generate(&self, rng: &mut dyn Rng) -> [u8; 20] {
+        let mut id = [0u8; 20];
+        let prefix = self.prefix.as_bytes();
+        let n = prefix.len().min(20);
+        id[..n].copy_from_slice(&prefix[..n]);
+        for slot in id.iter_mut().skip(n) {
+            let idx = rng.below(self.tail_alphabet.len().max(1) as u32) as usize;
+            *slot = self.tail_alphabet.get(idx).copied().unwrap_or(b'0');
+        }
+        id
+    }
+}
+
+/// One query parameter of an HTTP announce, in the order the profile emits
+/// them. Conditional parameters are omitted when they do not apply (`event`
+/// when there is none, `trackerid` when the tracker never gave one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnounceParam {
+    /// `info_hash`.
+    InfoHash,
+    /// `peer_id`.
+    PeerId,
+    /// `port`.
+    Port,
+    /// `uploaded`.
+    Uploaded,
+    /// `downloaded`.
+    Downloaded,
+    /// `left`.
+    Left,
+    /// `corrupt` (libtorrent extra).
+    Corrupt,
+    /// `key`.
+    Key,
+    /// `event` (only when there is one).
+    Event,
+    /// `numwant`.
+    Numwant,
+    /// `compact`.
+    Compact,
+    /// `no_peer_id`.
+    NoPeerId,
+    /// `supportcrypto` (MSE capability flag).
+    SupportCrypto,
+    /// `redundant` (libtorrent extra).
+    Redundant,
+    /// `trackerid` (only when the tracker returned one).
+    TrackerId,
+}
+
+/// How the announce `key` is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStyle {
+    /// A 32-bit value as 8 upper-case hex digits, zero padded.
+    HexUpper8,
+}
+
+impl KeyStyle {
+    /// Render `key` in this style.
+    pub fn render(self, key: u32) -> String {
+        match self {
+            KeyStyle::HexUpper8 => format!("{key:08X}"),
+        }
+    }
+}
+
+/// Percent-encoding style for binary query values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscapeStyle {
+    /// Lower-case hex; `A-Z a-z 0-9 - _ . ! ~ * ( )` are left literal.
+    LowerHexLibtorrent,
+    /// Lower-case hex; only RFC 3986 unreserved (`A-Z a-z 0-9 - _ . ~`) literal.
+    LowerHexRfc3986,
+}
+
+impl EscapeStyle {
+    /// Whether byte `b` is emitted literally.
+    pub fn is_unreserved(self, b: u8) -> bool {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            return true;
+        }
+        match self {
+            EscapeStyle::LowerHexLibtorrent => matches!(b, b'!' | b'*' | b'(' | b')'),
+            EscapeStyle::LowerHexRfc3986 => false,
+        }
+    }
+
+    /// Percent-encode `bytes`.
+    pub fn escape(self, bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 3);
+        for &b in bytes {
+            if self.is_unreserved(b) {
+                out.push(b as char);
+            } else {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+        out
+    }
+}
+
+/// An HTTP request header the announce carries, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnounceHeader {
+    /// `Host: host[:port]`.
+    Host,
+    /// `User-Agent: <profile user agent>`.
+    UserAgent,
+    /// `Accept-Encoding: gzip`.
+    AcceptEncodingGzip,
+    /// `Connection: close`.
+    ConnectionClose,
+}
+
+/// Whether the `Host` header carries the port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPortStyle {
+    /// Omit the port when it is the scheme default (80 / 443).
+    OmitDefault,
+    /// Always include the port.
+    Always,
+}
+
+/// When a new announce `key` is generated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLifetime {
+    /// One key per torrent for the life of the session.
+    PerTorrent,
+    /// One key for the whole session.
+    PerSession,
+}
+
+/// The shape of an HTTP announce (AGENTS.md 6, L2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpAnnounceShape {
+    /// Query parameters in emission order.
+    pub params: &'static [AnnounceParam],
+    /// Request headers in emission order.
+    pub headers: &'static [AnnounceHeader],
+    /// `Host` header port style.
+    pub host_port: HostPortStyle,
+    /// Percent-encoding style.
+    pub escape: EscapeStyle,
+    /// `key` rendering.
+    pub key: KeyStyle,
+    /// `key` lifetime.
+    pub key_lifetime: KeyLifetime,
+    /// `numwant` for regular announces.
+    pub numwant: u32,
+    /// `numwant` sent with `event=stopped`.
+    pub numwant_stopped: u32,
+    /// Value of `compact`.
+    pub compact: bool,
+    /// Value of `no_peer_id`.
+    pub no_peer_id: bool,
+    /// Value of `supportcrypto`.
+    pub supportcrypto: bool,
+}
+
+/// One entry of the LTEP handshake `m` map: extension name and the local id
+/// we assign to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LtepExtension {
+    /// Extension name as it appears in `m`.
+    pub name: &'static str,
+    /// The message id we assign (peers send us this id for that extension).
+    pub id: u8,
+}
+
+/// The shape of the LTEP extended handshake (BEP 10) we send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LtepShape {
+    /// The `m` map (bencode sorts keys on the wire; this is the set + ids).
+    pub m: &'static [LtepExtension],
+    /// `reqq`: the request queue depth we advertise.
+    pub reqq: u32,
+    /// Whether `complete_ago` is sent (libtorrent extra; `-1` when unknown).
+    pub complete_ago: bool,
+    /// Whether `yourip` is sent.
+    pub yourip: bool,
+    /// Whether `p` (listen port) is sent on outgoing connections.
+    pub p_on_outgoing: bool,
+    /// Whether `p` is sent on incoming connections.
+    pub p_on_incoming: bool,
+    /// Whether `upload_only: 1` is sent while seeding.
+    pub upload_only_when_seeding: bool,
+    /// Whether `metadata_size` is sent when we have the metadata.
+    pub metadata_size: bool,
+}
+
+/// What we send right after the handshake, in order (AGENTS.md 6, L2
+/// "first-messages sequence").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstMessage {
+    /// The LTEP extended handshake (only if both sides set the LTEP bit).
+    ExtendedHandshake,
+    /// `have_all` / `have_none` when the fast extension is negotiated and we
+    /// have all / no pieces; otherwise a `bitfield` (omitted if empty and
+    /// fast is off, matching BEP 3's "may be omitted" allowance is *not*
+    /// used: libtorrent always sends it).
+    HaveState,
+}
+
+/// Peer-wire shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerShape {
+    /// Reserved bytes in the handshake.
+    pub reserved: [u8; 8],
+    /// Messages sent immediately after the handshake, in order.
+    pub first_messages: &'static [FirstMessage],
+    /// Number of `allowed_fast` pieces we grant (BEP 6); 0 disables.
+    pub allowed_fast_count: u32,
+    /// Maximum number of outstanding incoming requests we accept per peer
+    /// (what `reqq` advertises).
+    pub max_incoming_requests: u32,
+}
+
+/// A complete identity/wire profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// Profile name (`native`, `qbt_5_2_3_lt2_0_14`).
+    pub name: &'static str,
+    /// Peer-id generator.
+    pub peer_id: PeerIdShape,
+    /// HTTP `User-Agent`.
+    pub user_agent: &'static str,
+    /// LTEP handshake `v` (client name and version).
+    pub ltep_version: &'static str,
+    /// HTTP announce shape.
+    pub http: HttpAnnounceShape,
+    /// LTEP handshake shape.
+    pub ltep: LtepShape,
+    /// Peer-wire shape.
+    pub peer: PeerShape,
+}
+
+/// Handshake reserved-bit positions (byte index, mask), BEP 3/6/10.
+pub mod reserved {
+    /// BEP 10 extension protocol: byte 5, bit 0x10.
+    pub const LTEP: (usize, u8) = (5, 0x10);
+    /// BEP 6 fast extension: byte 7, bit 0x04.
+    pub const FAST: (usize, u8) = (7, 0x04);
+    /// BEP 5 DHT: byte 7, bit 0x01.
+    pub const DHT: (usize, u8) = (7, 0x01);
+
+    /// Whether `bit` is set in `r`.
+    pub fn has(r: &[u8; 8], bit: (usize, u8)) -> bool {
+        r[bit.0] & bit.1 != 0
+    }
+}
+
+/// Announce params in the order the oracle emits them
+/// (`testkit/golden/capture_tracker_http/*/tap-tracker.jsonl`, every announce).
+const QBT_ANNOUNCE_PARAMS: &[AnnounceParam] = &[
+    AnnounceParam::InfoHash,
+    AnnounceParam::PeerId,
+    AnnounceParam::Port,
+    AnnounceParam::Uploaded,
+    AnnounceParam::Downloaded,
+    AnnounceParam::Left,
+    AnnounceParam::Corrupt,
+    AnnounceParam::Key,
+    AnnounceParam::Event,
+    AnnounceParam::Numwant,
+    AnnounceParam::Compact,
+    AnnounceParam::NoPeerId,
+    AnnounceParam::SupportCrypto,
+    AnnounceParam::Redundant,
+    // UNVERIFIED position: no golden capture has a tracker id yet (M4).
+    AnnounceParam::TrackerId,
+];
+
+/// Headers in the order the oracle emits them (same captures).
+const QBT_ANNOUNCE_HEADERS: &[AnnounceHeader] = &[
+    AnnounceHeader::Host,
+    AnnounceHeader::UserAgent,
+    AnnounceHeader::AcceptEncodingGzip,
+    AnnounceHeader::ConnectionClose,
+];
+
+/// LTEP `m` map as captured (`capture_peer_plain`, extended handshake):
+/// `{lt_donthave: 7, share_mode: 8, upload_only: 3, ut_holepunch: 4,
+/// ut_metadata: 2, ut_pex: 1}`. `ut_holepunch` cannot work without uTP; it is
+/// advertised for L2 exactness and answered as a disabled feature
+/// (`docs/quirks.md` Q2).
+const QBT_LTEP_M: &[LtepExtension] = &[
+    LtepExtension {
+        name: "ut_pex",
+        id: 1,
+    },
+    LtepExtension {
+        name: "ut_metadata",
+        id: 2,
+    },
+    LtepExtension {
+        name: "upload_only",
+        id: 3,
+    },
+    LtepExtension {
+        name: "ut_holepunch",
+        id: 4,
+    },
+    LtepExtension {
+        name: "lt_donthave",
+        id: 7,
+    },
+    LtepExtension {
+        name: "share_mode",
+        id: 8,
+    },
+];
+
+/// Our own `m` map: only what is implemented (M6 adds `ut_pex`, `ut_metadata`,
+/// `upload_only`).
+const NATIVE_LTEP_M: &[LtepExtension] = &[];
+
+const FIRST_MESSAGES: &[FirstMessage] = &[FirstMessage::ExtendedHandshake, FirstMessage::HaveState];
+
+/// The characters libtorrent draws the peer-id tail from: alphanumerics plus
+/// `- _ . ! ~ * ( )`. Consistent with every captured peer id
+/// (`-qB5230-PyFu!8(YVAlz`, `-qB5230-3unCvGtgNb_)`, `-qB5230-IE~JzVUKd0Us`,
+/// ...); UNVERIFIED whether `.` and `*` appear (M4 captures more ids).
+const QBT_TAIL_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*()";
+
+/// Our own tail alphabet (alphanumerics only, unambiguous in logs).
+const NATIVE_TAIL_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+impl Profile {
+    /// Our own honest identity (the default profile).
+    pub fn native() -> Profile {
+        Profile {
+            name: "native",
+            peer_id: PeerIdShape {
+                prefix: "-UR0010-",
+                tail_alphabet: NATIVE_TAIL_ALPHABET,
+            },
+            user_agent: "urtorrent/0.1.0",
+            ltep_version: "urtorrent 0.1.0",
+            http: HttpAnnounceShape {
+                params: QBT_ANNOUNCE_PARAMS,
+                headers: QBT_ANNOUNCE_HEADERS,
+                host_port: HostPortStyle::OmitDefault,
+                escape: EscapeStyle::LowerHexRfc3986,
+                key: KeyStyle::HexUpper8,
+                key_lifetime: KeyLifetime::PerTorrent,
+                numwant: 200,
+                numwant_stopped: 0,
+                compact: true,
+                no_peer_id: true,
+                supportcrypto: true,
+            },
+            ltep: LtepShape {
+                m: NATIVE_LTEP_M,
+                reqq: 250,
+                complete_ago: false,
+                yourip: true,
+                p_on_outgoing: true,
+                p_on_incoming: true,
+                upload_only_when_seeding: false,
+                metadata_size: true,
+            },
+            peer: PeerShape {
+                // LTEP + fast; no DHT bit: we do not implement DHT.
+                reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+                first_messages: FIRST_MESSAGES,
+                allowed_fast_count: 5,
+                max_incoming_requests: 250,
+            },
+        }
+    }
+
+    /// The conformance target: qBittorrent 5.2.3 on libtorrent 2.0.14, as
+    /// captured from the pinned oracle (`testkit/oracle.lock`).
+    pub fn qbt_5_2_3_lt2_0_14() -> Profile {
+        Profile {
+            name: "qbt_5_2_3_lt2_0_14",
+            peer_id: PeerIdShape {
+                prefix: "-qB5230-",
+                tail_alphabet: QBT_TAIL_ALPHABET,
+            },
+            user_agent: "qBittorrent/5.2.3",
+            ltep_version: "qBittorrent/5.2.3",
+            http: HttpAnnounceShape {
+                params: QBT_ANNOUNCE_PARAMS,
+                headers: QBT_ANNOUNCE_HEADERS,
+                // UNVERIFIED: captures only cover a non-default port (7070),
+                // where the port is present.
+                host_port: HostPortStyle::OmitDefault,
+                // `%e9%8b%27%01%d6%9bI%e7...%c2%2c...` (lower hex, `I` literal,
+                // `'`/`,` escaped) and peer ids with literal `!`, `(`, `)`, `~`.
+                escape: EscapeStyle::LowerHexLibtorrent,
+                // `key=FF2033B3`, `C8445FFC`, ...: 8 upper-case hex digits.
+                // UNVERIFIED: zero padding (no captured key starts with 0).
+                key: KeyStyle::HexUpper8,
+                // Constant across every announce of one torrent in one
+                // instance. UNVERIFIED per-torrent vs per-session (M4).
+                key_lifetime: KeyLifetime::PerTorrent,
+                numwant: 200,
+                numwant_stopped: 0,
+                compact: true,
+                no_peer_id: true,
+                supportcrypto: true,
+            },
+            ltep: LtepShape {
+                m: QBT_LTEP_M,
+                reqq: 2000,
+                complete_ago: true,
+                yourip: true,
+                // `p: 6881` appears on the oracle's outgoing connection
+                // (`oracle-initiator` capture) and is absent on the incoming
+                // one (`oracle-responder` capture).
+                p_on_outgoing: true,
+                p_on_incoming: false,
+                // `upload_only: 1` in the seeding capture only.
+                upload_only_when_seeding: true,
+                metadata_size: true,
+            },
+            peer: PeerShape {
+                // `0000000000100005` = LTEP + fast + DHT (docs/quirks.md Q1).
+                reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x05],
+                first_messages: FIRST_MESSAGES,
+                // Five `allowed_fast` messages in the seeding capture.
+                allowed_fast_count: 5,
+                max_incoming_requests: 2000,
+            },
+        }
+    }
+
+    /// Look a profile up by name.
+    pub fn by_name(name: &str) -> Option<Profile> {
+        match name {
+            "native" => Some(Profile::native()),
+            "qbt_5_2_3_lt2_0_14" | "qbt" => Some(Profile::qbt_5_2_3_lt2_0_14()),
+            _ => None,
+        }
+    }
+
+    /// Whether this profile advertises the LTEP bit.
+    pub fn supports_ltep(&self) -> bool {
+        reserved::has(&self.peer.reserved, reserved::LTEP)
+    }
+
+    /// Whether this profile advertises the fast-extension bit.
+    pub fn supports_fast(&self) -> bool {
+        reserved::has(&self.peer.reserved, reserved::FAST)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Counter(u32);
+    impl Rng for Counter {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            self.0
+        }
+    }
+
+    #[test]
+    fn peer_id_has_prefix_and_alphabet_tail() {
+        let p = Profile::qbt_5_2_3_lt2_0_14();
+        let id = p.peer_id.generate(&mut Counter(1));
+        assert_eq!(&id[..8], b"-qB5230-");
+        for &c in &id[8..] {
+            assert!(QBT_TAIL_ALPHABET.contains(&c), "{c}");
+        }
+        let n = Profile::native().peer_id.generate(&mut Counter(2));
+        assert_eq!(&n[..8], b"-UR0010-");
+        assert!(n[8..].iter().all(u8::is_ascii_alphanumeric));
+    }
+
+    #[test]
+    fn escape_matches_captured_style() {
+        // info_hash from the golden capture: e98b2701d69b49e78b07a50e0bc22c8a9dacee20
+        let ih = [
+            0xe9, 0x8b, 0x27, 0x01, 0xd6, 0x9b, 0x49, 0xe7, 0x8b, 0x07, 0xa5, 0x0e, 0x0b, 0xc2,
+            0x2c, 0x8a, 0x9d, 0xac, 0xee, 0x20,
+        ];
+        assert_eq!(
+            EscapeStyle::LowerHexLibtorrent.escape(&ih),
+            "%e9%8b%27%01%d6%9bI%e7%8b%07%a5%0e%0b%c2%2c%8a%9d%ac%ee%20"
+        );
+        assert_eq!(
+            EscapeStyle::LowerHexLibtorrent.escape(b"-qB5230-PyFu!8(YVAlz"),
+            "-qB5230-PyFu!8(YVAlz"
+        );
+        assert_eq!(EscapeStyle::LowerHexRfc3986.escape(b"a!b"), "a%21b");
+    }
+
+    #[test]
+    fn key_style() {
+        assert_eq!(KeyStyle::HexUpper8.render(0xFF2033B3), "FF2033B3");
+        assert_eq!(KeyStyle::HexUpper8.render(0x1), "00000001");
+    }
+
+    #[test]
+    fn reserved_bits() {
+        let q = Profile::qbt_5_2_3_lt2_0_14();
+        assert!(q.supports_ltep() && q.supports_fast());
+        assert!(reserved::has(&q.peer.reserved, reserved::DHT));
+        let n = Profile::native();
+        assert!(n.supports_ltep() && n.supports_fast());
+        assert!(!reserved::has(&n.peer.reserved, reserved::DHT));
+    }
+
+    #[test]
+    fn rng_below_is_in_range() {
+        let mut r = Counter(7);
+        for _ in 0..1000 {
+            assert!(r.below(70) < 70);
+        }
+        assert_eq!(r.below(1), 0);
+        assert_eq!(r.below(0), 0);
+    }
+}

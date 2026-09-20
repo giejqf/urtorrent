@@ -110,6 +110,18 @@ fn bind_socket(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
     if r < 0 { Err(last_os_error()) } else { Ok(()) }
 }
 
+fn peer_addr_of(fd: RawFd) -> io::Result<SocketAddr> {
+    // SAFETY: getpeername fills `storage` up to `len`; both are valid and sized.
+    let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let r =
+        unsafe { libc::getpeername(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) };
+    if r < 0 {
+        return Err(last_os_error());
+    }
+    sockaddr_to_std(&storage).ok_or_else(|| io::Error::other("unknown address family"))
+}
+
 fn local_addr_of(fd: RawFd) -> io::Result<SocketAddr> {
     // SAFETY: getsockname fills `storage` up to `len`; both are valid and sized.
     let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
@@ -207,6 +219,31 @@ impl TcpStream {
     /// Local address.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(local_addr_of(self.fd.raw())?)
+    }
+
+    /// Remote address.
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(peer_addr_of(self.fd.raw())?)
+    }
+
+    /// Set `TCP_NODELAY` (one-time socket setup, off the ring).
+    pub fn set_nodelay(&self, on: bool) -> Result<()> {
+        let v: libc::c_int = i32::from(on);
+        // SAFETY: setsockopt with a valid fd and an int-sized option value.
+        let r = unsafe {
+            libc::setsockopt(
+                self.fd.raw(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                &v as *const _ as *const libc::c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if r < 0 {
+            Err(last_os_error().into())
+        } else {
+            Ok(())
+        }
     }
 
     /// Send `buf`. Returns the number of bytes accepted and the buffer back

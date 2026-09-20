@@ -102,6 +102,20 @@ fn syscalls() -> Result<()> {
     }
 }
 
+/// `poll([{fd=0..2, events=0}, ...], n, 0)`: only stdio fds, no events.
+fn is_stdio_probe(args: &str) -> bool {
+    let fds: Vec<&str> = args.split("fd=").skip(1).collect();
+    !fds.is_empty()
+        && fds.iter().all(|f| {
+            let fd = f
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            matches!(fd.as_str(), "0" | "1" | "2")
+        })
+        && !args.contains("events=POLL")
+}
+
 struct SyscallReport {
     io_uring_enter: usize,
     violations: Vec<String>,
@@ -158,6 +172,12 @@ fn analyze_syscalls(text: &str) -> SyscallReport {
         if FD_SENSITIVE.contains(&name) {
             // With -y, the first arg's fd carries an annotation in <...>.
             let args = rest.split_once('(').map(|x| x.1).unwrap_or("");
+            // Rust's runtime start-up probes fds 0-2 with `poll(events=0)` to
+            // detect closed stdio; when stdin happens to be a socket (CI
+            // harnesses) that is not a data-path poll.
+            if name == "poll" && is_stdio_probe(args) {
+                continue;
+            }
             let first = args.split(',').next().unwrap_or("");
             let is_socket =
                 first.contains("socket:") || first.contains("TCP:") || first.contains("UDP:");
@@ -343,6 +363,12 @@ fn dependency_policy() -> Result<()> {
 }
 
 fn testkit(sub: &[&str], args: &[String]) -> Result<()> {
+    // The lab launches `urt-client` (the library under test) next to the
+    // testkit binary; build every testkit binary first.
+    run(
+        cargo().args(["build", "-q", "-p", "testkit", "--bins"]),
+        "build testkit binaries",
+    )?;
     let mut c = cargo();
     c.args(["run", "-q", "-p", "testkit", "--bin", "testkit", "--"])
         .args(sub)
@@ -361,7 +387,10 @@ fn fuzz(args: &[String]) -> Result<()> {
     // cargo-fuzz defaults to a musl target that lacks a prebuilt sanitizer
     // runtime here; pin the gnu host triple.
     let host = "x86_64-unknown-linux-gnu";
-    let mut c = cargo();
+    // Go through the rustup proxy (not `$CARGO`, which is the stable
+    // toolchain's own binary and does not understand `+nightly`).
+    let mut c = Command::new("cargo");
+    c.current_dir(root());
     c.args([
         "+nightly",
         "fuzz",

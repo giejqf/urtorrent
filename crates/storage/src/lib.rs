@@ -18,13 +18,12 @@
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-mod bitfield;
 mod hash;
 mod resume;
 mod store;
 
-pub use bitfield::Bitfield;
 pub use hash::{HashPool, sha1};
+pub use metainfo::Bitfield;
 pub use resume::{FORMAT_VERSION, ResumeData};
 pub use store::Storage;
 

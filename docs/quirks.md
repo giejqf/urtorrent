@@ -53,3 +53,19 @@ Behavioural (L3): we adopt the same default constant and honour
 Observation: right after a torrent is added and checked (WebAPI already
 reports `stalledUP`), incoming connections are closed without a handshake for
 up to ~1 s. Harness consequence only: tap-peer retries. Not a fidelity item.
+
+## Q6. LTEP `p` is omitted on outgoing connections from a non-routable listen socket
+
+Capture: `capture_peer_plain/v4/tap-peer-plain-oracle-initiator.jsonl` has
+`p: 6881` in the oracle's extended handshake; the same scenario in
+`capture_peer_plain/v6/...-oracle-initiator.jsonl` has **no `p`**. The lab's v6
+prefix is a ULA (`fd77:8e::/64`) with no default route, and libtorrent flags a
+listen socket whose interface has no route to the internet as "local network";
+`session_impl::listen_port(...)` skips such sockets, so the outgoing
+handshake carries no port. With a globally routable v6 address `p` would be
+present (as for v4 here, where the private range is not treated this way).
+
+Consequence: the `p` key depends on the *routability of our listen socket*,
+not just on the connection direction. `profile` records `p_on_outgoing`; the
+session decides routability per listen socket (M5, full dual-stack matrix).
+`crates/wire/tests/replay.rs` pins the v6 difference so it stays visible.

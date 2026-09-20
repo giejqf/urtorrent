@@ -12,6 +12,9 @@ libfuzzer-sys = "0.4"
 bencode = { path = "../crates/bencode" }
 metainfo = { path = "../crates/metainfo" }
 storage = { path = "../crates/storage" }
+wire = { path = "../crates/wire" }
+tracker = { path = "../crates/tracker" }
+profile = { path = "../crates/profile" }
 
 [[bin]]
 name = "bencode_decode"
@@ -44,6 +47,41 @@ bench = false
 [[bin]]
 name = "resume_parse"
 path = "fuzz_targets/resume_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_message"
+path = "fuzz_targets/wire_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_connection"
+path = "fuzz_targets/wire_connection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ltep_handshake"
+path = "fuzz_targets/ltep_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "announce_response"
+path = "fuzz_targets/announce_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
 test = false
 doc = false
 bench = false

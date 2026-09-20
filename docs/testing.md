@@ -20,6 +20,13 @@ family the shape asks for. Harness-side actors (tap-tracker, tap-peer,
 opentracker) run in the harness process or as host processes bound to bridge
 addresses (`.1` plus aliases `.2`-`.9`).
 
+The library under test runs as the `urt-client` binary (`testkit/src/bin`),
+launched into its own namespace like the oracle. It writes a JSON status
+snapshot (`status.json`: state, counters, trackers, peers seen, recent events)
+several times a second and takes commands from a control file (`shutdown`,
+`pause`, `resume`, `reannounce`, `save-resume`), so scenarios need no signals
+for a graceful stop. `testkit::client::UrtClient` wraps both.
+
 Run artifacts land in `testkit/runs/<stamp>-<scenario>-<shape>/` (gitignored):
 actor stdout/stderr, oracle profiles and logs, tap logs (`*.jsonl`), pcaps.
 Pass `--keep` to leave the namespaces up after a run; `testkit lab clean`

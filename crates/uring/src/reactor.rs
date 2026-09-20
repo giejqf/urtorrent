@@ -236,6 +236,74 @@ impl Reactor {
         }
     }
 
+    /// Cancel every operation still in flight (used at teardown): each slot is
+    /// marked ignored and an `ASYNC_CANCEL` is queued, so the kernel completes
+    /// it promptly (with `-ECANCELED` or its natural result) and the slot's
+    /// resources are freed when that CQE lands. The displaced wakers are
+    /// returned so the caller drops them after releasing the reactor borrow
+    /// (dropping a waker can drop a task whose future abandons another op).
+    pub(crate) fn cancel_all(&mut self) -> Vec<Waker> {
+        let mut wakers = Vec::new();
+        let keys: Vec<usize> = self
+            .slab
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(k, s)| {
+                s.as_ref()
+                    .filter(|s| matches!(s.lifecycle, Lifecycle::Submitted | Lifecycle::Waiting(_)))
+                    .map(|_| k)
+            })
+            .collect();
+        for key in keys {
+            if let Some(slot) = self.slab.get_mut(key)
+                && let Lifecycle::Waiting(w) =
+                    std::mem::replace(&mut slot.lifecycle, Lifecycle::Ignored)
+            {
+                wakers.push(w);
+            }
+            let cancel = opcode::AsyncCancel::new(key as u64)
+                .build()
+                .user_data(CANCEL_UD);
+            self.push(cancel);
+        }
+        wakers
+    }
+
+    /// Forget the resources of every slot still in flight (teardown fallback
+    /// when the kernel never completed them): leaking is the only safe option.
+    pub(crate) fn leak_in_flight(&mut self) {
+        for slot in self.slab.entries.iter_mut().flatten() {
+            if let Some(res) = slot.resources.take() {
+                std::mem::forget(res);
+            }
+        }
+    }
+
+    /// Like `tick(true)` but never blocks longer than `timeout` (teardown
+    /// safety net: a kernel that does not complete a cancelled op must not
+    /// hang the thread forever).
+    pub(crate) fn tick_timeout(&mut self, timeout: std::time::Duration) -> Vec<Waker> {
+        self.flush_backlog();
+        let ts = types::Timespec::new()
+            .sec(timeout.as_secs())
+            .nsec(timeout.subsec_nanos());
+        let args = types::SubmitArgs::new().timespec(&ts);
+        let want = if self.in_flight > 0 { 1 } else { 0 };
+        match self.ring.submitter().submit_with_args(want, &args) {
+            Ok(_) => {}
+            Err(ref e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EBUSY) | Some(libc::ETIME) | Some(libc::EINTR)
+                ) => {}
+            Err(e) => tracing::error!("io_uring submit failed: {e}"),
+        }
+        let mut wakers = Vec::new();
+        self.reap(&mut wakers);
+        wakers
+    }
+
     /// Flush pending SQEs and, if `wait` and there is something to wait for,
     /// block for at least one completion. Then reap. Returns woken wakers.
     pub(crate) fn tick(&mut self, wait: bool) -> Vec<Waker> {
