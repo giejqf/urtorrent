@@ -419,7 +419,10 @@ Each milestone ends with its integration scenarios green in CI.
   - `cargo xtask diff [scenario]` - differential run + discriminator
   - `cargo xtask capture` - regenerate golden captures from the pinned oracle
   - `cargo xtask fuzz <target> [secs]`
-  - `cargo xtask syscalls` - assert no non-uring data-path syscalls
+  - `cargo xtask syscalls` - assert no non-uring data-path syscalls (uring probe + a real
+    two-engine transfer under strace, engine threads only)
+  - `cargo xtask soak [transfer|many|all] [--size N] [--torrents N]` - perf / leak exercise
+    (release build; baselines in `docs/perf.md`)
 - Definition of done for any change: `xtask check` green; relevant `it`/`diff` scenarios
   green; new parser => new fuzz target; new wire-visible behaviour => profile entry +
   differential coverage; design-level decisions => ADR.

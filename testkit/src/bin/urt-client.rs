@@ -42,6 +42,7 @@ struct Args {
     lsd: bool,
     pex: bool,
     add_peers: Vec<std::net::SocketAddr>,
+    file_priorities: Option<Vec<u8>>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -66,6 +67,7 @@ fn parse_args() -> Result<Args> {
         lsd: true,
         pex: true,
         add_peers: Vec::new(),
+        file_priorities: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -76,6 +78,7 @@ fn parse_args() -> Result<Args> {
             "--no-lsd" => a.lsd = false,
             "--no-pex" => a.pex = false,
             "--add-peer" => a.add_peers.push(val()?.parse()?),
+            "--file-priorities" => a.file_priorities = Some(parse_priorities(&val()?)?),
             "--save" => a.save = PathBuf::from(val()?),
             "--resume" => a.resume = Some(PathBuf::from(val()?)),
             "--status" => a.status = Some(PathBuf::from(val()?)),
@@ -100,6 +103,12 @@ fn parse_args() -> Result<Args> {
         );
     }
     Ok(a)
+}
+
+fn parse_priorities(s: &str) -> Result<Vec<u8>> {
+    s.split(',')
+        .map(|x| x.trim().parse::<u8>().context("file priority"))
+        .collect()
 }
 
 fn peer_json(p: &urtorrent::PeerInfo) -> serde_json::Value {
@@ -164,6 +173,9 @@ async fn main() -> Result<()> {
     if let Some(r) = &args.resume {
         add = add.resume_dir(r);
     }
+    if let Some(p) = &args.file_priorities {
+        add = add.file_priorities(p.clone());
+    }
     let id = session.add_torrent(add).await.context("adding torrent")?;
     for p in &args.add_peers {
         session.add_peer(id, *p).await?;
@@ -218,6 +230,12 @@ async fn main() -> Result<()> {
                 "private": st.private,
                 "name": st.name,
                 "web_seeds": st.web_seeds,
+                "save_path": st.save_path.to_string_lossy(),
+                "total_wanted": st.total_wanted,
+                "total_wanted_done": st.total_wanted_done,
+                "files": st.files.iter().map(|f| serde_json::json!({
+                    "path": f.path, "size": f.size, "priority": f.priority, "done": f.done,
+                })).collect::<Vec<_>>(),
                 "listen_port": session.listen_port(),
                 "trackers": st.trackers.iter().map(|t| serde_json::json!({
                     "url": t.url, "working": t.working, "fails": t.fails,
@@ -248,7 +266,18 @@ async fn main() -> Result<()> {
                         let r = session.scrape(id).await?;
                         tracing::info!("scrape: {r:?}");
                     }
-                    other => tracing::warn!("unknown control command {other}"),
+                    other => {
+                        if let Some(csv) = other.strip_prefix("prio ") {
+                            match parse_priorities(csv) {
+                                Ok(p) => session.set_file_priorities(id, p).await?,
+                                Err(e) => tracing::warn!("bad priorities: {e}"),
+                            }
+                        } else if let Some(path) = other.strip_prefix("move ") {
+                            session.move_storage(id, PathBuf::from(path.trim())).await?;
+                        } else {
+                            tracing::warn!("unknown control command {other}");
+                        }
+                    }
                 }
             }
         }

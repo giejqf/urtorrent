@@ -227,7 +227,7 @@ pub fn maybe_request(t: &mut Torrent, handle: &Rc<PeerHandle>, now: Instant) {
 }
 
 /// A `ut_metadata` message from `handle`.
-pub fn on_message(
+pub async fn on_message(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
     handle: &Rc<PeerHandle>,
@@ -275,7 +275,7 @@ pub fn on_message(
                 let info_hash = torrent.borrow().info_hash;
                 let digest: [u8; 20] = Sha1::digest(&raw).into();
                 if digest == info_hash {
-                    super::torrent::on_metadata(ctx, torrent, raw);
+                    super::torrent::on_metadata(ctx, torrent, raw).await;
                     return Ok(());
                 }
                 // Wrong data: penalise every source and start over.

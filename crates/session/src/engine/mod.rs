@@ -54,6 +54,8 @@ pub struct EngineConfig {
     pub listen_v6: Option<Ipv6Addr>,
     pub profile: Profile,
     pub max_peers: usize,
+    /// Session-wide connection limit (libtorrent `connections_limit`).
+    pub max_connections: usize,
     pub max_half_open: usize,
     pub hash_threads: usize,
     pub ring_entries: u32,
@@ -81,6 +83,7 @@ impl Default for EngineConfig {
             listen_v6: Some(Ipv6Addr::UNSPECIFIED),
             profile: Profile::native(),
             max_peers: 50,
+            max_connections: 500,
             max_half_open: 10,
             hash_threads: 2,
             ring_entries: 1024,
@@ -108,6 +111,13 @@ pub enum Command {
     SaveResume(TorrentId, oneshot::Sender<Result<(), Error>>),
     ForceReannounce(TorrentId, oneshot::Sender<Result<(), Error>>),
     AddPeer(TorrentId, SocketAddr, oneshot::Sender<Result<(), Error>>),
+    SetFilePriorities(TorrentId, Vec<u8>, oneshot::Sender<Result<(), Error>>),
+    SetSequential(TorrentId, bool, oneshot::Sender<Result<(), Error>>),
+    MoveStorage(
+        TorrentId,
+        std::path::PathBuf,
+        oneshot::Sender<Result<(), Error>>,
+    ),
     ForceRecheck(TorrentId, oneshot::Sender<Result<(), Error>>),
     Scrape(
         TorrentId,
@@ -192,6 +202,20 @@ impl Ctx {
         self.torrents.borrow().get(&id).cloned()
     }
 
+    /// Connections (plus dials in progress) across every torrent except
+    /// `except` (which the caller may hold borrowed).
+    pub fn connection_count_except(&self, except: Option<TorrentId>) -> usize {
+        self.torrents
+            .borrow()
+            .iter()
+            .filter(|(id, _)| Some(**id) != except)
+            .map(|(_, t)| {
+                let t = t.borrow();
+                t.peers.len() + t.half_open
+            })
+            .sum()
+    }
+
     pub fn torrent_by_hash(&self, h: &InfoHash) -> Option<Rc<RefCell<Torrent>>> {
         let id = *self.by_hash.borrow().get(h)?;
         self.torrent(id)
@@ -236,6 +260,18 @@ impl Ctx {
                 self.cfg.profile.peer_id.generate(&mut r)
             }
             profile::PeerIdLifetime::PerSession => self.peer_id,
+        }
+    }
+
+    /// The peer id a new connection of `torrent` shakes hands with: the
+    /// torrent's announce id, or a fresh one per connection (L1, Q19).
+    pub fn handshake_peer_id(&self, torrent: &Torrent) -> [u8; 20] {
+        match self.cfg.profile.peer_id.handshake {
+            profile::HandshakePeerId::SameAsAnnounce => torrent.peer_id,
+            profile::HandshakePeerId::PerConnection => {
+                let mut r = rng::RngRef(&self.rng);
+                self.cfg.profile.peer_id.generate(&mut r)
+            }
         }
     }
 
@@ -668,6 +704,8 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 s.peers += t.peer_count();
                 s.downloaded += t.stats.downloaded;
                 s.uploaded += t.stats.uploaded;
+                s.download_rate += t.stats.download_rate;
+                s.upload_rate += t.stats.upload_rate;
             }
             let _ = reply.send(s);
         }
@@ -688,6 +726,39 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                     .add_candidates(ctx, &[addr], crate::api::PeerSource::Manual);
                 torrent::on_new_candidates(ctx, &t);
                 let _ = reply.send(Ok(()));
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::SetFilePriorities(id, prios, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let ctx2 = ctx.clone();
+                uring::spawn(async move {
+                    let r = torrent::set_file_priorities(&ctx2, &t, prios).await;
+                    let _ = reply.send(r);
+                });
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::SetSequential(id, on, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                t.borrow_mut().set_sequential(on);
+                let _ = reply.send(Ok(()));
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::MoveStorage(id, path, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let ctx2 = ctx.clone();
+                uring::spawn(async move {
+                    let r = torrent::move_storage(&ctx2, &t, path).await;
+                    let _ = reply.send(r);
+                });
             }
             None => {
                 let _ = reply.send(Err(Error::NoSuchTorrent));

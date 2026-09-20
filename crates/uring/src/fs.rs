@@ -23,31 +23,23 @@ pub struct File {
     _not_send: PhantomData<Rc<()>>,
 }
 
-fn last_os_error() -> io::Error {
-    io::Error::last_os_error()
-}
-
 impl File {
-    /// Open `path` for read+write, creating it (and needed parent dirs are the
-    /// caller's responsibility). Sparse by default.
-    pub fn open_rw(path: &Path) -> Result<File> {
-        Self::open_with(path, libc::O_RDWR | libc::O_CREAT)
+    /// Open `path` for read+write through the ring (`IORING_OP_OPENAT`),
+    /// creating it (parent dirs are the caller's responsibility). Sparse by
+    /// default.
+    pub async fn open_rw(path: &Path) -> Result<File> {
+        Self::open_with(path, libc::O_RDWR | libc::O_CREAT).await
     }
 
-    /// Open `path` read-only.
-    pub fn open_ro(path: &Path) -> Result<File> {
-        Self::open_with(path, libc::O_RDONLY)
+    /// Open `path` read-only through the ring.
+    pub async fn open_ro(path: &Path) -> Result<File> {
+        Self::open_with(path, libc::O_RDONLY).await
     }
 
-    fn open_with(path: &Path, flags: libc::c_int) -> Result<File> {
+    async fn open_with(path: &Path, flags: libc::c_int) -> Result<File> {
         let c = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-        // SAFETY: `c` is a valid NUL-terminated path; mode is used only when
-        // O_CREAT is set. The returned fd is checked.
-        let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC, 0o644) };
-        if fd < 0 {
-            return Err(last_os_error().into());
-        }
+        let fd = reactor::openat(c, flags | libc::O_CLOEXEC, 0o644).await?;
         Ok(File {
             fd,
             _not_send: PhantomData,

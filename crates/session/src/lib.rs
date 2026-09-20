@@ -25,8 +25,9 @@ mod api;
 mod engine;
 
 pub use api::{
-    AddTorrent, EncryptionMode, Event, EventStream, PeerInfo, PeerSource, Session, SessionBuilder,
-    SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus, TrackerStatus,
+    AddTorrent, EncryptionMode, Event, EventStream, FileStatus, PeerInfo, PeerSource, Session,
+    SessionBuilder, SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus,
+    TrackerStatus,
 };
 pub use profile::Profile;
 
@@ -54,6 +55,12 @@ pub enum Error {
     /// An I/O error (listen socket, storage, resume file).
     #[error("io: {0}")]
     Io(String),
+    /// A caller-supplied argument was rejected (wrong length, out of range).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    /// The operation cannot run in the torrent's current state.
+    #[error("not now: {0}")]
+    Busy(&'static str),
 }
 
 impl From<std::io::Error> for Error {

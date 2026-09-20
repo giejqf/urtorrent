@@ -25,7 +25,7 @@ mod store;
 pub use hash::{HashPool, sha1};
 pub use metainfo::Bitfield;
 pub use resume::{FORMAT_VERSION, ResumeData};
-pub use store::Storage;
+pub use store::{DEFAULT_PRIORITY, MAX_PRIORITY, Storage};
 
 /// A storage error.
 #[derive(Debug, thiserror::Error)]

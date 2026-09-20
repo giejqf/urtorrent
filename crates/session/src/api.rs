@@ -59,6 +59,11 @@ pub struct AddTorrent {
     pub paused: bool,
     /// Download pieces in order.
     pub sequential: bool,
+    /// Initial file priorities, one per content file in torrent order
+    /// (`0` = skip, `1..=7`; libtorrent's default is 4). `None` keeps the
+    /// priorities from the resume data, or the default. For a magnet link
+    /// they apply once the metadata arrives (ignored if the count differs).
+    pub file_priorities: Option<Vec<u8>>,
 }
 
 impl AddTorrent {
@@ -70,6 +75,7 @@ impl AddTorrent {
             resume_dir: None,
             paused: false,
             sequential: false,
+            file_priorities: None,
         }
     }
 
@@ -81,6 +87,7 @@ impl AddTorrent {
             resume_dir: None,
             paused: false,
             sequential: false,
+            file_priorities: None,
         }
     }
 
@@ -101,6 +108,25 @@ impl AddTorrent {
         self.sequential = sequential;
         self
     }
+
+    /// Initial file priorities (see the field).
+    pub fn file_priorities(mut self, prios: Vec<u8>) -> AddTorrent {
+        self.file_priorities = Some(prios);
+        self
+    }
+}
+
+/// One content file in a status snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStatus {
+    /// Path relative to the save directory, `/`-separated.
+    pub path: String,
+    /// Length in bytes.
+    pub size: u64,
+    /// Priority (`0` = skipped).
+    pub priority: u8,
+    /// Bytes of this file covered by verified pieces.
+    pub done: u64,
 }
 
 /// A torrent's lifecycle state.
@@ -191,15 +217,34 @@ pub struct TorrentStatus {
     pub complete: bool,
     /// Web seeds (BEP 19) configured.
     pub web_seeds: usize,
+    /// Content files with their priorities and progress (empty until the
+    /// metadata is known).
+    pub files: Vec<FileStatus>,
+    /// Bytes in wanted pieces (priority > 0).
+    pub total_wanted: u64,
+    /// Bytes in wanted pieces already verified.
+    pub total_wanted_done: u64,
+    /// Where the content lives.
+    pub save_path: PathBuf,
 }
 
 impl TorrentStatus {
-    /// Fraction of pieces we have, 0.0..=1.0.
+    /// Fraction of pieces we have, 0.0..=1.0 (0.0 without metadata).
     pub fn progress(&self) -> f64 {
         if self.pieces_total == 0 {
-            1.0
+            if self.has_metadata { 1.0 } else { 0.0 }
         } else {
             self.pieces_have as f64 / self.pieces_total as f64
+        }
+    }
+
+    /// Fraction of the wanted bytes we have, 0.0..=1.0 (1.0 when nothing is
+    /// wanted).
+    pub fn wanted_progress(&self) -> f64 {
+        if self.total_wanted == 0 {
+            1.0
+        } else {
+            self.total_wanted_done as f64 / self.total_wanted as f64
         }
     }
 }
@@ -263,6 +308,10 @@ pub struct SessionStats {
     pub downloaded: u64,
     /// Total payload uploaded this session.
     pub uploaded: u64,
+    /// Sum of the torrents' smoothed download rates, bytes per second.
+    pub download_rate: u64,
+    /// Sum of the torrents' smoothed upload rates, bytes per second.
+    pub upload_rate: u64,
 }
 
 /// Something that happened in the engine.
@@ -321,6 +370,13 @@ pub enum Event {
         id: TorrentId,
         /// The announcing peer.
         addr: SocketAddr,
+    },
+    /// The content was moved to a new directory (`Session::move_storage`).
+    StorageMoved {
+        /// The torrent.
+        id: TorrentId,
+        /// The new save path.
+        path: PathBuf,
     },
     /// A web seed (BEP 19) request failed; the seed is retried later.
     WebSeedError {
@@ -457,9 +513,16 @@ impl SessionBuilder {
         self
     }
 
-    /// Maximum connected peers per torrent.
+    /// Maximum connected peers per torrent (default 50).
     pub fn max_peers_per_torrent(mut self, n: usize) -> Self {
         self.cfg.max_peers = n.max(1);
+        self
+    }
+
+    /// Maximum connections across the session (default 500, libtorrent's
+    /// `connections_limit`).
+    pub fn max_connections(mut self, n: usize) -> Self {
+        self.cfg.max_connections = n.max(1);
         self
     }
 
@@ -627,6 +690,28 @@ impl Session {
     /// source alongside trackers, PEX and LSD.
     pub async fn add_peer(&self, id: TorrentId, addr: SocketAddr) -> Result<(), Error> {
         self.send(|tx| Command::AddPeer(id, addr, tx)).await?
+    }
+
+    /// Download pieces in order (or go back to rarest-first).
+    pub async fn set_sequential(&self, id: TorrentId, sequential: bool) -> Result<(), Error> {
+        self.send(|tx| Command::SetSequential(id, sequential, tx))
+            .await?
+    }
+
+    /// Set file priorities (one per content file, `0` = skip, `1..=7`).
+    /// Pieces straddling a skipped and a wanted file are still downloaded;
+    /// their skipped bytes go to a parts file (`.<name>.parts`) rather than
+    /// creating the skipped file. Resolves once storage has been adjusted.
+    pub async fn set_file_priorities(&self, id: TorrentId, prios: Vec<u8>) -> Result<(), Error> {
+        self.send(|tx| Command::SetFilePriorities(id, prios, tx))
+            .await?
+    }
+
+    /// Move the content to `path` (rename on the same filesystem, copy
+    /// otherwise). Peer I/O is held while the files move; resolves when the
+    /// torrent runs from the new location.
+    pub async fn move_storage(&self, id: TorrentId, path: PathBuf) -> Result<(), Error> {
+        self.send(|tx| Command::MoveStorage(id, path, tx)).await?
     }
 
     /// Re-announce as soon as each tracker's `min interval` allows.

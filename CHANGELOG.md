@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-20
+
+First release: TCP-only, tracker / PEX / LSD-driven downloading and seeding on
+io_uring, IPv4 + IPv6, with the `qbt_5_2_3_lt2_0_14` identity profile
+indistinguishable from the pinned oracle at L1 / L2 (AGENTS.md 6). DHT, uTP and
+BEP 52 are deferred to later minor releases.
+
 ### Added
 
 - M0 harness: workspace, CI, `xtask` dev commands, `testkit` with an isolated
@@ -155,3 +162,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     magnet_via_ut_metadata, lsd_discovery, web_seed_only (Diff),
     private_no_pex_lsd (v4 / v6); PEX side of the discriminator.
   - Fuzz: pex_message, metadata_message, lsd_datagram.
+- M7 hardening:
+  - File priorities / selective download (Tier 1): `AddTorrent::file_priorities`,
+    `Session::set_file_priorities`, `TorrentStatus::files` /
+    `total_wanted{,_done}`, `wanted_progress`; pieces straddling a skipped
+    file park their skipped bytes in a parts file (`.<name>.parts`), exported
+    when the file becomes wanted; skipped files are never created; a finished
+    selective download is upload-only but announces `completed` only as a
+    full seed (ADR 0005). Resume data format 2 persists priorities.
+  - `Session::move_storage` (rename, or copy across filesystems, with peer I/O
+    held meanwhile) and `Event::StorageMoved`; `Session::set_sequential`;
+    `SessionBuilder::max_connections` (session-wide, default 500);
+    `SessionStats::{download_rate, upload_rate}`.
+  - Torrent files are opened through the ring (`IORING_OP_OPENAT`, now in the
+    probed baseline); `Storage` file access is async end to end.
+  - `xtask syscalls` also runs a real two-engine transfer under `strace -Y`
+    and judges only the engine threads (`urt-net`, `urt-hash-*`; `urt-dns`
+    may block); `xtask soak` (release build): many-torrents and big loopback
+    transfer with fd / RSS checks; baselines in `docs/perf.md`.
+  - `xtask check` runs `cargo semver-checks` against the latest release tag
+    when available.
+  - testkit: `urt-client --file-priorities`, `prio` / `move` control commands,
+    scenarios `file_priorities` and `move_storage` against the oracle.
+  - Every fuzz target run for 90 s without findings.
+  - L1 fix (Q19): the handshake peer id is generated per connection under the
+    qbt profile (libtorrent 2.0 does; the announce id stays per torrent), and
+    duplicate connections are arbitrated the way libtorrent does (by IP and
+    listen port, then by peer id); the discriminator checks the
+    handshake-vs-announce id relation.

@@ -7,7 +7,9 @@ enough that trackers and peers see nothing unusual.
 
 Read [AGENTS.md](AGENTS.md) first: it is the project charter (scope, rules,
 architecture, milestones). Design decisions live in [docs/adr](docs/adr),
-oracle-vs-BEP disagreements in [docs/quirks.md](docs/quirks.md).
+oracle-vs-BEP disagreements in [docs/quirks.md](docs/quirks.md), the test
+layers in [docs/testing.md](docs/testing.md) and soak/perf baselines in
+[docs/perf.md](docs/perf.md).
 
 ## Status
 
@@ -20,7 +22,7 @@ oracle-vs-BEP disagreements in [docs/quirks.md](docs/quirks.md).
 | M4 Identity | done: HTTPS via rustls, profile facts pinned (per-torrent peer id / key, Q6-Q8), discriminator v1 + `xtask diff` (oracle ≡ us under the qbt profile; Transmission and `native` flagged) |
 | M5 Reach | done (PT-complete): UDP tracker, scrape, MSE (all modes vs the oracle), per-listen-socket dual-stack announces, tier failover/backoff, PT-style tracker, uTP-enabled oracle over TCP |
 | M6 Extensions | done: PEX, `ut_metadata` / magnets, `upload_only`, LSD, web seeds, BEP 40; private torrents proven silent on the wire (Q11); scenarios green in v4 / v6 |
-| M7 Hardening | next |
+| M7 Hardening | done: file priorities with a parts file + move storage (Tier 1), torrent files opened on the ring, `xtask syscalls` on a real session, `xtask soak` (20 GiB loopback, 500 torrents), fuzz time, API review; **0.1.0** |
 
 ## Developer commands
 
@@ -31,7 +33,8 @@ cargo xtask it [scenario]  # integration scenarios in the isolated netns lab
 cargo xtask capture        # regenerate golden captures from the pinned oracle
 cargo xtask diff           # differential run + discriminator (M4)
 cargo xtask fuzz <target>  # cargo-fuzz (nightly)
-cargo xtask syscalls       # no non-uring data-path syscalls (M1)
+cargo xtask syscalls       # no non-uring data-path syscalls: uring probe + a real session under strace
+cargo xtask soak           # perf / leak exercise: many torrents + a big loopback transfer (release build)
 ```
 
 ## Using the library
@@ -54,6 +57,14 @@ async fn main() -> Result<(), urtorrent::Error> {
     session.shutdown().await
 }
 ```
+
+Magnet links (`AddTorrent::magnet`), selective download
+(`AddTorrent::file_priorities` / `Session::set_file_priorities`, with a parts
+file for pieces that straddle skipped files), `Session::move_storage`,
+`Session::add_peer`, rate limits, force recheck and crash-safe resume data are
+all there; see the `Session` docs for the full surface. Identity is chosen
+per session with `SessionBuilder::profile` (`Profile::native()` by default,
+`Profile::qbt_5_2_3_lt2_0_14()` for the conformance target).
 
 The engine runs on its own io_uring thread; the caller's tokio runtime only ever
 awaits `tokio::sync` channels (AGENTS.md 5.6). `testkit/src/bin/urt-client.rs`

@@ -91,6 +91,14 @@ pub struct Torrent {
     pub webseed: super::webseed::State,
     pub save_path: PathBuf,
     sequential: bool,
+    /// Requested file priorities (content-file order) until the metadata
+    /// exists; afterwards the live ones are in `storage`.
+    pending_priorities: Option<Vec<u8>>,
+    /// `move_storage` in progress: block writes/reads wait on `move_gate`.
+    pub moving: bool,
+    pub move_gate: Rc<Notify>,
+    /// Disk writes in flight (drained before a move).
+    pub writes_in_flight: usize,
     /// The tracker / tick tasks are running.
     pub tasks_running: bool,
     pub announcer: Announcer,
@@ -249,7 +257,61 @@ impl Torrent {
             trackers,
             complete: self.is_complete(),
             web_seeds: self.web_seeds.len(),
+            files: self.file_statuses(),
+            total_wanted: self.wanted().0,
+            total_wanted_done: self.wanted().1,
+            save_path: self.save_path.clone(),
         }
+    }
+
+    /// `(total_wanted, total_wanted_done)`: bytes of the files with a
+    /// non-zero priority, and those of them covered by verified pieces
+    /// (libtorrent's definition, per file rather than per piece).
+    fn wanted(&self) -> (u64, u64) {
+        let (Some(info), Some(storage)) = (&self.info, &self.storage) else {
+            return (0, 0);
+        };
+        let prios = storage.file_priorities();
+        let mut total = 0u64;
+        let mut done = 0u64;
+        for (i, f) in info.files.iter().enumerate() {
+            if f.is_padding() || prios.get(i).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            total += f.length;
+            done += storage.file_done(i);
+        }
+        (total, done)
+    }
+
+    /// Content files with priority and progress.
+    fn file_statuses(&self) -> Vec<crate::api::FileStatus> {
+        let (Some(info), Some(storage)) = (&self.info, &self.storage) else {
+            return Vec::new();
+        };
+        let prios = storage.file_priorities();
+        info.files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.is_padding())
+            .map(|(i, f)| crate::api::FileStatus {
+                path: f.path.components().join("/"),
+                size: f.length,
+                priority: prios.get(i).copied().unwrap_or(0),
+                done: storage.file_done(i),
+            })
+            .collect()
+    }
+
+    /// Indices into `info.files` of the content (non-padding) files, in
+    /// order: the public API numbers files this way.
+    fn content_indices(info: &metainfo::Info) -> Vec<usize> {
+        info.files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.is_padding())
+            .map(|(i, _)| i)
+            .collect()
     }
 
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
@@ -285,6 +347,12 @@ impl Torrent {
             self.candidates_dirty = true;
         }
         added
+    }
+
+    /// Toggle sequential download (applies to future picks).
+    pub fn set_sequential(&mut self, on: bool) {
+        self.sequential = on;
+        self.picker.set_sequential(on);
     }
 
     /// Where an address was learned (for `PeerInfo::source`).
@@ -449,6 +517,10 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         webseed: super::webseed::State::default(),
         save_path: params.save_path.clone(),
         sequential: params.sequential,
+        pending_priorities: params.file_priorities.clone(),
+        moving: false,
+        move_gate: Notify::new(),
+        writes_in_flight: 0,
         tasks_running: false,
         announcer,
         announce_key: ctx.new_announce_key(),
@@ -486,13 +558,24 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
     ctx.emit(Event::TorrentAdded { id });
     match parsed {
         Some((info, raw)) => {
-            attach_metadata(&ctx, &torrent, info, raw)?;
-            let files_present = files_present(&torrent);
-            if let Err(e) = create_files(&torrent) {
+            let resume = load_resume(&torrent);
+            if let Err(e) = attach_metadata(&ctx, &torrent, info, raw, resume.as_ref()) {
                 ctx.remove_torrent_entry(id);
                 return Err(e);
             }
-            uring::spawn(initial_check(ctx.clone(), torrent.clone(), files_present));
+            // Before any file is created: does the disk still hold what the
+            // resume data describes?
+            let files_present = wanted_files_present(&torrent);
+            if let Err(e) = create_files(&torrent).await {
+                ctx.remove_torrent_entry(id);
+                return Err(e);
+            }
+            uring::spawn(initial_check(
+                ctx.clone(),
+                torrent.clone(),
+                files_present,
+                resume,
+            ));
         }
         None => {
             // A magnet: nothing to check yet; announce and find peers to
@@ -505,12 +588,54 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
     Ok(id)
 }
 
-/// Install the metadata: the info dictionary, storage, picker, privacy.
+/// Whether every wanted content file exists on disk. Evaluated before any
+/// file is created, to decide whether resume data still describes the disk;
+/// skipped files are never created, so they do not count.
+fn wanted_files_present(torrent: &Rc<RefCell<Torrent>>) -> bool {
+    let t = torrent.borrow();
+    let (Some(info), Some(storage)) = (&t.info, &t.storage) else {
+        return false;
+    };
+    let prios = storage.file_priorities();
+    info.files
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| !f.is_padding() && prios.get(*i).copied().unwrap_or(0) > 0)
+        .all(|(_, f)| std::fs::metadata(f.path.to_path(&t.save_path)).is_ok())
+}
+
+/// Load the resume file, if any (unreadable data is ignored with a warning).
+fn load_resume(torrent: &Rc<RefCell<Torrent>>) -> Option<ResumeData> {
+    let path = torrent.borrow().resume_path.clone()?;
+    ResumeData::load(&path).unwrap_or_else(|e| {
+        tracing::warn!("ignoring unreadable resume data {}: {e}", path.display());
+        None
+    })
+}
+
+/// Expand content-file priorities to one entry per `info.files` (padding
+/// files get 0). `None` when the count does not match.
+fn expand_priorities(info: &metainfo::Info, prios: &[u8]) -> Option<Vec<u8>> {
+    let idx = Torrent::content_indices(info);
+    if idx.len() != prios.len() {
+        return None;
+    }
+    let mut out = vec![0u8; info.files.len()];
+    for (k, i) in idx.into_iter().enumerate() {
+        out[i] = prios[k].min(storage::MAX_PRIORITY);
+    }
+    Some(out)
+}
+
+/// Install the metadata: the info dictionary, storage (with the initial file
+/// priorities: the caller's, else the resume data's, else the default),
+/// picker, privacy.
 fn attach_metadata(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
     info: metainfo::Info,
     raw: Vec<u8>,
+    resume: Option<&ResumeData>,
 ) -> Result<(), Error> {
     let mut t = torrent.borrow_mut();
     let info = Rc::new(info);
@@ -519,8 +644,32 @@ fn attach_metadata(
         t.save_path.clone(),
         ctx.pool.clone(),
     ));
+    let requested = t.pending_priorities.take();
+    let initial: Option<Vec<u8>> = match requested {
+        Some(p) => match expand_priorities(&info, &p) {
+            Some(e) => Some(e),
+            None => {
+                tracing::warn!(
+                    torrent = t.id.0,
+                    "file priority count {} does not match {} files; ignored",
+                    p.len(),
+                    Torrent::content_indices(&info).len()
+                );
+                None
+            }
+        },
+        None => resume
+            .filter(|r| r.matches(&info) && r.file_priorities.len() == info.files.len())
+            .map(|r| r.file_priorities.clone()),
+    };
+    if let Some(p) = &initial {
+        storage.init_priorities(p);
+    }
     let mut picker = Picker::new(info.piece_count(), info.piece_length, info.total_length);
     picker.set_sequential(t.sequential);
+    for (i, p) in storage.piece_priorities().into_iter().enumerate() {
+        picker.set_priority(i, p);
+    }
     t.metadata_size = raw.len().min(u32::MAX as usize) as u32;
     t.name = info.name.clone();
     t.private = info.private;
@@ -531,28 +680,17 @@ fn attach_metadata(
     Ok(())
 }
 
-/// Whether every content file exists on disk (checked before any is created,
-/// to decide whether resume data still describes the disk).
-fn files_present(torrent: &Rc<RefCell<Torrent>>) -> bool {
-    let t = torrent.borrow();
-    let Some(info) = &t.info else {
-        return false;
-    };
-    info.content_files()
-        .all(|f| std::fs::metadata(f.path.to_path(&t.save_path)).is_ok())
-}
-
-fn create_files(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
+async fn create_files(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
     let storage = torrent.borrow().storage.clone();
     if let Some(s) = storage {
-        s.create_files()?;
+        s.create_files().await?;
     }
     Ok(())
 }
 
 /// The metadata arrived over `ut_metadata` (BEP 9): install it, tell every
 /// connected peer, and check the disk before downloading.
-pub fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec<u8>) {
+pub async fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec<u8>) {
     let info = match metainfo::Info::from_info_dict(&raw) {
         Ok(i) => i,
         Err(e) => {
@@ -564,16 +702,13 @@ pub fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec<u8>) 
         fail_torrent(ctx, torrent, "v2-only metadata (BEP 52) is deferred".into());
         return;
     }
-    let files_present = {
-        let t = torrent.borrow();
-        info.content_files()
-            .all(|f| std::fs::metadata(f.path.to_path(&t.save_path)).is_ok())
-    };
-    if let Err(e) = attach_metadata(ctx, torrent, info, raw) {
+    let resume = load_resume(torrent);
+    if let Err(e) = attach_metadata(ctx, torrent, info, raw, resume.as_ref()) {
         fail_torrent(ctx, torrent, e.to_string());
         return;
     }
-    if let Err(e) = create_files(torrent) {
+    let files_present = wanted_files_present(torrent);
+    if let Err(e) = create_files(torrent).await {
         fail_torrent(ctx, torrent, e.to_string());
         return;
     }
@@ -598,27 +733,30 @@ pub fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec<u8>) 
     for p in peers {
         p.on_metadata(torrent, n, &have);
     }
-    uring::spawn(initial_check(ctx.clone(), torrent.clone(), files_present));
+    uring::spawn(initial_check(
+        ctx.clone(),
+        torrent.clone(),
+        files_present,
+        resume,
+    ));
 }
 
 /// Resume data or recheck, then start. A resume file only ever records pieces
 /// that were verified and fsynced, so it is trusted when it matches the
 /// torrent and every content file is still present; otherwise, if any content
 /// exists on disk, it is rechecked (AGENTS.md 5.4: when unsure, recheck).
-async fn initial_check(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, files_present: bool) {
-    let (storage, info, resume_path, save_path) = {
+async fn initial_check(
+    ctx: Rc<Ctx>,
+    torrent: Rc<RefCell<Torrent>>,
+    files_present: bool,
+    resume: Option<ResumeData>,
+) {
+    let (storage, info, save_path) = {
         let t = torrent.borrow();
         let (Some(s), Some(i)) = (t.storage.clone(), t.info.clone()) else {
             return;
         };
-        (s, i, t.resume_path.clone(), t.save_path.clone())
-    };
-    let resume = match &resume_path {
-        Some(p) => ResumeData::load(p).unwrap_or_else(|e| {
-            tracing::warn!("ignoring unreadable resume data {}: {e}", p.display());
-            None
-        }),
-        None => None,
+        (s, i, t.save_path.clone())
     };
     let mut have = Bitfield::new(info.piece_count());
     let mut carried: Option<(u64, u64)> = None;
@@ -630,7 +768,8 @@ async fn initial_check(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, files_presen
         _ => {
             let any_data = info
                 .content_files()
-                .any(|f| std::fs::metadata(f.path.to_path(&save_path)).is_ok_and(|m| m.len() > 0));
+                .any(|f| std::fs::metadata(f.path.to_path(&save_path)).is_ok_and(|m| m.len() > 0))
+                || std::fs::metadata(storage.parts_path()).is_ok_and(|m| m.len() > 0);
             if any_data {
                 match storage.check_all().await {
                     Ok(h) => have = h,
@@ -886,6 +1025,7 @@ pub async fn save_resume(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
         have,
         uploaded,
         downloaded,
+        file_priorities: storage.file_priorities(),
     };
     data.save(&path)?;
     let mut t = torrent.borrow_mut();
@@ -959,8 +1099,13 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
         });
         t.candidates.extend(v);
     }
+    // Session-wide limit: the other torrents' connections plus ours.
+    let others = ctx.connection_count_except(Some(t.id));
     for _ in 0..t.candidates.len() {
-        if t.peers.len() + t.half_open >= max_peers || t.half_open >= max_half_open {
+        if t.peers.len() + t.half_open >= max_peers
+            || t.half_open >= max_half_open
+            || others + t.peers.len() + t.half_open >= ctx.cfg.max_connections
+        {
             break;
         }
         let Some(addr) = t.candidates.pop_front() else {
@@ -1051,6 +1196,8 @@ pub async fn on_block_from(
     let Some(storage) = storage else {
         return;
     };
+    wait_not_moving(torrent).await;
+    torrent.borrow_mut().writes_in_flight += 1;
     let write = storage
         .write_block(
             request.index as usize,
@@ -1058,6 +1205,7 @@ pub async fn on_block_from(
             uring::Buffer::from_vec(data),
         )
         .await;
+    torrent.borrow_mut().writes_in_flight -= 1;
     if let Err(e) = write {
         fail_torrent(ctx, torrent, format!("disk write failed: {e}"));
         return;
@@ -1075,6 +1223,7 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
     let Some(storage) = torrent.borrow().storage.clone() else {
         return;
     };
+    wait_not_moving(&torrent).await;
     let result = storage.verify_piece(piece as usize).await;
     let now = Instant::now();
     let finished = {
@@ -1091,21 +1240,7 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
                 t.broadcast_have(piece);
                 t.refresh_interest();
                 ctx.emit(Event::PieceFinished { id, piece });
-                if t.picker.is_complete() && !t.finished_emitted {
-                    t.finished_emitted = true;
-                    t.announcer.completed(now);
-                    t.tracker_kick.notify();
-                    tracing::info!(torrent = id.0, "download complete");
-                    ctx.emit(Event::TorrentFinished { id });
-                    // BEP 21: tell every peer we are upload-only now.
-                    for p in t.peers.values() {
-                        p.send_upload_only(true);
-                    }
-                    super::webseed::stop_all(&t);
-                    true
-                } else {
-                    false
-                }
+                maybe_finished(&ctx, &mut t, now)
             }
             Ok(false) => {
                 let size = t.picker.piece_size(piece as usize);
@@ -1156,6 +1291,167 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
     };
     if finished && let Err(e) = save_resume(&torrent).await {
         tracing::warn!("resume save after completion failed: {e}");
+    }
+}
+
+/// Every wanted piece is verified: emit `TorrentFinished` once per
+/// completion, tell peers we are upload-only (BEP 21), and announce
+/// `completed` when we are a full seed (libtorrent only does so for a seed,
+/// not for a finished selective download). Returns whether it fired.
+fn maybe_finished(ctx: &Ctx, t: &mut Torrent, now: Instant) -> bool {
+    if !t.is_complete() || t.finished_emitted {
+        return false;
+    }
+    t.finished_emitted = true;
+    if t.picker.is_seed() {
+        t.announcer.completed(now);
+        t.tracker_kick.notify();
+    }
+    tracing::info!(
+        torrent = t.id.0,
+        seed = t.picker.is_seed(),
+        "download finished"
+    );
+    ctx.emit(Event::TorrentFinished { id: t.id });
+    for p in t.peers.values() {
+        p.send_upload_only(true);
+    }
+    super::webseed::stop_all(t);
+    true
+}
+
+/// `Session::set_file_priorities`.
+pub async fn set_file_priorities(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    prios: Vec<u8>,
+) -> Result<(), Error> {
+    if prios.iter().any(|p| *p > storage::MAX_PRIORITY) {
+        return Err(Error::InvalidArgument(format!(
+            "file priorities must be 0..={}",
+            storage::MAX_PRIORITY
+        )));
+    }
+    let (storage, expanded) = {
+        let mut t = torrent.borrow_mut();
+        let (Some(info), Some(storage)) = (t.info.clone(), t.storage.clone()) else {
+            // No metadata yet: remember for when it arrives.
+            t.pending_priorities = Some(prios);
+            return Ok(());
+        };
+        let expanded = expand_priorities(&info, &prios).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "expected {} file priorities, got {}",
+                Torrent::content_indices(&info).len(),
+                prios.len()
+            ))
+        })?;
+        if t.moving {
+            return Err(Error::Busy("storage is being moved"));
+        }
+        (storage, expanded)
+    };
+    storage.set_file_priorities(&expanded).await?;
+    let mut t = torrent.borrow_mut();
+    for (i, p) in storage.piece_priorities().into_iter().enumerate() {
+        t.picker.set_priority(i, p);
+    }
+    t.resume_dirty = true;
+    let now = Instant::now();
+    if !t.is_complete() {
+        // More to download: a later completion fires `TorrentFinished` again,
+        // peers hear we are no longer upload-only, and seeds we parted from
+        // as "both seeds" may be dialled again right away.
+        t.finished_emitted = false;
+        for p in t.peers.values() {
+            p.send_upload_only(false);
+        }
+        t.failed.clear();
+    }
+    t.refresh_interest();
+    let peers: Vec<Rc<PeerHandle>> = t.peers.values().cloned().collect();
+    for p in &peers {
+        p.fill_requests_locked(&mut t, ctx);
+    }
+    maybe_finished(ctx, &mut t, now);
+    let running = t.is_running();
+    if running {
+        connect_more(ctx, torrent, &mut t, now);
+    }
+    drop(t);
+    if running {
+        super::webseed::start(ctx, torrent);
+    }
+    Ok(())
+}
+
+/// `Session::move_storage`: hold disk I/O, wait for in-flight writes and
+/// hash checks to drain, move the files, resume.
+pub async fn move_storage(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    path: PathBuf,
+) -> Result<(), Error> {
+    let storage = {
+        let mut t = torrent.borrow_mut();
+        let Some(storage) = t.storage.clone() else {
+            // No files yet: just change where they will go.
+            t.save_path = path.clone();
+            ctx.emit(Event::StorageMoved { id: t.id, path });
+            return Ok(());
+        };
+        if t.moving {
+            return Err(Error::Busy("storage is already being moved"));
+        }
+        if t.checking {
+            return Err(Error::Busy("torrent is checking"));
+        }
+        t.moving = true;
+        storage
+    };
+    // Drain: no write may be mid-flight and no piece mid-hash.
+    for _ in 0..600 {
+        let quiet = {
+            let t = torrent.borrow();
+            t.writes_in_flight == 0 && t.verifying.is_empty()
+        };
+        if quiet {
+            break;
+        }
+        uring::sleep(Duration::from_millis(50)).await;
+    }
+    let result = storage.move_to(path.clone()).await;
+    let (id, gate) = {
+        let mut t = torrent.borrow_mut();
+        t.moving = false;
+        if result.is_ok() {
+            t.save_path = path.clone();
+            t.resume_dirty = true;
+        }
+        (t.id, t.move_gate.clone())
+    };
+    gate.notify();
+    match result {
+        Ok(()) => {
+            tracing::info!(torrent = id.0, path = %path.display(), "storage moved");
+            ctx.emit(Event::StorageMoved { id, path });
+            Ok(())
+        }
+        Err(e) => Err(Error::Io(format!("move storage: {e}"))),
+    }
+}
+
+/// Wait while a storage move is in progress (disk I/O callers).
+pub async fn wait_not_moving(torrent: &Rc<RefCell<Torrent>>) {
+    loop {
+        let gate = {
+            let t = torrent.borrow();
+            if !t.moving {
+                return;
+            }
+            t.move_gate.clone()
+        };
+        super::local::select2(gate.wait(), uring::sleep(Duration::from_millis(100))).await;
     }
 }
 

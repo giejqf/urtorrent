@@ -457,3 +457,94 @@ fn qbt_magnet_mode_matches_capture() {
         other => panic!("expected LTEP handshake, got {other:?}"),
     }
 }
+
+/// Q19: the oracle shakes hands with a fresh peer id on every connection
+/// (two connections of one torrent to two taps in `capture_pex`, two
+/// consecutive connections in `capture_magnet`), and none of them is the id
+/// it announced with (`capture_peer_plain`).
+#[test]
+fn qbt_handshake_peer_id_is_per_connection() {
+    let mut ids: Vec<(String, String)> = Vec::new(); // (info_hash, peer_id)
+    for file in [
+        "capture_pex/v4/tap-peer-pex-A.jsonl",
+        "capture_pex/v4/tap-peer-pex-B.jsonl",
+        "capture_magnet/v4/tap-peer-magnet-oracle.jsonl",
+    ] {
+        let Some(conns) = golden(file) else { continue };
+        for c in conns.iter().filter(|c| c["handshake"].is_object()) {
+            ids.push((
+                c["handshake"]["info_hash"].as_str().unwrap().to_string(),
+                c["handshake"]["peer_id_hex"].as_str().unwrap().to_string(),
+            ));
+        }
+    }
+    if ids.len() < 2 {
+        return;
+    }
+    for (ih, _) in &ids {
+        let of_torrent: std::collections::BTreeSet<&String> = ids
+            .iter()
+            .filter(|(h, _)| h == ih)
+            .map(|(_, p)| p)
+            .collect();
+        let n = ids.iter().filter(|(h, _)| h == ih).count();
+        assert_eq!(
+            of_torrent.len(),
+            n,
+            "torrent {ih}: connections share a peer id"
+        );
+    }
+    // Handshake id != announce id for the same torrent.
+    let (Some(peers), Some(tracker)) = (
+        golden("capture_peer_plain/v4/tap-peer-plain-oracle-initiator.jsonl"),
+        golden("capture_peer_plain/v4/tap-tracker-plain.jsonl"),
+    ) else {
+        return;
+    };
+    let hs = peers
+        .iter()
+        .find(|c| c["handshake"].is_object())
+        .expect("handshake");
+    let ih = hs["handshake"]["info_hash"].as_str().unwrap();
+    let hs_id = hs["handshake"]["peer_id_hex"].as_str().unwrap();
+    let mut announce_ids = Vec::new();
+    for e in &tracker {
+        if e["kind"] != "announce" {
+            continue;
+        }
+        let q = e["http"]["query"].as_array().unwrap();
+        let get = |k: &str| {
+            q.iter()
+                .find(|kv| kv[0] == k)
+                .map(|kv| kv[1].as_str().unwrap().to_string())
+        };
+        let raw_ih = percent_decode(&get("info_hash").unwrap());
+        if bencode::hex(&raw_ih) == ih {
+            announce_ids.push(bencode::hex(&percent_decode(&get("peer_id").unwrap())));
+        }
+    }
+    assert!(!announce_ids.is_empty(), "no announce for {ih}");
+    assert!(
+        announce_ids.iter().all(|a| a != hs_id),
+        "handshake id {hs_id} equals an announce id"
+    );
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}

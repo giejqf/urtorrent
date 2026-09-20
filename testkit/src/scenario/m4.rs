@@ -292,9 +292,15 @@ fn diff_identity(ctx: &mut Ctx) -> Result<()> {
             .into_iter()
             .filter(|c| ips.contains(&c.remote.ip()) && c.handshake.is_some())
             .find_map(|c| discriminator::peer_fingerprint(&c));
+        let tracker = discriminator::tracker_fingerprint(events, ips);
+        let handshake_id_is_announce_id = match (&tracker, &peer) {
+            (Some(t), Some(p)) => Some(discriminator::handshake_id_is_announce_id(t, p)),
+            _ => None,
+        };
         Fingerprint {
-            tracker: discriminator::tracker_fingerprint(events, ips),
+            tracker,
             peer,
+            handshake_id_is_announce_id,
             ..Default::default()
         }
     };

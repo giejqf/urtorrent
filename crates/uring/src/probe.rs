@@ -35,6 +35,8 @@ pub struct Features {
     pub fsync: bool,
     /// `fallocate`.
     pub fallocate: bool,
+    /// `openat` (torrent files are opened through the ring).
+    pub openat: bool,
     /// `timeout`.
     pub timeout: bool,
     /// `async_cancel`.
@@ -69,6 +71,7 @@ impl Features {
             (self.close, "close"),
             (self.fsync, "fsync"),
             (self.fallocate, "fallocate"),
+            (self.openat, "openat"),
             (self.timeout, "timeout"),
             (self.async_cancel, "async_cancel"),
         ] {
@@ -136,6 +139,7 @@ pub fn probe() -> Result<Features> {
         close: s(opcode::Close::CODE),
         fsync: s(opcode::Fsync::CODE),
         fallocate: s(opcode::Fallocate::CODE),
+        openat: s(opcode::OpenAt::CODE),
         timeout: s(opcode::Timeout::CODE),
         async_cancel: s(opcode::AsyncCancel::CODE),
         accept_multi: s(opcode::AcceptMulti::CODE),

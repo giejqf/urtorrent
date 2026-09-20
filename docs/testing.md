@@ -10,6 +10,8 @@
 | Integration | `testkit/src/scenario` | `cargo xtask it [--shape v4\|v6\|dual] [scenario]` |
 | Differential | scenarios tagged `Diff` (`diff_identity`, `mse_shape`, `dual_stack_announce`, `pex_discovery`, `web_seed_only`, ...) | `cargo xtask diff` |
 | Captures | scenarios tagged `Capture` | `cargo xtask capture` |
+| Enforcement | `xtask syscalls` (uring probe + real session under `strace -f -Y`) | `cargo xtask syscalls` |
+| Soak / perf | `testkit/src/bin/urt-soak.rs` | `cargo xtask soak [transfer\|many\|all] [--size 20G] [--torrents 500]` (see `docs/perf.md`) |
 
 ## The lab
 

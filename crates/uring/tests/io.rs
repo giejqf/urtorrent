@@ -71,7 +71,7 @@ fn file_write_read_sync() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("data.bin");
     rt.block_on(async move {
-        let f = File::open_rw(&path).unwrap();
+        let f = File::open_rw(&path).await.unwrap();
         f.allocate(0, 4096).await.unwrap();
         let payload: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
         f.write_all_at(0, Buffer::from_vec(payload.clone()))

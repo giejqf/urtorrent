@@ -15,7 +15,7 @@ use sha1::{Digest, Sha1};
 
 use super::{Ctx, ScenarioDef, Tag};
 use crate::client::{ClientConfig, UrtClient};
-use crate::fixtures::{Fixture, FixtureSpec};
+use crate::fixtures::{FileSpec, Fixture, FixtureSpec};
 use crate::lab::Shape;
 use crate::oracle::OracleConfig;
 use crate::tap::peer::{Misbehaviour, Role, TapPeer, TapPeerConfig};
@@ -68,6 +68,18 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             shapes: &[Shape::V4],
             tags: &[Tag::It],
             run: rate_limits,
+        },
+        ScenarioDef {
+            name: "file_priorities",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It],
+            run: file_priorities,
+        },
+        ScenarioDef {
+            name: "move_storage",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It],
+            run: move_storage,
         },
     ]
 }
@@ -612,5 +624,180 @@ fn rate_limits(ctx: &mut Ctx) -> Result<()> {
         "far too slow: {elapsed:?}"
     );
     seeder.shutdown()?;
+    Ok(())
+}
+
+/// Selective download from the oracle: the middle file is skipped, so it is
+/// never created and the pieces straddling it park their skipped bytes in
+/// the parts file; then it is wanted after all and the torrent completes.
+fn file_priorities(ctx: &mut Ctx) -> Result<()> {
+    let tracker = tap_tracker(ctx)?;
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("sel")
+            .with_files(vec![
+                FileSpec::new("a.bin", 700_000),
+                FileSpec::new("sub/b.bin", 1_300_000),
+                FileSpec::new("c.bin", 500_000),
+            ])
+            .with_piece_length(64 << 10)
+            .with_tracker(&tracker.http_url(0)),
+    ));
+    let h = fx.info_hash_hex();
+    let seeder = ctx.oracle("seeder", OracleConfig::primary())?;
+    fx.write_data(&seeder.save_path)?;
+    seeder.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&seeder.save_path.to_string_lossy()),
+        &h,
+    )?;
+    seeder
+        .api
+        .wait_for(&h, Duration::from_secs(60), "seeder checked", |t| {
+            t.is_seeding()
+        })?;
+    let torrent_path = ctx.file("sel.torrent");
+    std::fs::write(&torrent_path, &fx.torrent)?;
+    let mut client = ctx.client(
+        "urt",
+        ClientConfig::default()
+            .profile("qbt")
+            .file_priorities(vec![4, 0, 4]),
+        &torrent_path,
+    )?;
+    let st = client.wait_for(Duration::from_secs(120), "wanted files to complete", |s| {
+        s.complete
+    })?;
+    ctx.note(format!(
+        "selective: pieces {}/{} wanted {}/{} left {} files {:?}",
+        st.pieces_have,
+        st.pieces_total,
+        st.total_wanted_done,
+        st.total_wanted,
+        st.left,
+        st.files
+            .iter()
+            .map(|f| format!("{} p{} {}/{}", f.path, f.priority, f.done, f.size))
+            .collect::<Vec<_>>()
+    ));
+    ensure!(
+        st.pieces_have < st.pieces_total,
+        "skipped pieces were downloaded"
+    );
+    ensure!(st.left > 0, "left must stay truthful for skipped data");
+    ensure!(st.total_wanted_done == st.total_wanted);
+    ensure!(st.files.len() == 3 && st.files[1].priority == 0);
+    ensure!(st.files[0].done == 700_000 && st.files[2].done == 500_000);
+    let b_path = client.save_path.join("sel/sub/b.bin");
+    ensure!(!b_path.exists(), "skipped file must not be created");
+    ensure!(
+        client.save_path.join(".sel.parts").exists(),
+        "straddling bytes belong in the parts file"
+    );
+    let a = std::fs::read(client.save_path.join("sel/a.bin"))?;
+    ensure!(a == fx.data_range(0, 700_000), "a.bin content");
+    let c = std::fs::read(client.save_path.join("sel/c.bin"))?;
+    ensure!(c == fx.data_range(2_000_000, 500_000), "c.bin content");
+    // `completed` is only for full seeds (libtorrent): none so far.
+    let our_ips = client.actor.addrs();
+    let events = tracker.events();
+    let ours = announces_from(&events, &our_ips);
+    ensure!(
+        !ours.iter().any(|e| query(e, "event") == Some("completed")),
+        "a finished selective download is not `completed`"
+    );
+
+    // Want everything.
+    client.command("prio 4,4,4")?;
+    let st = client.wait_for(Duration::from_secs(120), "full download", |s| {
+        s.complete && s.pieces_have == s.pieces_total
+    })?;
+    ensure!(st.left == 0 && st.corrupt == 0);
+    ensure!(
+        st.downloaded == fx.total_len,
+        "downloaded {} vs {}",
+        st.downloaded,
+        fx.total_len
+    );
+    fx.verify_data(&client.save_path)?
+        .map_err(|e| anyhow::anyhow!("client data mismatch: {e}"))?;
+    client.wait_for(Duration::from_secs(20), "completed announce", |_| {
+        let events = tracker.events();
+        announces_from(&events, &our_ips)
+            .iter()
+            .any(|e| query(e, "event") == Some("completed"))
+    })?;
+    client.shutdown()?;
+    let p = ctx.file("tap-tracker.jsonl");
+    tracker.save_jsonl(&p)?;
+    ctx.artifact("tap-tracker.jsonl", &p);
+    Ok(())
+}
+
+/// Move storage while downloading from the oracle (rate-limited so the move
+/// happens mid-transfer): the download continues in the new directory and
+/// the data verifies there.
+fn move_storage(ctx: &mut Ctx) -> Result<()> {
+    let tracker = tap_tracker(ctx)?;
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("mv")
+            .with_files(vec![
+                FileSpec::new("one.bin", 2_500_000),
+                FileSpec::new("d/two.bin", 1_500_000),
+            ])
+            .with_piece_length(64 << 10)
+            .with_tracker(&tracker.http_url(0)),
+    ));
+    let h = fx.info_hash_hex();
+    let seeder = ctx.oracle("seeder", OracleConfig::primary())?;
+    fx.write_data(&seeder.save_path)?;
+    seeder.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&seeder.save_path.to_string_lossy()),
+        &h,
+    )?;
+    seeder
+        .api
+        .wait_for(&h, Duration::from_secs(60), "seeder checked", |t| {
+            t.is_seeding()
+        })?;
+    let torrent_path = ctx.file("mv.torrent");
+    std::fs::write(&torrent_path, &fx.torrent)?;
+    let mut client = ctx.client(
+        "urt",
+        ClientConfig::default()
+            .profile("qbt")
+            .download_limit(512 * 1024),
+        &torrent_path,
+    )?;
+    client.wait_for(Duration::from_secs(60), "some pieces", |s| {
+        s.pieces_have >= 8
+    })?;
+    let new_dir = client.actor.log_dir.join("moved");
+    client.command(&format!("move {}", new_dir.display()))?;
+    let st = client.wait_for(Duration::from_secs(30), "storage moved", |s| {
+        s.save_path == new_dir.to_string_lossy()
+            && s.events.iter().any(|e| e.starts_with("StorageMoved"))
+    })?;
+    ctx.note(format!(
+        "moved at {}/{} pieces; old dir has one.bin: {}",
+        st.pieces_have,
+        st.pieces_total,
+        client.save_path.join("mv/one.bin").exists()
+    ));
+    ensure!(
+        !client.save_path.join("mv/one.bin").exists(),
+        "old location must be empty"
+    );
+    let st = client.wait_for(Duration::from_secs(120), "download to complete", |s| {
+        s.complete
+    })?;
+    ensure!(st.corrupt == 0 && st.downloaded == fx.total_len);
+    fx.verify_data(&new_dir)?
+        .map_err(|e| anyhow::anyhow!("moved data mismatch: {e}"))?;
+    client.command("recheck")?;
+    std::thread::sleep(Duration::from_millis(500));
+    let st = client.wait_for(Duration::from_secs(60), "recheck after move", |s| {
+        s.state == "Seeding" && s.pieces_have == s.pieces_total
+    })?;
+    ensure!(st.complete);
+    client.shutdown()?;
     Ok(())
 }

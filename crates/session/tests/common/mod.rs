@@ -82,6 +82,61 @@ pub fn make_torrent(
     (t, data)
 }
 
+/// Build a multi-file torrent (`files` = (path with '/' separators, length))
+/// and its concatenated data.
+pub fn make_multi_torrent(
+    name: &str,
+    files: &[(&str, usize)],
+    piece_len: usize,
+    announce: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let size: usize = files.iter().map(|(_, l)| *l).sum();
+    let mut data = vec![0u8; size];
+    let mut x: u32 = 0x9e37_79b9;
+    for b in &mut data {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x as u8;
+    }
+    let mut pieces = Vec::new();
+    for chunk in data.chunks(piece_len) {
+        pieces.extend_from_slice(&storage::sha1(chunk));
+    }
+    let mut info = Vec::new();
+    info.extend_from_slice(b"d");
+    bstr(&mut info, b"files");
+    info.push(b'l');
+    for (path, len) in files {
+        info.push(b'd');
+        bstr(&mut info, b"length");
+        info.extend_from_slice(format!("i{len}e").as_bytes());
+        bstr(&mut info, b"path");
+        info.push(b'l');
+        for c in path.split('/') {
+            bstr(&mut info, c.as_bytes());
+        }
+        info.push(b'e');
+        info.push(b'e');
+    }
+    info.push(b'e');
+    bstr(&mut info, b"name");
+    bstr(&mut info, name.as_bytes());
+    bstr(&mut info, b"piece length");
+    info.extend_from_slice(format!("i{piece_len}e").as_bytes());
+    bstr(&mut info, b"pieces");
+    bstr(&mut info, &pieces);
+    info.push(b'e');
+    let mut t = Vec::new();
+    t.push(b'd');
+    bstr(&mut t, b"announce");
+    bstr(&mut t, announce.as_bytes());
+    bstr(&mut t, b"info");
+    t.extend_from_slice(&info);
+    t.push(b'e');
+    (t, data)
+}
+
 /// A seeder speaking through our own sans-IO connection (responder role).
 pub fn spawn_seeder(info_hash: [u8; 20], data: Arc<Vec<u8>>, piece_len: usize) -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

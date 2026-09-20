@@ -60,6 +60,17 @@ pub enum PeerIdLifetime {
     PerSession,
 }
 
+/// Which peer id the BitTorrent handshake carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakePeerId {
+    /// The same id the torrent announces with.
+    SameAsAnnounce,
+    /// A fresh id for every peer connection (libtorrent 2.0 passes
+    /// `generate_peer_id()` to each `peer_connection`, incoming and outgoing;
+    /// docs/quirks.md Q19).
+    PerConnection,
+}
+
 /// How the 20-byte peer id is built: a fixed prefix plus a random tail drawn
 /// from an alphabet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,8 +79,10 @@ pub struct PeerIdShape {
     pub prefix: &'static str,
     /// Alphabet the random tail is drawn from.
     pub tail_alphabet: &'static [u8],
-    /// Per torrent or per session.
+    /// Per torrent or per session (the announce id).
     pub lifetime: PeerIdLifetime,
+    /// What the peer-wire handshake carries.
+    pub handshake: HandshakePeerId,
 }
 
 impl PeerIdShape {
@@ -494,6 +507,7 @@ impl Profile {
                 prefix: "-UR0010-",
                 tail_alphabet: NATIVE_TAIL_ALPHABET,
                 lifetime: PeerIdLifetime::PerSession,
+                handshake: HandshakePeerId::SameAsAnnounce,
             },
             user_agent: "urtorrent/0.1.0",
             ltep_version: "urtorrent 0.1.0",
@@ -545,9 +559,13 @@ impl Profile {
                 prefix: "-qB5230-",
                 tail_alphabet: QBT_TAIL_ALPHABET,
                 // 40 torrents in one oracle announced 40 different peer ids
-                // (`capture_keys`); the two torrents of `capture_peer_plain`
-                // shook hands with different ids too.
+                // (`capture_keys`).
                 lifetime: PeerIdLifetime::PerTorrent,
+                // Every handshake carries a fresh id, unrelated to the
+                // announce id: `capture_pex` (two connections of one torrent
+                // to two taps: two ids), `capture_magnet` (two consecutive
+                // connections: two ids), none equal to the tracker's (Q19).
+                handshake: HandshakePeerId::PerConnection,
             },
             user_agent: "qBittorrent/5.2.3",
             ltep_version: "qBittorrent/5.2.3",

@@ -47,7 +47,7 @@ fn main() -> ExitCode {
         // File round-trip on the ring.
         let path =
             std::env::temp_dir().join(format!("urt-syscall-probe-{}.bin", std::process::id()));
-        let f = File::open_rw(&path).unwrap();
+        let f = File::open_rw(&path).await.unwrap();
         let payload: Vec<u8> = (0..65536u32).map(|i| i as u8).collect();
         f.write_all_at(0, Buffer::from_vec(payload.clone()))
             .await

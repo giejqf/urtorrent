@@ -59,7 +59,7 @@ fn syscalls() -> Result<()> {
     if !have("strace") {
         bail!("strace is required for `xtask syscalls` (apt install strace)");
     }
-    // Build and locate the self-contained uring data-path probe.
+    // 1. The self-contained uring data-path probe (every syscall counts).
     run(
         cargo().args(["build", "-q", "-p", "uring", "--bin", "syscall-probe"]),
         "build syscall-probe",
@@ -68,38 +68,106 @@ fn syscalls() -> Result<()> {
     if !probe.exists() {
         bail!("syscall-probe binary not found at {}", probe.display());
     }
-    let trace = std::env::temp_dir().join(format!("urt-syscalls-{}.txt", std::process::id()));
-    let status = Command::new("strace")
-        .args(["-f", "-y", "-e", "trace=%net,%desc,epoll_create,epoll_create1,epoll_ctl,epoll_wait,epoll_pwait,poll,ppoll,select,pselect6,io_uring_enter,io_uring_setup,io_uring_register", "-o"])
-        .arg(&trace)
-        .arg(&probe)
-        .status()
-        .context("running strace")?;
-    if !status.success() {
-        bail!("syscall-probe failed under strace (exit {status})");
-    }
-    let text = std::fs::read_to_string(&trace).context("reading strace output")?;
-    let report = analyze_syscalls(&text);
-    let _ = std::fs::remove_file(&trace);
-
-    println!("io_uring_enter calls: {}", report.io_uring_enter);
+    let report = trace(&probe, &[], None)?;
+    println!(
+        "uring probe: io_uring_enter calls: {}",
+        report.io_uring_enter
+    );
     if report.io_uring_enter == 0 {
         bail!("no io_uring_enter observed: the data path did not use io_uring");
     }
-    if report.violations.is_empty() {
-        println!(
-            "syscalls: OK — no epoll/poll/select or off-ring socket/file data syscalls on the data path"
-        );
-        Ok(())
-    } else {
-        for v in &report.violations {
-            println!("  VIOLATION {v}");
-        }
-        bail!(
-            "{} banned data-path syscall(s) detected (AGENTS.md rule 4)",
-            report.violations.len()
-        )
+    fail_on_violations(&report, "uring probe")?;
+
+    // 2. A real session transfer: two engines on loopback. Only the engine's
+    // threads are judged (`urt-net`, `urt-hash-*`); the main thread prepares
+    // the fixture and drives the API, and `urt-dns` may block.
+    run(
+        cargo().args(["build", "-q", "-p", "testkit", "--bin", "urt-syscall-probe"]),
+        "build urt-syscall-probe",
+    )?;
+    let probe = root().join("target/debug/urt-syscall-probe");
+    let dir = std::env::temp_dir().join(format!("urt-syscall-session-{}", std::process::id()));
+    let dir_s = dir.to_string_lossy().into_owned();
+    let report = trace(&probe, &[dir_s.as_str()], Some(&["urt-net", "urt-hash"]))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    println!(
+        "session probe: io_uring_enter calls on engine threads: {}",
+        report.io_uring_enter
+    );
+    if report.io_uring_enter == 0 {
+        bail!("no io_uring_enter observed on the engine threads");
     }
+    fail_on_violations(&report, "session probe")?;
+    println!(
+        "syscalls: OK — no epoll/poll/select or off-ring socket/file data syscalls on the data path"
+    );
+    Ok(())
+}
+
+/// `cargo xtask soak [transfer|many|all] [--size 2G] [--torrents 500]`: the
+/// release-built `urt-soak` binary against `target/soak`.
+fn soak(args: &[String]) -> Result<()> {
+    run(
+        cargo().args([
+            "build",
+            "-q",
+            "--release",
+            "-p",
+            "testkit",
+            "--bin",
+            "urt-soak",
+        ]),
+        "build urt-soak (release)",
+    )?;
+    let bin = root().join("target/release/urt-soak");
+    let dir = root().join("target/soak");
+    let mut cmd = Command::new(&bin);
+    cmd.current_dir(root());
+    let mut passed_dir = false;
+    for a in args {
+        if a == "--dir" {
+            passed_dir = true;
+        }
+        cmd.arg(a);
+    }
+    if !passed_dir {
+        cmd.arg("--dir").arg(&dir);
+    }
+    run(&mut cmd, "urt-soak")
+}
+
+fn fail_on_violations(report: &SyscallReport, what: &str) -> Result<()> {
+    if report.violations.is_empty() {
+        return Ok(());
+    }
+    for v in &report.violations {
+        println!("  VIOLATION [{what}] {v}");
+    }
+    bail!(
+        "{}: {} banned data-path syscall(s) detected (AGENTS.md rule 4)",
+        what,
+        report.violations.len()
+    )
+}
+
+/// Run `bin` under strace and analyse. With `threads`, only syscalls issued
+/// by threads whose name starts with one of the prefixes are judged (needs
+/// strace `-Y`, which annotates pids with the thread name).
+fn trace(bin: &Path, args: &[&str], threads: Option<&[&str]>) -> Result<SyscallReport> {
+    let trace = std::env::temp_dir().join(format!("urt-syscalls-{}.txt", std::process::id()));
+    let mut cmd = Command::new("strace");
+    cmd.args(["-f", "-y", "-Y", "-e", "trace=%net,%desc,epoll_create,epoll_create1,epoll_ctl,epoll_wait,epoll_pwait,poll,ppoll,select,pselect6,io_uring_enter,io_uring_setup,io_uring_register", "-o"])
+        .arg(&trace)
+        .arg(bin)
+        .args(args);
+    let status = cmd.status().context("running strace")?;
+    if !status.success() {
+        bail!("{} failed under strace (exit {status})", bin.display());
+    }
+    let text = std::fs::read_to_string(&trace).context("reading strace output")?;
+    let report = analyze_syscalls(&text, threads);
+    let _ = std::fs::remove_file(&trace);
+    Ok(report)
 }
 
 /// `poll([{fd=0..2, events=0}, ...], n, 0)`: only stdio fds, no events.
@@ -121,13 +189,14 @@ struct SyscallReport {
     violations: Vec<String>,
 }
 
-/// Parse strace `-y` output (which annotates fds like `3<socket:[...]>` or
-/// `5</tmp/...>`). Flags: any epoll_*/select/pselect6 (global); any socket data
-/// op (recv*/send*/connect/accept*) — all of ours are on-ring; and any
-/// read/write/pread/pwrite/poll/ppoll whose fd is annotated as a socket or a
-/// file under a temp/data path (a torrent file), since those must go through
-/// the ring.
-fn analyze_syscalls(text: &str) -> SyscallReport {
+/// Parse strace `-y -Y` output (fds annotated like `3<socket:[...]>` or
+/// `5</tmp/...>`, pids like `1234<urt-net>`). Flags: any epoll_*/select/
+/// pselect6 (global); any socket data op (recv*/send*/connect/accept*) — all
+/// of ours are on-ring; and any read/write/pread/pwrite/poll/ppoll whose fd is
+/// annotated as a socket or a file under a temp/data path (a torrent file),
+/// since those must go through the ring. With `threads`, lines from other
+/// threads are ignored (the `urt-dns` helper is allowed to block).
+fn analyze_syscalls(text: &str, threads: Option<&[&str]>) -> SyscallReport {
     // Reactor syscalls that must never appear at all.
     const GLOBAL_BAN: &[&str] = &[
         "epoll_create",
@@ -151,10 +220,19 @@ fn analyze_syscalls(text: &str) -> SyscallReport {
     let mut io_uring_enter = 0usize;
     let mut violations = Vec::new();
     for line in text.lines() {
-        // Lines look like: "1234 syscall(args...) = ret" (with -f pid prefix).
-        let Some(rest) = line.split_once(' ').map(|x| x.1) else {
+        // Lines look like: "1234<comm> syscall(args...) = ret" (with -f -Y).
+        let Some((pid, rest)) = line.split_once(' ') else {
             continue;
         };
+        if let Some(prefixes) = threads {
+            let comm = pid
+                .split_once('<')
+                .and_then(|(_, c)| c.strip_suffix('>'))
+                .unwrap_or("");
+            if !prefixes.iter().any(|p| comm.starts_with(p)) {
+                continue;
+            }
+        }
         let rest = rest.trim_start();
         let name = rest.split(['(', ' ']).next().unwrap_or("");
         if name == "io_uring_enter" {
@@ -182,7 +260,8 @@ fn analyze_syscalls(text: &str) -> SyscallReport {
             let is_socket =
                 first.contains("socket:") || first.contains("TCP:") || first.contains("UDP:");
             let is_torrent_file = (first.contains("/tmp/") || first.contains("urt-"))
-                && !first.contains("urt-syscalls-");
+                && !first.contains("urt-syscalls-")
+                && !first.contains(".resume");
             if is_socket || is_torrent_file {
                 violations.push(format!("{name} on {}: {}", first.trim(), line.trim()));
             }
@@ -204,7 +283,9 @@ fn usage() -> ExitCode {
   diff [scenario ..] differential run + discriminator       [--shape ...]
   capture [scen ...] regenerate golden captures from the pinned oracle
   fuzz <target> [secs]
-  syscalls           assert no non-uring data-path syscalls during a transfer"
+  syscalls           assert no non-uring data-path syscalls during a transfer
+  soak [mode] [--size N] [--torrents N]
+                     perf / leak exercise (release build): many torrents, big loopback transfer"
     );
     ExitCode::from(2)
 }
@@ -223,6 +304,7 @@ fn main() -> ExitCode {
         "diff" => testkit(&["diff"], rest),
         "fuzz" => fuzz(rest),
         "syscalls" => syscalls(),
+        "soak" => soak(rest),
         _ => return usage(),
     };
     match r {
@@ -284,8 +366,50 @@ fn check(args: &[String]) -> Result<()> {
         )?;
     }
     dependency_policy()?;
+    if !quick {
+        semver_policy()?;
+    }
     eprintln!("check: OK");
     Ok(())
+}
+
+/// AGENTS.md 9 versioning: once a release tag exists, `cargo semver-checks`
+/// compares the facade's public API against it (a patch release must be
+/// API-compatible). Skipped, with a note, until the first tag or when the
+/// tool is not installed.
+fn semver_policy() -> Result<()> {
+    let has_tool = Command::new("cargo")
+        .args(["semver-checks", "--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_tool {
+        eprintln!("==> semver: cargo-semver-checks not installed, skipping");
+        return Ok(());
+    }
+    let tags = Command::new("git")
+        .args(["tag", "--list", "v*", "--sort=-v:refname"])
+        .current_dir(root())
+        .output()
+        .context("git tag")?;
+    let tags = String::from_utf8_lossy(&tags.stdout);
+    let Some(latest) = tags.lines().next().map(str::trim).filter(|t| !t.is_empty()) else {
+        eprintln!("==> semver: no release tag yet, skipping");
+        return Ok(());
+    };
+    // Only meaningful when the working tree is past the tag: at the tag
+    // itself the comparison is trivially clean.
+    run(
+        cargo().args([
+            "semver-checks",
+            "check-release",
+            "-p",
+            "urtorrent",
+            "--baseline-rev",
+            latest,
+        ]),
+        &format!("cargo semver-checks (baseline {latest})"),
+    )
 }
 
 /// AGENTS.md 5.3 enforcement #2: cargo-deny bans and the tokio feature audit.

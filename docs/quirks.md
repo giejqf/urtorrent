@@ -234,3 +234,44 @@ in one request (the whole 2 MiB file in the capture; libtorrent caps at
 16 MiB). We match the request line and header order/values and request
 contiguous runs capped at 4 MiB over a kept-alive connection (an accepted L3
 difference in request count).
+
+## Q18. `completed` is announced only by a full seed
+
+libtorrent (`torrent::finished` → `if (is_seed()) completed()`) announces
+`event=completed` only when every piece is present; a selective download that
+finished its wanted files sends no `completed` and keeps announcing the real
+`left` (the skipped bytes). BEP 3 says `completed` is sent "when the download
+completes", which is ambiguous for selective downloads. We follow libtorrent:
+it is the truthful reading (rule 1) and what trackers expect from qBittorrent.
+Checked in the `file_priorities` scenario (no `completed` after the selective
+finish, one after the full download).
+
+## Q19. A fresh peer id for every peer connection; the announce id is another
+
+Captures: `capture_pex` (one torrent, two tap peers: the oracle's two
+handshakes carry two different peer ids), `capture_magnet` (two consecutive
+connections to the same tap: two ids), `capture_peer_plain` (the handshake id
+is not the id announced to the tracker for that torrent). libtorrent 2.0
+passes `aux::generate_peer_id(settings)` to every `peer_connection`
+(`session_impl::incoming_connection`, `torrent::connect_to_peer`), while
+trackers see the torrent's own `m_peer_id`. Two consequences we mirror:
+
+- `profile::PeerIdShape::handshake = PerConnection` for the qbt profile: the
+  handshake id is generated per connection (L1: a tap seeing two connections
+  with one id, or a tracker + tap seeing the same id twice, would tell us
+  apart). The `native` profile keeps one id everywhere.
+- Duplicate-connection arbitration cannot rely on peer ids between two
+  libtorrents (they never repeat), so libtorrent decides **by IP**
+  (`peer_list::new_connection`): equal directions drop the newcomer,
+  otherwise the side with the lower *listen* port keeps its outgoing
+  connection, equal ports toss a coin. The peer-id rule
+  (`bt_peer_connection::on_receive`: the greater id initiates) still exists
+  for clients with stable ids. The engine implements both; a connection
+  dropped as a duplicate does not back the address off (the coin can fall
+  the wrong way on both sides at once, and the next tick simply dials again).
+  This replaced our earlier "lower peer id initiates" rule, which disagreed
+  with the oracle and stalled `kill9_resume` once LSD made simultaneous
+  connects common.
+
+Pinned in `crates/wire/tests/replay.rs`; the discriminator compares
+"handshake id equals announce id" between the oracle and us.

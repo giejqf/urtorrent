@@ -641,6 +641,24 @@ mod ops {
         cqe_result(res).map(|_| ())
     }
 
+    /// `openat` relative to the cwd (`AT_FDCWD`): the path lives in the op's
+    /// resources until the CQE. Returns the new fd.
+    pub(crate) async fn openat(
+        path: std::ffi::CString,
+        flags: i32,
+        mode: libc::mode_t,
+    ) -> io::Result<i32> {
+        let (res, _path) = Op::submit(Box::new(path), |p, ud| {
+            opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), p.as_ptr())
+                .flags(flags)
+                .mode(mode)
+                .build()
+                .user_data(ud)
+        })
+        .await;
+        cqe_result(res).map(|fd| fd as i32)
+    }
+
     /// `close`.
     pub(crate) async fn close(fd: i32) -> io::Result<()> {
         let (res, ()) = Op::submit((), |_, ud| {

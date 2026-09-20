@@ -363,7 +363,7 @@ fn connection_params(
     ConnectionParams {
         role,
         info_hash: t.info_hash,
-        our_peer_id: t.peer_id,
+        our_peer_id: ctx.handshake_peer_id(t),
         profile: ctx.cfg.profile.clone(),
         piece_count: t.info.as_ref().map(|i| i.piece_count()),
         our_have: t
@@ -662,6 +662,8 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
             || !t.is_running()
             || t.is_banned(addr.ip())
             || t.peers.len() >= ctx.cfg.max_peers
+            || ctx.connection_count_except(Some(t.id)) + t.peers.len() + t.half_open
+                >= ctx.cfg.max_connections
         {
             return;
         }
@@ -775,9 +777,14 @@ async fn run_connection(
         let last = handle.last_have.borrow().clone();
         t.picker.peer_left(&last);
         *handle.last_have.borrow_mut() = Bitfield::new(t.piece_count());
-        // Q3: a plaintext attempt that died before the handshake completed
-        // makes the next attempt to this address encrypted (and soon).
-        if !incoming && ctx.cfg.encryption == EncryptionMode::Enabled {
+        // A connection dropped as a duplicate says nothing about the address:
+        // no backoff (if both ends tossed the coin the wrong way, the next
+        // tick dials again).
+        if reason.starts_with("duplicate") {
+            t.allow_reconnect_now(addr);
+        } else if !incoming && ctx.cfg.encryption == EncryptionMode::Enabled {
+            // Q3: a plaintext attempt that died before the handshake completed
+            // makes the next attempt to this address encrypted (and soon).
             if handle.peer_id.get().is_none() && !handle.encrypted.get() {
                 t.mse_retry.insert(addr);
                 t.allow_reconnect_now(addr);
@@ -872,26 +879,51 @@ async fn handle_event(
         WireEvent::Handshaked { peer_id, .. } => {
             let id = {
                 let t = torrent.borrow();
-                // One connection per IP: if a second one exists, the connection
-                // initiated by the side with the lower peer id survives. Both
-                // ends compute the same answer, so exactly one is closed.
-                let dup = t
+                // libtorrent's duplicate rules (peer_list::new_connection and
+                // bt_peer_connection::on_receive), so both ends drop the same
+                // connection:
+                // - the same peer id on another connection: the side with the
+                //   greater id is the one allowed to initiate;
+                // - the same IP (one connection per IP): equal directions
+                //   drop the newcomer; otherwise the side with the lower
+                //   *listen* port keeps its outgoing connection; equal ports
+                //   toss a coin.
+                let our_id = handle.conn.borrow().params().our_peer_id;
+                let same_pid = t
+                    .peers
+                    .values()
+                    .find(|p| p.key != handle.key && p.peer_id.get() == Some(peer_id))
+                    .cloned();
+                if let Some(other) = same_pid {
+                    if (peer_id < our_id) == !handle.incoming {
+                        other.close("duplicate peer id");
+                    } else {
+                        return Err("duplicate peer id".into());
+                    }
+                }
+                let same_ip = t
                     .peers
                     .values()
                     .find(|p| p.key != handle.key && p.addr.ip() == handle.addr.ip())
                     .cloned();
-                if let Some(other) = dup {
-                    let ours = t.peer_id;
-                    let this_survives = if handle.incoming {
-                        peer_id < ours
-                    } else {
-                        ours < peer_id
-                    };
-                    if this_survives {
-                        other.close("duplicate connection");
-                    } else {
+                if let Some(other) = same_ip {
+                    if other.incoming == handle.incoming {
                         return Err("duplicate connection".into());
                     }
+                    let our_port = ctx.listen_port;
+                    let other_port = if handle.incoming {
+                        other.addr.port()
+                    } else {
+                        handle.addr.port()
+                    };
+                    let outgoing1 = !handle.incoming;
+                    let drop_this = (our_port < other_port && !outgoing1)
+                        || (our_port > other_port && outgoing1)
+                        || (our_port == other_port && ctx.rng.next_u64() & 1 == 1);
+                    if drop_this {
+                        return Err("duplicate connection".into());
+                    }
+                    other.close("duplicate connection");
                 }
                 t.id
             };
@@ -1010,7 +1042,7 @@ async fn handle_event(
                     super::pex::on_message(ctx, &mut t, handle, &payload, now)?;
                 }
                 Some("ut_metadata") => {
-                    super::metadata::on_message(ctx, torrent, handle, &payload, now)?;
+                    super::metadata::on_message(ctx, torrent, handle, &payload, now).await?;
                 }
                 Some("upload_only") => {
                     let on = wire::ext::parse_upload_only(&payload)
@@ -1143,6 +1175,7 @@ async fn uploader(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, handle: Rc<PeerHa
             handle.out.notify();
             continue;
         }
+        torrent::wait_not_moving(&torrent).await;
         match storage
             .read_block(r.index as usize, r.begin, r.length)
             .await

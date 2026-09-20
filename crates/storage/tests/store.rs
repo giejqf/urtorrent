@@ -61,7 +61,7 @@ fn single_file_write_verify_upload() {
         let root = root.clone();
         async move {
             let store = Storage::new(info.clone(), root, pool);
-            store.create_files().unwrap();
+            store.create_files().await.unwrap();
             write_all(&store, &content, fx.piece_length).await;
             // Every piece verifies.
             for p in 0..info.piece_count() {
@@ -92,7 +92,7 @@ fn recheck_detects_corruption() {
         let root = root.clone();
         async move {
             let store = Storage::new(info.clone(), root, pool);
-            store.create_files().unwrap();
+            store.create_files().await.unwrap();
             write_all(&store, &content, fx.piece_length).await;
             let have = store.check_all().await.unwrap();
             assert!(have.is_complete());
@@ -138,7 +138,7 @@ fn multi_file_spans_and_write_verify() {
         let root = root.clone();
         async move {
             let store = Storage::new(info.clone(), root.clone(), pool);
-            store.create_files().unwrap();
+            store.create_files().await.unwrap();
             // A piece 0 block spans a.txt (1000) into dir/b.bin.
             let slices = store.block_slices(0, 0, 16384).unwrap();
             assert!(slices.len() >= 2, "piece 0 should span >=2 files");
@@ -167,7 +167,7 @@ fn write_and_maybe_verify_reports_completion() {
         let content = fx.content.clone();
         async move {
             let store = Storage::new(info.clone(), root.clone(), pool);
-            store.create_files().unwrap();
+            store.create_files().await.unwrap();
             // Piece 0 is 16384: write first block -> incomplete (None).
             let b0 = Buffer::from_vec(content[0..16384].to_vec());
             // write only half of piece 0
@@ -204,7 +204,7 @@ fn resume_roundtrip_and_recheck_on_mismatch() {
         let resume_path = resume_path.clone();
         async move {
             let store = Storage::new(info.clone(), root, pool);
-            store.create_files().unwrap();
+            store.create_files().await.unwrap();
             write_all(&store, &content, fx.piece_length).await;
             store.check_all().await.unwrap();
             store.sync_all().await.unwrap();
@@ -229,4 +229,103 @@ fn resume_roundtrip_and_recheck_on_mismatch() {
     let other_info = Torrent::parse(&other.torrent).unwrap().info;
     assert!(!rd.matches(&other_info));
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// Selective download: a skipped middle file is never created; the bytes of
+/// pieces straddling it land in the parts file; raising its priority exports
+/// them into the real file, and a move relocates everything.
+#[test]
+fn file_priorities_parts_file_and_move() {
+    // 16 KiB pieces: a (20000) | b (30000) | c (14000): pieces 1 and 3
+    // straddle b's boundaries, piece 2 is inside b.
+    let fx = fixture::multi(
+        "sel",
+        &[("a.bin", 20_000), ("b.bin", 30_000), ("c.bin", 14_000)],
+        16384,
+        9,
+    );
+    let torrent = Torrent::parse(&fx.torrent).unwrap();
+    let info = Rc::new(torrent.info);
+    let root = tmpdir("prio");
+    let root2 = tmpdir("prio-moved");
+    let pool = Rc::new(HashPool::new(2));
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on({
+        let info = info.clone();
+        let content = fx.content.clone();
+        let root = root.clone();
+        let root2 = root2.clone();
+        async move {
+            let store = Storage::new(info.clone(), root.clone(), pool);
+            store.init_priorities(&[4, 0, 4]);
+            assert_eq!(store.piece_priorities(), vec![4, 4, 0, 4]);
+            store.create_files().await.unwrap();
+            assert!(root.join("sel/a.bin").exists());
+            assert!(
+                !root.join("sel/b.bin").exists(),
+                "skipped file must not be created"
+            );
+            assert!(root.join("sel/c.bin").exists());
+            // Download the wanted pieces (0, 1, 3); piece 2 is skipped.
+            let pl = 16384usize;
+            for p in [0usize, 1, 3] {
+                let start = p * pl;
+                let end = (start + pl).min(content.len());
+                let buf = Buffer::from_vec(content[start..end].to_vec());
+                store.write_block(p, 0, buf).await.unwrap();
+                assert!(store.verify_piece(p).await.unwrap(), "piece {p}");
+            }
+            assert!(!root.join("sel/b.bin").exists());
+            assert!(
+                store.parts_path().exists(),
+                "straddling bytes go to the parts file"
+            );
+            // a and c are complete; b holds only the straddling parts.
+            assert_eq!(store.file_done(0), 20_000);
+            assert_eq!(store.file_done(2), 14_000);
+            let b_done = store.file_done(1);
+            assert!(
+                b_done > 0 && b_done < 30_000,
+                "b partially covered: {b_done}"
+            );
+            // Uploading from a straddling piece reads through the parts file.
+            let blk = store.read_block(1, 0, 16384).await.unwrap();
+            assert_eq!(blk.as_slice(), &content[16384..32768]);
+
+            // Want b after all: its parts are exported into the real file...
+            store.set_file_priorities(&[4, 4, 4]).await.unwrap();
+            assert_eq!(store.piece_priorities(), vec![4, 4, 4, 4]);
+            assert!(root.join("sel/b.bin").exists());
+            let b_disk = std::fs::read(root.join("sel/b.bin")).unwrap();
+            // ... up to piece 1's end (the file is sparse beyond).
+            let b_start = 20_000;
+            let p1_end = 32_768;
+            assert_eq!(&b_disk[..p1_end - b_start], &content[b_start..p1_end]);
+            // Piece 3's slice of b also came across.
+            let p3_start = 3 * pl;
+            let b_end = 50_000;
+            assert_eq!(
+                &b_disk[p3_start - b_start..b_end - b_start],
+                &content[p3_start..b_end]
+            );
+            // Finish piece 2 into the real file and the torrent is complete.
+            let buf = Buffer::from_vec(content[2 * pl..3 * pl].to_vec());
+            store.write_block(2, 0, buf).await.unwrap();
+            assert!(store.verify_piece(2).await.unwrap());
+            assert_eq!(
+                std::fs::read(root.join("sel/b.bin")).unwrap(),
+                &content[b_start..b_end]
+            );
+
+            // Move storage: files follow, data still verifies.
+            store.move_to(root2.clone()).await.unwrap();
+            assert!(!root.join("sel/a.bin").exists());
+            assert!(root2.join("sel/a.bin").exists());
+            assert_eq!(store.root(), root2);
+            let have = store.check_all().await.unwrap();
+            assert_eq!(have.count(), 4);
+        }
+    });
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&root2).ok();
 }

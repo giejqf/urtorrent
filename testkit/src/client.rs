@@ -32,6 +32,8 @@ pub struct ClientConfig {
     pub pex: bool,
     /// Manually added peers (`Session::add_peer`).
     pub add_peers: Vec<std::net::SocketAddr>,
+    /// Initial file priorities.
+    pub file_priorities: Option<Vec<u8>>,
     /// Extra environment (e.g. `RUST_LOG`).
     pub env: Vec<(String, String)>,
 }
@@ -50,6 +52,7 @@ impl Default for ClientConfig {
             lsd: true,
             pex: true,
             add_peers: Vec::new(),
+            file_priorities: None,
             env: vec![("RUST_LOG".into(), "debug".into())],
         }
     }
@@ -70,6 +73,10 @@ impl ClientConfig {
     }
     pub fn add_peer(mut self, a: std::net::SocketAddr) -> Self {
         self.add_peers.push(a);
+        self
+    }
+    pub fn file_priorities(mut self, p: Vec<u8>) -> Self {
+        self.file_priorities = Some(p);
         self
     }
     pub fn upload_limit(mut self, bytes_per_sec: u64) -> Self {
@@ -132,6 +139,14 @@ pub struct ClientStatus {
     #[serde(default)]
     pub web_seeds: usize,
     #[serde(default)]
+    pub save_path: String,
+    #[serde(default)]
+    pub total_wanted: u64,
+    #[serde(default)]
+    pub total_wanted_done: u64,
+    #[serde(default)]
+    pub files: Vec<ClientFile>,
+    #[serde(default)]
     pub listen_port: u16,
     #[serde(default)]
     pub trackers: Vec<ClientTracker>,
@@ -144,6 +159,17 @@ pub struct ClientStatus {
     pub events: Vec<String>,
     #[serde(default)]
     pub exited: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct ClientFile {
+    pub path: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub priority: u8,
+    #[serde(default)]
+    pub done: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -268,6 +294,10 @@ impl UrtClient {
         }
         for p in &config.add_peers {
             cmd.arg("--add-peer").arg(p.to_string());
+        }
+        if let Some(p) = &config.file_priorities {
+            let csv: Vec<String> = p.iter().map(|x| x.to_string()).collect();
+            cmd.arg("--file-priorities").arg(csv.join(","));
         }
         if config.upload_limit > 0 {
             cmd.arg("--upload-limit")

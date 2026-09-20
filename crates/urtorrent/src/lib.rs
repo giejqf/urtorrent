@@ -37,8 +37,8 @@
 pub use metainfo::{InfoHash, MagnetLink, Torrent};
 pub use profile::Profile;
 pub use session::{
-    AddTorrent, EncryptionMode, Error, Event, EventStream, PeerInfo, PeerSource, Session,
-    SessionBuilder, SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus,
+    AddTorrent, EncryptionMode, Error, Event, EventStream, FileStatus, PeerInfo, PeerSource,
+    Session, SessionBuilder, SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus,
     TrackerStatus,
 };
 

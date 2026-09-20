@@ -19,6 +19,9 @@ use crate::tap::tracker::TapEvent;
 pub struct TrackerFingerprint {
     /// First 8 bytes of the peer id (Azureus-style prefix).
     pub peer_id_prefix: String,
+    /// The whole announce peer id (hex), for the cross-check against the
+    /// handshake id; random by design, never compared directly.
+    pub peer_id_hex: String,
     /// `User-Agent`.
     pub user_agent: Option<String>,
     /// Header names in order.
@@ -52,6 +55,8 @@ pub struct PeerFingerprint {
     pub reserved_hex: String,
     /// Peer id prefix.
     pub peer_id_prefix: String,
+    /// The whole handshake peer id (hex); see `TrackerFingerprint::peer_id_hex`.
+    pub peer_id_hex: String,
     /// LTEP `m` map (name -> id), sorted.
     pub ltep_m: Vec<(String, i64)>,
     /// LTEP handshake keys present, sorted (values of random/contextual keys
@@ -124,6 +129,16 @@ pub struct Fingerprint {
     pub udp: Option<UdpFingerprint>,
     pub mse: Option<MseFingerprint>,
     pub pex: Option<PexFingerprint>,
+    /// L1 (Q19): the handshake carried the same peer id as the announce for
+    /// the same torrent. libtorrent 2.0 uses a fresh id per connection, so
+    /// this is `false` for the oracle. Set by scenarios that observe both.
+    pub handshake_id_is_announce_id: Option<bool>,
+}
+
+/// Whether the handshake id of a peer capture equals the announce id: the
+/// cross-check input for [`Fingerprint::handshake_id_is_announce_id`].
+pub fn handshake_id_is_announce_id(tracker: &TrackerFingerprint, peer: &PeerFingerprint) -> bool {
+    tracker.peer_id_hex == peer.peer_id_hex
 }
 
 /// What a tap peer can tell from the first `ut_pex` message it receives
@@ -260,6 +275,7 @@ pub fn tracker_fingerprint(events: &[TapEvent], ips: &[IpAddr]) -> Option<Tracke
     let peer_id_raw = crate::http::percent_decode(query(first, "peer_id")?.as_bytes());
     let peer_id_prefix =
         String::from_utf8_lossy(&peer_id_raw[..peer_id_raw.len().min(8)]).into_owned();
+    let peer_id_hex = crate::bencode::hex(&peer_id_raw);
     // Escape style from every escaped byte in binary-valued params.
     let mut lower = None;
     let mut literal = None;
@@ -318,6 +334,7 @@ pub fn tracker_fingerprint(events: &[TapEvent], ips: &[IpAddr]) -> Option<Tracke
         .collect();
     Some(TrackerFingerprint {
         peer_id_prefix,
+        peer_id_hex,
         user_agent: header(first, "User-Agent").map(str::to_string),
         headers: h.headers.iter().map(|(k, _)| k.clone()).collect(),
         params,
@@ -384,6 +401,7 @@ pub fn peer_fingerprint(c: &PeerCapture) -> Option<PeerFingerprint> {
     Some(PeerFingerprint {
         reserved_hex: hs.reserved_hex.clone(),
         peer_id_prefix: hs.peer_id_text.chars().take(8).collect(),
+        peer_id_hex: hs.peer_id_hex.clone(),
         ltep_m,
         ltep_keys,
         reqq,
@@ -505,6 +523,12 @@ pub fn diff(a: &Fingerprint, b: &Fingerprint) -> Vec<String> {
         (None, None) => {}
         _ => out.push("peer observation missing on one side".into()),
     }
+    // L1 (Q19): a client reusing its announce id in handshakes is told apart.
+    if let (Some(x), Some(y)) = (a.handshake_id_is_announce_id, b.handshake_id_is_announce_id)
+        && x != y
+    {
+        out.push(format!("L1 handshake id equals announce id: {x} vs {y}"));
+    }
     // PEX is only observable in scenarios built for it; its absence on one
     // side is not a tell.
     if let (Some(x), Some(y)) = (&a.pex, &b.pex) {
@@ -558,6 +582,35 @@ pub fn golden_oracle() -> anyhow::Result<Fingerprint> {
             .map(serde_json::from_str)
             .collect::<Result<_, _>>()?;
         fp.peer = caps.iter().find_map(peer_fingerprint);
+        // The same scenario's tracker log carries the oracle's announce id
+        // for the torrent it fetched from the tap seeder: the Q19 cross-check.
+        if let (Some(peer), Some(tp)) = (
+            fp.peer.clone(),
+            golden_file("capture_peer_plain", Shape::V4, "tap-tracker-plain.jsonl"),
+        ) {
+            let events: Vec<TapEvent> = std::fs::read_to_string(tp)?
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()?;
+            let ih_hex = caps
+                .iter()
+                .find_map(|c| c.handshake.as_ref().map(|h| h.info_hash.clone()));
+            let ips: Vec<IpAddr> = peer_ip_of(&caps).into_iter().collect();
+            let matching: Vec<TapEvent> = events
+                .into_iter()
+                .filter(|e| {
+                    e.kind == "announce"
+                        && query(e, "info_hash").is_some_and(|q| {
+                            let raw = crate::http::percent_decode(q.as_bytes());
+                            Some(crate::bencode::hex(&raw)) == ih_hex
+                        })
+                })
+                .collect();
+            if let Some(t) = tracker_fingerprint(&matching, &ips) {
+                fp.handshake_id_is_announce_id = Some(handshake_id_is_announce_id(&t, &peer));
+            }
+        }
     }
     if let Some(p) = golden_file("capture_pex", Shape::V4, "tap-peer-pex-A.jsonl") {
         let caps: Vec<PeerCapture> = std::fs::read_to_string(p)?
@@ -569,6 +622,13 @@ pub fn golden_oracle() -> anyhow::Result<Fingerprint> {
         fp.pex = caps.iter().find_map(|c| pex_fingerprint(c, 1));
     }
     Ok(fp)
+}
+
+/// The remote address of the first handshaken connection in `caps`.
+fn peer_ip_of(caps: &[PeerCapture]) -> Option<IpAddr> {
+    caps.iter()
+        .find(|c| c.handshake.is_some())
+        .map(|c| c.remote.ip())
 }
 
 /// Name the client a fingerprint most likely belongs to.
@@ -653,6 +713,7 @@ mod tests {
             udp: None,
             mse: None,
             pex: None,
+            handshake_id_is_announce_id: None,
         };
         let d = diff(
             &Fingerprint {
@@ -661,6 +722,7 @@ mod tests {
                 udp: None,
                 mse: None,
                 pex: None,
+                handshake_id_is_announce_id: None,
             },
             &fp,
         );
@@ -729,6 +791,7 @@ mod tests {
             udp: None,
             mse: None,
             pex: None,
+            handshake_id_is_announce_id: None,
         };
         let d = diff(
             &Fingerprint {
@@ -737,6 +800,7 @@ mod tests {
                 udp: None,
                 mse: None,
                 pex: None,
+                handshake_id_is_announce_id: None,
             },
             &fp,
         );

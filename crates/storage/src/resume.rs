@@ -21,8 +21,9 @@ use metainfo::InfoHash;
 use crate::Error;
 use metainfo::Bitfield;
 
-/// Current resume-data format version.
-pub const FORMAT_VERSION: i64 = 1;
+/// Current resume-data format version. Version 2 added `file_priorities`
+/// (optional; version-1 files read as "all default").
+pub const FORMAT_VERSION: i64 = 2;
 
 /// Decoded resume data for one torrent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub struct ResumeData {
     pub uploaded: u64,
     /// Bytes downloaded so far.
     pub downloaded: u64,
+    /// File priorities per `info.files` entry (empty = all default).
+    pub file_priorities: Vec<u8>,
 }
 
 impl ResumeData {
@@ -59,6 +62,7 @@ impl ResumeData {
             have: Bitfield::new(pieces),
             uploaded: 0,
             downloaded: 0,
+            file_priorities: Vec::new(),
         }
     }
 
@@ -69,7 +73,7 @@ impl ResumeData {
         let up = self.uploaded as i64;
         let down = self.downloaded as i64;
         let pieces = self.have.len() as i64;
-        let entries: Vec<(&[u8], Value)> = vec![
+        let mut entries: Vec<(&[u8], Value)> = vec![
             (b"downloaded", Value::Int(down)),
             (b"format", Value::Int(self.format_version)),
             (b"have", Value::Bytes(self.have.as_bytes())),
@@ -79,6 +83,10 @@ impl ResumeData {
             (b"total_length", Value::Int(total)),
             (b"uploaded", Value::Int(up)),
         ];
+        if !self.file_priorities.is_empty() {
+            // Sorted key order: `file_priorities` sorts before `format`.
+            entries.insert(1, (b"file_priorities", Value::Bytes(&self.file_priorities)));
+        }
         bencode::to_bytes(&Value::Dict { entries, raw: b"" })
     }
 
@@ -134,6 +142,11 @@ impl ResumeData {
             .and_then(Value::as_int)
             .unwrap_or(0)
             .max(0) as u64;
+        let file_priorities = v
+            .get_str("file_priorities")
+            .and_then(Value::as_bytes)
+            .map(|b| b.iter().map(|p| (*p).min(7)).collect())
+            .unwrap_or_default();
         Ok(ResumeData {
             format_version,
             info_hash,
@@ -142,6 +155,7 @@ impl ResumeData {
             have,
             uploaded,
             downloaded,
+            file_priorities,
         })
     }
 
@@ -201,14 +215,29 @@ mod tests {
         have.set(3);
         have.set(9);
         ResumeData {
-            format_version: 1,
+            format_version: FORMAT_VERSION,
             info_hash: [7u8; 20],
             piece_length: 16384,
             total_length: 150_000,
             have,
             uploaded: 1000,
             downloaded: 2000,
+            file_priorities: vec![4, 0, 7],
         }
+    }
+
+    /// A version-1 file (no `file_priorities`) still loads.
+    #[test]
+    fn reads_format_version_1() {
+        let mut v1 = sample();
+        v1.format_version = 1;
+        v1.file_priorities = Vec::new();
+        let bytes = v1.encode();
+        assert!(!bytes.windows(15).any(|w| w == b"file_priorities"));
+        let back = ResumeData::decode(&bytes).unwrap();
+        assert_eq!(back.format_version, 1);
+        assert!(back.file_priorities.is_empty());
+        assert_eq!(back.have, v1.have);
     }
 
     #[test]
