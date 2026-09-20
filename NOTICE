@@ -8,4 +8,15 @@ Portions of this software are ported from libtorrent-rasterbar
 contributors, licensed under the BSD-3-Clause license. Files containing ported
 logic carry the original copyright notice; the list is maintained here:
 
-  (none yet)
+  crates/profile/src/lib.rs
+      The qbt profile's announce parameter set and order, percent-encoding
+      rules (escape_string.cpp) and peer-id tail alphabet (string_util.cpp,
+      url_random) were transcribed from the oracle's captures and confirmed
+      against libtorrent 2.0.14 (http_tracker_connection.cpp).
+  crates/tracker/src/announcer.rs
+      Tier selection, event sequencing and failure backoff follow
+      libtorrent's torrent.cpp (announce_with_tracker) and
+      announce_entry.cpp (failed()).
+  crates/wire/src/fast.rs
+      The unmasked-address allowed-fast set (Q7) follows
+      bt_peer_connection::send_allowed_set.

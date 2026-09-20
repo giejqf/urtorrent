@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 urtorrent contributors
+// Parts of the qbt profile data follow libtorrent-rasterbar (BSD-3-Clause),
+// Copyright (c) Arvid Norberg and contributors; see NOTICE.
 
 //! Identity and wire-shape profiles (AGENTS.md 6). Identity is **data, not
 //! code**: everything a tracker or a peer can observe that is not dictated by
@@ -49,6 +51,15 @@ pub trait Rng {
     }
 }
 
+/// How long a generated peer id lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerIdLifetime {
+    /// A fresh id for every torrent (libtorrent 2.0: `torrent::m_peer_id`).
+    PerTorrent,
+    /// One id for the whole session.
+    PerSession,
+}
+
 /// How the 20-byte peer id is built: a fixed prefix plus a random tail drawn
 /// from an alphabet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +68,8 @@ pub struct PeerIdShape {
     pub prefix: &'static str,
     /// Alphabet the random tail is drawn from.
     pub tail_alphabet: &'static [u8],
+    /// Per torrent or per session.
+    pub lifetime: PeerIdLifetime,
 }
 
 impl PeerIdShape {
@@ -104,7 +117,9 @@ pub enum AnnounceParam {
     Compact,
     /// `no_peer_id`.
     NoPeerId,
-    /// `supportcrypto` (MSE capability flag).
+    /// `supportcrypto=1`, emitted only while encryption is not disabled
+    /// (`AnnounceRequest::crypto_supported`; libtorrent 2.0.14 has no
+    /// `requirecrypto`).
     SupportCrypto,
     /// `redundant` (libtorrent extra).
     Redundant,
@@ -220,7 +235,8 @@ pub struct HttpAnnounceShape {
     pub compact: bool,
     /// Value of `no_peer_id`.
     pub no_peer_id: bool,
-    /// Value of `supportcrypto`.
+    /// Whether `supportcrypto=1` is announced at all when encryption is on
+    /// (libtorrent `announce_crypto_support`).
     pub supportcrypto: bool,
 }
 
@@ -405,10 +421,9 @@ const FIRST_MESSAGES: &[FirstMessage] = &[
     FirstMessage::AllowedFast,
 ];
 
-/// The characters libtorrent draws the peer-id tail from: alphanumerics plus
-/// `- _ . ! ~ * ( )`. Consistent with every captured peer id
-/// (`-qB5230-PyFu!8(YVAlz`, `-qB5230-3unCvGtgNb_)`, `-qB5230-IE~JzVUKd0Us`,
-/// ...); UNVERIFIED whether `.` and `*` appear (M4 captures more ids).
+/// The characters libtorrent draws the peer-id tail from (`url_random`):
+/// alphanumerics plus `- _ . ! ~ * ( )`. Every one of the 70 characters was
+/// observed across the 46 peer ids in `testkit/golden` (`capture_keys`).
 const QBT_TAIL_ALPHABET: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*()";
 
@@ -424,6 +439,7 @@ impl Profile {
             peer_id: PeerIdShape {
                 prefix: "-UR0010-",
                 tail_alphabet: NATIVE_TAIL_ALPHABET,
+                lifetime: PeerIdLifetime::PerSession,
             },
             user_agent: "urtorrent/0.1.0",
             ltep_version: "urtorrent 0.1.0",
@@ -469,6 +485,10 @@ impl Profile {
             peer_id: PeerIdShape {
                 prefix: "-qB5230-",
                 tail_alphabet: QBT_TAIL_ALPHABET,
+                // 40 torrents in one oracle announced 40 different peer ids
+                // (`capture_keys`); the two torrents of `capture_peer_plain`
+                // shook hands with different ids too.
+                lifetime: PeerIdLifetime::PerTorrent,
             },
             user_agent: "qBittorrent/5.2.3",
             ltep_version: "qBittorrent/5.2.3",
@@ -481,11 +501,11 @@ impl Profile {
                 // `%e9%8b%27%01%d6%9bI%e7...%c2%2c...` (lower hex, `I` literal,
                 // `'`/`,` escaped) and peer ids with literal `!`, `(`, `)`, `~`.
                 escape: EscapeStyle::LowerHexLibtorrent,
-                // `key=FF2033B3`, `C8445FFC`, ...: 8 upper-case hex digits.
-                // UNVERIFIED: zero padding (no captured key starts with 0).
+                // `key=FF2033B3`, `C8445FFC`, ...: 8 upper-case hex digits
+                // (`%08X` in libtorrent's http_tracker_connection.cpp).
                 key: KeyStyle::HexUpper8,
-                // Constant across every announce of one torrent in one
-                // instance. UNVERIFIED per-torrent vs per-session (M4).
+                // 40 torrents, 40 distinct keys, each constant across its
+                // torrent's announces (`capture_keys`).
                 key_lifetime: KeyLifetime::PerTorrent,
                 numwant: 200,
                 numwant_stopped: 0,
@@ -500,7 +520,9 @@ impl Profile {
                 yourip: true,
                 // `p: 6881` appears on the oracle's outgoing connection
                 // (`oracle-initiator` capture) and is absent on the incoming
-                // one (`oracle-responder` capture).
+                // one (`oracle-responder` capture). On outgoing v6
+                // connections it is absent until an external address is
+                // known (docs/quirks.md Q6); `wire` applies that rule.
                 p_on_outgoing: true,
                 p_on_incoming: false,
                 // `upload_only: 1` in the seeding capture only.
@@ -561,6 +583,7 @@ mod tests {
         for &c in &id[8..] {
             assert!(QBT_TAIL_ALPHABET.contains(&c), "{c}");
         }
+        assert_eq!(p.peer_id.lifetime, PeerIdLifetime::PerTorrent);
         let n = Profile::native().peer_id.generate(&mut Counter(2));
         assert_eq!(&n[..8], b"-UR0010-");
         assert!(n[8..].iter().all(u8::is_ascii_alphanumeric));

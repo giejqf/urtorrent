@@ -54,21 +54,26 @@ Observation: right after a torrent is added and checked (WebAPI already
 reports `stalledUP`), incoming connections are closed without a handshake for
 up to ~1 s. Harness consequence only: tap-peer retries. Not a fidelity item.
 
-## Q6. LTEP `p` is omitted on outgoing connections from a non-routable listen socket
+## Q6. LTEP `p` is omitted on outgoing v6 connections until an external address is known
 
 Capture: `capture_peer_plain/v4/tap-peer-plain-oracle-initiator.jsonl` has
 `p: 6881` in the oracle's extended handshake; the same scenario in
-`capture_peer_plain/v6/...-oracle-initiator.jsonl` has **no `p`**. The lab's v6
-prefix is a ULA (`fd77:8e::/64`) with no default route, and libtorrent flags a
-listen socket whose interface has no route to the internet as "local network";
-`session_impl::listen_port(...)` skips such sockets, so the outgoing
-handshake carries no port. With a globally routable v6 address `p` would be
-present (as for v4 here, where the private range is not treated this way).
+`capture_peer_plain/v6/...-oracle-initiator.jsonl` has **no `p`**, with or
+without a default route in the namespace.
 
-Consequence: the `p` key depends on the *routability of our listen socket*,
-not just on the connection direction. `profile` records `p_on_outgoing`; the
-session decides routability per listen socket (M5, full dual-stack matrix).
-`crates/wire/tests/replay.rs` pins the v6 difference so it stays visible.
+Mechanism (libtorrent 2.0.14 `bt_peer_connection::write_extensions` →
+`session_impl::listen_port(ssl, local_addr)`): the port is sent only when a
+listen socket's *external address* (an `ip_voter` fed by tracker `external
+ip` replies and peers' `yourip`) equals the connection's local address, or is
+unspecified **of the same family**. A voter with no votes yields a v4
+unspecified address, so v4 connections match right away while v6 ones match
+only once a global v6 address has been voted in; the lab's ULA prefix never
+qualifies (`is_local` rejects fc00::/7), so `p` never appears there.
+
+Consequence: `wire::ConnectionParams::advertise_port` carries the decision;
+the session sets it to "connection is IPv4" until external-address voting
+exists (candidate for M6 alongside PEX). Pinned in
+`crates/wire/tests/replay.rs`.
 
 ## Q7. Allowed-fast set is seeded with the full peer address, not the BEP 6 /24
 
@@ -84,3 +89,14 @@ Consequence: `profile::PeerShape::allowed_fast_addr` — `LibtorrentFull` for th
 qbt profile (L2), `Bep6Masked` for `native`. Interop is unaffected either way
 (the receiver only records the indices it is told). Pinned in
 `crates/wire/tests/replay.rs`.
+
+## Q8. `supportcrypto=1` is only announced while encryption is enabled
+
+Observation (`diff_identity` with the oracle at `Session\Encryption=2`,
+"disable"): the announce carries no `supportcrypto` parameter at all; at the
+default setting ("allow", the golden captures) it is `supportcrypto=1`.
+libtorrent emits `supportcrypto=1` when encryption is allowed and
+`requirecrypto=1` when it is forced (position UNVERIFIED until the M5 forced
+capture). Consequence: the parameter is a function of the MSE mode, not a
+constant of the profile; `profile` will model it when MSE lands (M5). Until
+then the qbt profile announces `supportcrypto=1`, the oracle's default.

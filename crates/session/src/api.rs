@@ -385,6 +385,13 @@ impl SessionBuilder {
         self
     }
 
+    /// Trust an additional CA (PEM bundle) for HTTPS trackers, on top of the
+    /// Mozilla roots and `SSL_CERT_FILE`.
+    pub fn root_certificate_pem(mut self, pem: Vec<u8>) -> Self {
+        self.cfg.extra_roots.push(pem);
+        self
+    }
+
     /// Start the engine threads. Fails hard if io_uring is unavailable.
     pub async fn build(self) -> Result<Session, Error> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();

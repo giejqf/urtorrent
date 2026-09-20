@@ -291,13 +291,16 @@ fn connection_params(
     ConnectionParams {
         role,
         info_hash: t.info.info_hash,
-        our_peer_id: ctx.peer_id,
+        our_peer_id: t.peer_id,
         profile: ctx.cfg.profile.clone(),
         piece_count: Some(t.info.piece_count()),
         our_have: t.storage.have(),
         listen_port: ctx.listen_port,
         peer_ip: Some(peer_ip),
         metadata_size: Some(t.metadata_size),
+        // Q6: without external-address voting (M6 candidate), a v4 listen
+        // socket matches any v4 connection; a v6 one matches nothing yet.
+        advertise_port: peer_ip.is_ipv4(),
     }
 }
 
@@ -516,10 +519,11 @@ async fn handle_event(
                     .find(|p| p.key != handle.key && p.addr.ip() == handle.addr.ip())
                     .cloned();
                 if let Some(other) = dup {
+                    let ours = t.peer_id;
                     let this_survives = if handle.incoming {
-                        peer_id < ctx.peer_id
+                        peer_id < ours
                     } else {
-                        ctx.peer_id < peer_id
+                        ours < peer_id
                     };
                     if this_survives {
                         other.close("duplicate connection");

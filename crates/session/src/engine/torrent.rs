@@ -74,6 +74,9 @@ pub struct Torrent {
     pub picker: Picker,
     pub announcer: Announcer,
     pub announce_key: u32,
+    /// The peer id used for this torrent's announces and handshakes (per
+    /// torrent or the session's, per the profile).
+    pub peer_id: [u8; 20],
     /// Stopped by the caller.
     pub paused: bool,
     /// A check (initial or forced) is running.
@@ -367,6 +370,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         picker,
         announcer,
         announce_key: ctx.new_announce_key(),
+        peer_id: ctx.new_torrent_peer_id(),
         paused: params.paused,
         checking: true,
         error: None,

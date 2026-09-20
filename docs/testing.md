@@ -8,7 +8,7 @@
 | Fuzz | `fuzz/` | `cargo xtask fuzz <target> [secs]` |
 | Replay | crate tests fed from `testkit/golden` | `cargo xtask check` |
 | Integration | `testkit/src/scenario` | `cargo xtask it [--shape v4\|v6\|dual] [scenario]` |
-| Differential | scenarios tagged `Diff` | `cargo xtask diff` |
+| Differential | scenarios tagged `Diff` (`diff_identity`) | `cargo xtask diff` |
 | Captures | scenarios tagged `Capture` | `cargo xtask capture` |
 
 ## The lab
@@ -53,3 +53,15 @@ identity and wire shape (AGENTS.md 6). Formats:
   timestamps and raw frame (except piece payloads), decoded LTEP dictionaries.
 
 Bumping `testkit/oracle.lock` regenerates all of them in the same PR.
+
+## The discriminator
+
+`testkit::discriminator` turns tap-tracker events and tap-peer captures into
+a `Fingerprint` (L1 identifiers and L2 wire shape only: peer-id prefix,
+`User-Agent`, header and parameter order, escape style, `key` format,
+`numwant`/flags, reserved bits, LTEP `m`/keys/`reqq`/`v`, the first-messages
+sequence). `diff(a, b)` lists the tells; `classify` compares against the
+oracle's fingerprint computed from the committed goldens. `diff_identity`
+runs the oracle, us (qbt and native) and Transmission through the same taps
+and asserts the discriminator separates exactly the right ones. When a new
+tell is found: add it to the discriminator first (red), then fix it (green).

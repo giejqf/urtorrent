@@ -85,3 +85,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     internet), `xtask doctor` AppArmor check; scenarios `seed_to_oracle`,
     `seed_to_transmission` (v4/v6/dual), `pause_resume`, `kill9_resume`,
     `recheck_corrupted`, `hash_fail_ban`, `rate_limits`.
+- M4 identity:
+  - HTTPS trackers over rustls (ADR 0003): explicit aws-lc-rs provider,
+    Mozilla roots + `SessionBuilder::root_certificate_pem` + `SSL_CERT_FILE`,
+    ciphertext over io_uring; `https_tracker` scenario (v4/v6) and golden.
+  - Profile facts pinned by capture and libtorrent 2.0.14 source: peer id
+    per torrent (L1 lifetime), tail alphabet fully observed, `key` = `%08X`
+    per torrent, `supportcrypto=1` only while encryption is enabled (Q8), the
+    `p` rule (Q6, external-address vote semantics). `AnnounceRequest` gained
+    `crypto_supported`; `ConnectionParams` gained `advertise_port`.
+  - The discriminator (`testkit::discriminator`): tracker- and peer-side
+    fingerprints from tap captures, golden-oracle classifier, human-readable
+    L1/L2 tells; `cargo xtask diff` runs `diff_identity`, where the live
+    oracle, us (qbt), us (native) and Transmission are all observed by the
+    same taps: no tells for the qbt profile, tells for the other two.
+  - `capture_keys` scenario (40 torrents) and its golden.
+  - NOTICE entries for logic confirmed against libtorrent.

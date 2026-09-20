@@ -17,6 +17,7 @@ mod local;
 mod peer;
 mod rate;
 mod rng;
+mod tls;
 mod torrent;
 mod tracker_task;
 
@@ -55,6 +56,8 @@ pub struct EngineConfig {
     pub download_rate: u64,
     /// Session-wide unchoke slots.
     pub unchoke_slots: usize,
+    /// Extra CA certificates (PEM bundles) trusted for HTTPS trackers.
+    pub extra_roots: Vec<Vec<u8>>,
 }
 
 impl Default for EngineConfig {
@@ -71,6 +74,7 @@ impl Default for EngineConfig {
             upload_rate: 0,
             download_rate: 0,
             unchoke_slots: choker::DEFAULT_SLOTS,
+            extra_roots: Vec::new(),
         }
     }
 }
@@ -113,6 +117,7 @@ pub struct Ctx {
     pub families: http::Families,
     pub pool: Rc<HashPool>,
     pub dns: Dns,
+    pub tls: tls::TlsClient,
     pub rng: rng::Rng,
     pub kick: NotifyHandle,
     pub recv_pool: BufferPool,
@@ -177,6 +182,18 @@ impl Ctx {
     /// A random 32-bit announce key.
     pub fn new_announce_key(&self) -> u32 {
         (self.rng.next_u64() >> 32) as u32
+    }
+
+    /// The peer id for a new torrent: fresh per torrent or the session's,
+    /// as the profile dictates (L1: lifetime is part of the identity).
+    pub fn new_torrent_peer_id(&self) -> [u8; 20] {
+        match self.cfg.profile.peer_id.lifetime {
+            profile::PeerIdLifetime::PerTorrent => {
+                let mut r = rng::RngRef(&self.rng);
+                self.cfg.profile.peer_id.generate(&mut r)
+            }
+            profile::PeerIdLifetime::PerSession => self.peer_id,
+        }
     }
 
     fn remove_torrent_entry(&self, id: TorrentId) -> Option<Rc<RefCell<Torrent>>> {
@@ -270,6 +287,15 @@ pub fn run(
             v6: listeners.iter().any(|l| l.local_addr().is_ipv6()),
         };
 
+        let mut roots = tls::TlsClient::env_roots();
+        roots.extend(cfg.extra_roots.iter().cloned());
+        let tls = match tls::TlsClient::new(&roots) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = ready.send(Err(Error::Io(e)));
+                return;
+            }
+        };
         let rng = rng::Rng::from_os();
         let peer_id = {
             let mut r = rng::RngRef(&rng);
@@ -280,6 +306,7 @@ pub fn run(
         let now = Instant::now();
         let ctx = Rc::new(Ctx {
             dns: Dns::new(kick.clone()),
+            tls,
             up_limit: rate::Limiter::new(cfg.upload_rate, now),
             down_limit: rate::Limiter::new(cfg.download_rate, now),
             slots: Cell::new(cfg.unchoke_slots),

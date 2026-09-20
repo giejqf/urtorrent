@@ -49,7 +49,7 @@ impl ExtHandshake {
         shape: &profile::LtepShape,
         version: &str,
         outgoing: bool,
-        listen_port: u16,
+        listen_port: Option<u16>,
         yourip: Option<IpAddr>,
         metadata_size: Option<u32>,
         seeding: bool,
@@ -57,10 +57,15 @@ impl ExtHandshake {
         ExtHandshake {
             m: shape.m.iter().map(|e| (e.name.to_string(), e.id)).collect(),
             v: Some(version.to_string()),
-            p: if (outgoing && shape.p_on_outgoing) || (!outgoing && shape.p_on_incoming) {
-                Some(listen_port)
-            } else {
-                None
+            // `listen_port` is `None` when the port is not advertisable to
+            // this peer (docs/quirks.md Q6).
+            p: match listen_port {
+                Some(p)
+                    if (outgoing && shape.p_on_outgoing) || (!outgoing && shape.p_on_incoming) =>
+                {
+                    Some(p)
+                }
+                _ => None,
             },
             reqq: Some(shape.reqq),
             yourip: if shape.yourip { yourip } else { None },

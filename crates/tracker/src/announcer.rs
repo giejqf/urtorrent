@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 urtorrent contributors
+// Tier/backoff semantics follow libtorrent-rasterbar (BSD-3-Clause),
+// Copyright (c) Arvid Norberg and contributors; see NOTICE.
 
 //! Per-torrent announce scheduling: multi-tracker tiers with libtorrent's
 //! semantics (`announce_to_all_tiers = true`, `announce_to_all_trackers =

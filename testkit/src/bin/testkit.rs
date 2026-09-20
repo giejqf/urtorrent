@@ -22,6 +22,7 @@ fn usage() -> ExitCode {
   testkit list
   testkit it [--shape v4|v6|dual] [--keep] [scenario ...]       run integration scenarios
   testkit capture [--shape ...] [scenario ...]                  run capture scenarios and promote goldens
+  testkit diff [--shape ...] [scenario ...]                     differential runs + discriminator
   testkit run <scenario> [--shape ...] [--keep]                 run one scenario (any tag), no promotion
   testkit lab clean                                             remove stale lab bridges/namespaces
   testkit oracle ensure                                         download + verify pinned oracle binaries"
@@ -51,6 +52,7 @@ fn main() -> ExitCode {
         "it" => run_tagged(rest, Some(Tag::It), false),
         "capture" => run_tagged(rest, Some(Tag::Capture), true),
         "run" => run_tagged(rest, None, false),
+        "diff" => run_tagged(rest, Some(Tag::Diff), false),
         "lab" => match rest.first().map(String::as_str) {
             Some("clean") => testkit::lab::clean_all().map(|r| {
                 println!("removed: {r:?}");

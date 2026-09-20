@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 urtorrent contributors
+// The unmasked-address variant follows libtorrent-rasterbar (BSD-3-Clause),
+// Copyright (c) Arvid Norberg and contributors; see NOTICE.
 
 //! BEP 6 allowed-fast set generation: a deterministic set of `k` pieces a
 //! peer may request while choked, derived from its address and the info-hash.

@@ -65,6 +65,9 @@ pub struct AnnounceRequest {
     pub event: AnnounceEvent,
     /// `tracker id` returned by an earlier response, if any.
     pub tracker_id: Option<Vec<u8>>,
+    /// Whether encryption (MSE) is not disabled on our side: drives
+    /// `supportcrypto=1` (docs/quirks.md Q8).
+    pub crypto_supported: bool,
 }
 
 impl AnnounceRequest {
@@ -99,7 +102,11 @@ impl AnnounceRequest {
                 AnnounceParam::Compact => format!("compact={}", flag(shape.compact)),
                 AnnounceParam::NoPeerId => format!("no_peer_id={}", flag(shape.no_peer_id)),
                 AnnounceParam::SupportCrypto => {
-                    format!("supportcrypto={}", flag(shape.supportcrypto))
+                    if shape.supportcrypto && self.crypto_supported {
+                        "supportcrypto=1".to_string()
+                    } else {
+                        continue;
+                    }
                 }
                 AnnounceParam::Redundant => format!("redundant={}", self.redundant),
                 AnnounceParam::TrackerId => match &self.tracker_id {
@@ -290,6 +297,7 @@ mod tests {
             key: 0xC8445FFC,
             event,
             tracker_id: None,
+            crypto_supported: true,
         }
     }
 
@@ -324,6 +332,16 @@ mod tests {
         assert!(s.starts_with("GET /abc123/announce.php?x=1&info_hash="));
         assert!(s.contains("\r\nHost: pt.example\r\n"));
         assert!(s.contains("\r\nUser-Agent: urtorrent/0.1.0\r\n"));
+    }
+
+    #[test]
+    fn supportcrypto_follows_the_encryption_setting() {
+        let p = Profile::qbt_5_2_3_lt2_0_14();
+        let mut r = req(AnnounceEvent::None);
+        r.crypto_supported = false;
+        let q = r.query(&p);
+        assert!(!q.contains("supportcrypto"), "{q}");
+        assert!(q.contains("&no_peer_id=1&redundant=0"), "{q}");
     }
 
     #[test]

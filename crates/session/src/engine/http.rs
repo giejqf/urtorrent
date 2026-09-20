@@ -2,9 +2,8 @@
 // Copyright (c) 2026 urtorrent contributors
 
 //! A minimal HTTP/1.1 client over io_uring TCP for tracker announces: resolve,
-//! connect (with timeout), send the pre-built request, frame the response with
-//! `tracker::http`, follow a few redirects. HTTPS arrives in M4 (rustls over
-//! the same sockets).
+//! connect (with timeout), optional TLS (rustls, ADR 0003), send the pre-built
+//! request, frame the response with `tracker::http`, follow a few redirects.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -14,6 +13,7 @@ use tracker::http::{Response, ResponseParser};
 use uring::{Buffer, TcpStream};
 
 use super::dns::Dns;
+use super::tls::{TlsClient, TlsStream};
 
 /// Maximum redirects followed (libtorrent follows 5).
 const MAX_REDIRECTS: usize = 5;
@@ -44,20 +44,18 @@ impl Families {
 /// redirects re-render the request against the new URL).
 pub async fn get(
     dns: &Dns,
+    tls: &TlsClient,
     families: Families,
     url: &Url,
     build: &dyn Fn(&Url) -> Vec<u8>,
 ) -> Result<Response, String> {
     let mut url = url.clone();
     for _ in 0..=MAX_REDIRECTS {
-        if url.is_tls() {
-            return Err("https trackers are not supported yet (M4: rustls)".into());
-        }
-        if url.scheme != "http" {
+        if url.scheme != "http" && url.scheme != "https" {
             return Err(format!("unsupported scheme {}", url.scheme));
         }
         let request = build(&url);
-        let resp = fetch_once(dns, families, &url, request).await?;
+        let resp = fetch_once(dns, tls, families, &url, request).await?;
         match resp.redirect() {
             Some(loc) => {
                 let next = if loc.starts_with("http://") || loc.starts_with("https://") {
@@ -88,6 +86,7 @@ pub async fn get(
 
 async fn fetch_once(
     dns: &Dns,
+    tls: &TlsClient,
     families: Families,
     url: &Url,
     request: Vec<u8>,
@@ -107,7 +106,15 @@ async fn fetch_once(
     for addr in candidates {
         match uring::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
-                return uring::timeout(RESPONSE_TIMEOUT, exchange(&stream, request))
+                let fut = async {
+                    if url.is_tls() {
+                        let mut s = TlsStream::connect(tls, stream, &url.host).await?;
+                        exchange_tls(&mut s, request).await
+                    } else {
+                        exchange(&stream, request).await
+                    }
+                };
+                return uring::timeout(RESPONSE_TIMEOUT, fut)
                     .await
                     .map_err(|_| "tracker response timed out".to_string())?;
             }
@@ -134,6 +141,20 @@ async fn exchange(stream: &TcpStream, request: Vec<u8>) -> Result<Response, Stri
                 }
             }
             Err(e) => return Err(format!("recv: {e}")),
+        }
+    }
+}
+
+async fn exchange_tls(stream: &mut TlsStream, request: Vec<u8>) -> Result<Response, String> {
+    stream.send_all(&request).await?;
+    let mut parser = ResponseParser::new();
+    loop {
+        let chunk = stream.recv(16 * 1024).await?;
+        if chunk.is_empty() {
+            return parser.finish().map_err(|e| e.to_string());
+        }
+        if let Some(resp) = parser.push(&chunk).map_err(|e| e.to_string())? {
+            return Ok(resp);
         }
     }
 }

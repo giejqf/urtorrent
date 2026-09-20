@@ -237,3 +237,62 @@ fn add_twice_is_duplicate_and_magnet_is_unsupported() {
     block_on(session.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// L1 lifetime: under the qbt profile every torrent announces its own peer
+/// id (as libtorrent does); the native profile uses one per session.
+#[test]
+fn peer_id_lifetime_follows_the_profile() {
+    let dir = std::env::temp_dir().join(format!("urt-session-pid-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (profile, distinct) in [
+        (profile::Profile::qbt_5_2_3_lt2_0_14(), true),
+        (profile::Profile::native(), false),
+    ] {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let announce = spawn_tracker("127.0.0.1:1".parse().unwrap(), log.clone());
+        let session = block_on(
+            Session::builder()
+                .listen_port(0)
+                .listen_v4(Some(Ipv4Addr::LOCALHOST))
+                .listen_v6(None)
+                .profile(profile.clone())
+                .build(),
+        )
+        .unwrap();
+        let (a, _) = make_torrent("a.bin", 5000, 16384, &announce);
+        let (b, _) = make_torrent("b.bin", 6000, 16384, &announce);
+        block_on(session.add_torrent(AddTorrent::metainfo(a, dir.join(profile.name)))).unwrap();
+        block_on(session.add_torrent(AddTorrent::metainfo(b, dir.join(profile.name)))).unwrap();
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(10) && log.lock().unwrap().len() < 2 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        block_on(session.shutdown()).unwrap();
+        let ids: std::collections::BTreeSet<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|l| {
+                l.split('&')
+                    .find_map(|kv| kv.strip_prefix("peer_id=").map(str::to_string))
+            })
+            .collect();
+        assert!(!ids.is_empty(), "no announces: {:?}", log.lock().unwrap());
+        assert!(ids.iter().all(|i| i.starts_with(profile.peer_id.prefix)));
+        if distinct {
+            assert_eq!(
+                ids.len(),
+                2,
+                "qbt profile must use one peer id per torrent: {ids:?}"
+            );
+        } else {
+            assert_eq!(
+                ids.len(),
+                1,
+                "native profile uses one peer id per session: {ids:?}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

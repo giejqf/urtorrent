@@ -90,6 +90,13 @@ pub struct ConnectionParams {
     pub peer_ip: Option<IpAddr>,
     /// Size of the info dictionary (LTEP `metadata_size`), if known.
     pub metadata_size: Option<u32>,
+    /// Whether our listen port is advertisable to this peer (LTEP `p`):
+    /// libtorrent only sends it when the listen socket's external address
+    /// matches the connection's local address, and a socket without any
+    /// external-address vote yet only matches IPv4 (docs/quirks.md Q6). The
+    /// session computes this; `true` for a v4 connection with no known
+    /// external address, `false` for v6 until one is known.
+    pub advertise_port: bool,
 }
 
 /// Something that happened on the connection that the caller must act on.
@@ -517,7 +524,9 @@ impl Connection {
                             &self.params.profile.ltep,
                             self.params.profile.ltep_version,
                             outgoing,
-                            self.params.listen_port,
+                            self.params
+                                .advertise_port
+                                .then_some(self.params.listen_port),
                             self.params.peer_ip,
                             self.params.metadata_size,
                             seeding,
@@ -777,6 +786,7 @@ mod tests {
             listen_port: 6881,
             peer_ip: Some("10.0.0.2".parse().unwrap()),
             metadata_size: Some(100),
+            advertise_port: true,
         }
     }
 

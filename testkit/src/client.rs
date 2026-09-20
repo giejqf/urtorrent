@@ -56,6 +56,10 @@ impl ClientConfig {
         self.download_limit = bytes_per_sec;
         self
     }
+    pub fn env(mut self, k: &str, v: &str) -> Self {
+        self.env.push((k.into(), v.into()));
+        self
+    }
 }
 
 /// A status snapshot written by the client.

@@ -121,6 +121,7 @@ fn replay_oracle_leeching_from_us() {
             .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
             .map(|a| a.ip()),
         metadata_size: Some(714),
+        advertise_port: true,
     });
     let mut requests = 0;
     let mut haves = 0;
@@ -177,7 +178,7 @@ fn replay_oracle_leeching_from_us() {
 #[test]
 fn qbt_ltep_handshake_is_byte_exact() {
     let profile = profile::Profile::qbt_5_2_3_lt2_0_14();
-    // (file, outgoing, seeding, oracle listen port is routable)
+    // (file, outgoing, seeding, listen port advertisable: v4 yes, v6 no)
     let cases = [
         (
             "capture_peer_plain/v4/tap-peer-plain-oracle-initiator.jsonl",
@@ -218,19 +219,19 @@ fn qbt_ltep_handshake_is_byte_exact() {
             let oracle = ExtHandshake::parse(&oracle_payload).unwrap();
             // The facts the handshake depends on, taken from the capture.
             let yourip: Option<IpAddr> = oracle.yourip;
-            let mut ours = ExtHandshake::build(
+            // Q6: the port is advertisable on v4 (no external-address vote
+            // needed) but not on the lab's v6 (ULA never wins a vote).
+            let ours = ExtHandshake::build(
                 &profile.ltep,
                 profile.ltep_version,
                 outgoing,
-                6881,
+                routable.then_some(6881),
                 yourip,
                 oracle.metadata_size,
                 seeding,
             );
             if outgoing && !routable {
-                // Q6: the oracle omitted `p` here. Pin it.
                 assert_eq!(oracle.p, None, "{file}: Q6 no longer holds");
-                ours.p = None;
             }
             assert_eq!(
                 bencode::hex(&ours.encode()),

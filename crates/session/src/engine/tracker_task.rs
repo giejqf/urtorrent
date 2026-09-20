@@ -70,7 +70,7 @@ pub async fn run(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
 fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
     AnnounceRequest {
         info_hash: t.info.info_hash,
-        peer_id: ctx.peer_id,
+        peer_id: t.peer_id,
         port: ctx.listen_port,
         uploaded: t.stats.uploaded,
         downloaded: t.stats.downloaded,
@@ -80,6 +80,10 @@ fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
         key: t.announce_key,
         event: job.event,
         tracker_id: job.tracker_id.clone(),
+        // MSE lands in M5; until then we announce the oracle's default
+        // ("encryption allowed") capability, which is what the profile's
+        // captures were taken with.
+        crypto_supported: true,
     }
 }
 
@@ -93,7 +97,7 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
     let result: Result<AnnounceResponse, String> = async {
         let url = Url::parse(&job.url).map_err(|e| e.to_string())?;
         let profile = &ctx.cfg.profile;
-        let resp = http::get(&ctx.dns, ctx.families, &url, &|u| {
+        let resp = http::get(&ctx.dns, &ctx.tls, ctx.families, &url, &|u| {
             request.http_request(u, profile)
         })
         .await?;

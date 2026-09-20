@@ -27,6 +27,11 @@ tracing.workspace = true
 # and audited by `xtask check`.
 tokio = { version = "1", default-features = false, features = ["sync"] }
 futures-core = { version = "0.3", default-features = false }
+# HTTPS trackers (ADR 0003): rustls through its buffer API over uring sockets,
+# default crypto provider, Mozilla roots plus caller-supplied CAs.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
+webpki-roots = "1"
+rustls-pemfile = "2"
 
 [dev-dependencies]
 # Tests drive the API with a minimal thread-parking executor (no tokio runtime

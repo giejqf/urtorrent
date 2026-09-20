@@ -28,4 +28,8 @@ socket2 = "0.6"
 # `rt`, `macros`, `time` and `sync` are enabled: none of them pull in `mio`,
 # and `testkit` is outside the audited library graph anyway.
 urtorrent = { path = "../crates/urtorrent", version = "0.1.0" }
+# The discriminator checks the library's own request builder against the
+# goldens too (a unit-level differential).
+tracker = { path = "../crates/tracker", version = "0.1.0" }
+profile = { path = "../crates/profile", version = "0.1.0" }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }
