@@ -87,6 +87,8 @@ fn zero_torrent(name: &str, size: u64, piece_len: u32, salt: u64) -> Vec<u8> {
     t
 }
 
+static DISK_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn session(ip: Ipv4Addr, max_peers: usize) -> Result<Session> {
     Ok(block_on(
         Session::builder()
@@ -96,6 +98,7 @@ fn session(ip: Ipv4Addr, max_peers: usize) -> Result<Session> {
             .lsd(false)
             .max_peers_per_torrent(max_peers)
             .hash_threads(2)
+            .disk_thread(DISK_THREAD.load(std::sync::atomic::Ordering::Relaxed))
             .build(),
     )?)
 }
@@ -319,6 +322,10 @@ fn main() -> Result<()> {
     let mut torrents: usize = 500;
     let mut dir: Option<PathBuf> = None;
     while let Some(k) = args.next() {
+        if k == "--inline-disk" {
+            DISK_THREAD.store(false, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         let v = args.next().with_context(|| format!("{k} needs a value"))?;
         match k.as_str() {
             "--size" => size = parse_size(&v)?,

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- External-address voting (libtorrent `ip_voter` semantics): trackers'
+  `external ip` and peers' `yourip` vote per listen family; LTEP `p` on
+  outgoing connections follows the libtorrent rule against the voted
+  address (Q6 is now the implemented mechanism, not an approximation); BEP 40
+  ranks against the external address; `Event::ExternalAddress`,
+  `SessionStats::{external_v4, external_v6}`.
+- A dedicated disk ring: torrent file I/O and hashing completions run on the
+  `urt-disk` io_uring thread (`storage::DiskRing` / `DiskStore`, ADR 0004 §4
+  amended), with per-piece ordering and full barriers for check / priorities
+  / move / sync; peers batch the writes of one receive buffer, the uploader
+  pipelines reads. `SessionBuilder::disk_thread(false)` keeps disk I/O on the
+  network ring. `uring::Bridge` is the shared cross-thread completion path.
+- `xtask syscalls` judges the `urt-disk` thread too; `urt-soak
+  --inline-disk` for A/B runs.
+
 ## [0.1.0] - 2026-09-20
 
 First release: TCP-only, tracker / PEX / LSD-driven downloading and seeding on

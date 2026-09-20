@@ -7,6 +7,7 @@
 //! a forced re-announce, stop) kicks it.
 
 use std::cell::RefCell;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -112,25 +113,40 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
         return;
     }
     let family = http::Families::only(v6);
-    let result: Result<AnnounceResponse, String> = async {
+    let result: Result<(AnnounceResponse, Option<(SocketAddr, SocketAddr)>), String> = async {
         let url = Url::parse(&job.url).map_err(|e| e.to_string())?;
         let profile = &ctx.cfg.profile;
         if url.scheme == "udp" {
-            return announce_udp(ctx, &url, &request, v6).await;
+            return announce_udp(ctx, &url, &request, v6)
+                .await
+                .map(|r| (r, None));
         }
-        let resp = http::get(&ctx.dns, &ctx.tls, family, &url, &|u| {
+        let (resp, endpoints) = http::get_with_endpoints(&ctx.dns, &ctx.tls, family, &url, &|u| {
             request.http_request(u, profile)
         })
         .await?;
         if !(200..300).contains(&resp.status) {
             return Err(tracker::Error::Status(resp.status).to_string());
         }
-        AnnounceResponse::parse(&resp.body).map_err(|e| e.to_string())
+        AnnounceResponse::parse(&resp.body)
+            .map(|r| (r, Some(endpoints)))
+            .map_err(|e| e.to_string())
     }
     .await;
     let now = Instant::now();
     match result {
-        Ok(resp) => {
+        Ok((resp, endpoints)) => {
+            // BEP 24 `external ip`: a vote from the tracker for the listen
+            // family this announce went out from (libtorrent
+            // `torrent::tracker_response` → `set_external_address`).
+            if let (Some(ip), Some((remote, local))) = (resp.external_ip, endpoints) {
+                ctx.cast_external_vote(
+                    local.ip(),
+                    ip,
+                    super::external_ip::Source::Tracker,
+                    remote.ip(),
+                );
+            }
             let added = {
                 let mut t = torrent.borrow_mut();
                 t.announcer.on_success(&job, &resp, now);

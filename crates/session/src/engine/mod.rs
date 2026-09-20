@@ -9,9 +9,9 @@
 //! results) arrives through a single eventfd [`uring::Notifier`]; local tasks
 //! that need the command loop's attention ring the same eventfd.
 
-mod bridge;
 mod choker;
 mod dns;
+mod external_ip;
 mod http;
 mod local;
 mod lsd;
@@ -34,7 +34,7 @@ use std::time::Instant;
 
 use metainfo::InfoHash;
 use profile::Profile;
-use storage::HashPool;
+use storage::DiskRing;
 use tokio::sync::{mpsc, oneshot};
 use uring::{BufferPool, Notifier, NotifyHandle, Runtime, TcpListener};
 
@@ -73,6 +73,9 @@ pub struct EngineConfig {
     pub pex: bool,
     /// Local Service Discovery enabled.
     pub lsd: bool,
+    /// Torrent file I/O on its own `urt-disk` ring thread (default) rather
+    /// than on the network ring.
+    pub disk_thread: bool,
 }
 
 impl Default for EngineConfig {
@@ -94,6 +97,7 @@ impl Default for EngineConfig {
             encryption: crate::api::EncryptionMode::Enabled,
             pex: true,
             lsd: true,
+            disk_thread: true,
         }
     }
 }
@@ -146,12 +150,15 @@ pub struct Ctx {
     pub peer_id: [u8; 20],
     pub listen_port: u16,
     pub families: http::Families,
-    pub pool: Rc<HashPool>,
+    /// The disk thread (torrent file I/O and hashing).
+    pub disk: Rc<DiskRing>,
     pub dns: Dns,
     pub tls: tls::TlsClient,
     pub udp: Rc<udp::UdpDemux>,
     /// Local Service Discovery sockets (`None` when disabled or unavailable).
     pub lsd: RefCell<Option<lsd::Lsd>>,
+    /// External-address voters, one per listen family (`[v4, v6]`).
+    pub external: RefCell<[external_ip::IpVoter; 2]>,
     pub rng: rng::Rng,
     pub kick: NotifyHandle,
     pub recv_pool: BufferPool,
@@ -261,6 +268,38 @@ impl Ctx {
             }
             profile::PeerIdLifetime::PerSession => self.peer_id,
         }
+    }
+
+    /// Record an external-address vote for the listen family of `local` (the
+    /// connection's local address). On a change every torrent re-ranks its
+    /// candidates (BEP 40 uses our external address) and an event is emitted.
+    pub fn cast_external_vote(
+        &self,
+        local: IpAddr,
+        ip: IpAddr,
+        kind: external_ip::Source,
+        source: IpAddr,
+    ) {
+        let idx = usize::from(local.is_ipv6());
+        let changed = self.external.borrow_mut()[idx].cast_vote(ip, kind, source, Instant::now());
+        if changed {
+            tracing::info!(%ip, %source, ?kind, "external address updated");
+            for t in self.torrents.borrow().values() {
+                t.borrow_mut().rerank_candidates();
+            }
+            self.emit(Event::ExternalAddress { ip });
+        }
+    }
+
+    /// Whether an outgoing connection with local address `local` may carry
+    /// LTEP `p` (docs/quirks.md Q6).
+    pub fn advertise_port_for(&self, local: IpAddr) -> bool {
+        self.external.borrow()[usize::from(local.is_ipv6())].advertise_port_for(local)
+    }
+
+    /// Our external address for a family, if voted in.
+    pub fn external_address(&self, v6: bool) -> Option<IpAddr> {
+        self.external.borrow()[usize::from(v6)].external_address()
     }
 
     /// The peer id a new connection of `torrent` shakes hands with: the
@@ -387,8 +426,17 @@ pub fn run(
             if families.v6 { cfg.listen_v6 } else { None },
             (rng.next_u64() >> 32) as u32,
         ));
-        let pool = Rc::new(HashPool::new(cfg.hash_threads));
-        pool.attach_notifier(kick.clone());
+        let disk = if cfg.disk_thread {
+            match DiskRing::start(cfg.hash_threads, kick.clone()) {
+                Ok(d) => Rc::new(d),
+                Err(e) => {
+                    let _ = ready.send(Err(Error::Io(format!("disk thread: {e}"))));
+                    return;
+                }
+            }
+        } else {
+            Rc::new(DiskRing::inline(cfg.hash_threads, kick.clone()))
+        };
         let lsd = if cfg.lsd {
             lsd::Lsd::open(
                 if families.v4 { cfg.listen_v4 } else { None },
@@ -404,6 +452,10 @@ pub fn run(
             tls,
             udp: udp_demux.clone(),
             lsd: RefCell::new(lsd),
+            external: RefCell::new([
+                external_ip::IpVoter::new(now),
+                external_ip::IpVoter::new(now),
+            ]),
             up_limit: rate::Limiter::new(cfg.upload_rate, now),
             down_limit: rate::Limiter::new(cfg.download_rate, now),
             slots: Cell::new(cfg.unchoke_slots),
@@ -411,7 +463,7 @@ pub fn run(
             peer_id,
             listen_port: port,
             families,
-            pool,
+            disk,
             rng,
             kick: kick.clone(),
             recv_pool: BufferPool::new(64 * 1024, 64),
@@ -453,7 +505,7 @@ pub fn run(
                 tracing::error!("notifier failed: {e}");
                 break;
             }
-            ctx.pool.drain();
+            ctx.disk.drain();
             ctx.dns.drain();
             while let Ok(cmd) = cmd_rx.try_recv() {
                 handle_command(&ctx, cmd);
@@ -697,6 +749,8 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             let torrents = ctx.torrents.borrow();
             let mut s = SessionStats {
                 torrents: torrents.len(),
+                external_v4: ctx.external_address(false),
+                external_v6: ctx.external_address(true),
                 ..Default::default()
             };
             for t in torrents.values() {

@@ -34,6 +34,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct PeerHandle {
     pub key: u32,
     pub addr: SocketAddr,
+    /// Our end of the connection (which listen family it belongs to).
+    pub local: SocketAddr,
     pub incoming: bool,
     pub conn: RefCell<Connection>,
     /// Wakes the writer.
@@ -84,6 +86,8 @@ pub struct Cipher {
 
 /// Outbound bytes queued beyond which the uploader waits for the writer.
 const UPLOAD_BACKLOG: usize = 256 * 1024;
+/// Disk reads the uploader keeps in flight per peer (16 KiB blocks: 256 KiB).
+const UPLOAD_READ_BATCH: usize = 16;
 /// Receive buffer size (and the largest download-limiter grant per read).
 const RECV_SIZE: u64 = 64 * 1024;
 
@@ -91,6 +95,7 @@ impl PeerHandle {
     fn new(
         key: u32,
         addr: SocketAddr,
+        local: SocketAddr,
         incoming: bool,
         conn: Connection,
         pieces: usize,
@@ -100,6 +105,7 @@ impl PeerHandle {
         PeerHandle {
             key,
             addr,
+            local,
             incoming,
             conn: RefCell::new(conn),
             out: Notify::new(),
@@ -359,6 +365,7 @@ fn connection_params(
     t: &Torrent,
     role: Role,
     peer_ip: std::net::IpAddr,
+    local_ip: std::net::IpAddr,
 ) -> ConnectionParams {
     ConnectionParams {
         role,
@@ -373,9 +380,9 @@ fn connection_params(
         listen_port: ctx.listen_port,
         peer_ip: Some(peer_ip),
         metadata_size: t.has_metadata().then_some(t.metadata_size),
-        // Q6: without external-address voting, a v4 listen socket matches
-        // any v4 connection; a v6 one matches nothing yet.
-        advertise_port: peer_ip.is_ipv4(),
+        // Q6: `p` only when the listen family's external address matches our
+        // end of this connection (v4 matches while nothing is voted).
+        advertise_port: ctx.advertise_port_for(local_ip),
         private: t.private,
     }
 }
@@ -489,13 +496,22 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
         };
         (stream, use_mse)
     };
+    let local_addr = stream
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::new(addr.ip(), 0));
     let (mut conn, info_hash) = {
         let t = torrent.borrow();
         if t.closing.is_set() || !t.is_running() || t.has_peer_ip(addr.ip()) {
             return;
         }
         (
-            Connection::new(connection_params(&ctx, &t, Role::Initiator, addr.ip())),
+            Connection::new(connection_params(
+                &ctx,
+                &t,
+                Role::Initiator,
+                addr.ip(),
+                local_addr.ip(),
+            )),
             t.info_hash,
         )
     };
@@ -533,7 +549,7 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
     }
     let source = torrent.borrow().source_of(addr);
     run_connection(
-        ctx, torrent, stream, conn, addr, false, initial, cipher, source,
+        ctx, torrent, stream, conn, addr, local_addr, false, initial, cipher, source,
     )
     .await;
 }
@@ -542,6 +558,9 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
 /// responder handshake), find the torrent, run.
 pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
     let Ok(addr) = stream.peer_addr() else { return };
+    let local_addr = stream
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::new(addr.ip(), ctx.listen_port));
     let mut raw: Vec<u8> = Vec::with_capacity(wire::HANDSHAKE_LEN);
     let mut cipher = Cipher::default();
     // Read until we can tell plaintext from MSE (20 bytes), then finish the
@@ -667,7 +686,13 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
         {
             return;
         }
-        Connection::new(connection_params(&ctx, &t, Role::Responder, addr.ip()))
+        Connection::new(connection_params(
+            &ctx,
+            &t,
+            Role::Responder,
+            addr.ip(),
+            local_addr.ip(),
+        ))
     };
     let _ = stream.set_nodelay(true);
     run_connection(
@@ -676,6 +701,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
         stream,
         conn,
         addr,
+        local_addr,
         true,
         raw,
         cipher,
@@ -693,6 +719,7 @@ async fn run_connection(
     stream: TcpStream,
     conn: Connection,
     addr: SocketAddr,
+    local: SocketAddr,
     incoming: bool,
     initial: Vec<u8>,
     cipher: Cipher,
@@ -700,7 +727,9 @@ async fn run_connection(
 ) {
     let key = ctx.new_peer_key();
     let pieces = torrent.borrow().piece_count();
-    let handle = Rc::new(PeerHandle::new(key, addr, incoming, conn, pieces, source));
+    let handle = Rc::new(PeerHandle::new(
+        key, addr, local, incoming, conn, pieces, source,
+    ));
     handle.encrypted.set(cipher.enc.is_some());
     *handle.cipher.borrow_mut() = cipher;
     torrent.borrow_mut().peers.insert(key, handle.clone());
@@ -833,8 +862,16 @@ async fn process_bytes(
         }
         .map_err(|e| format!("protocol: {e}"))?
     };
+    let mut writes = Vec::new();
+    let mut result = Ok(());
     for ev in events {
-        handle_event(ctx, torrent, handle, ev).await?;
+        match handle_event(ctx, torrent, handle, ev, &mut writes).await {
+            Ok(()) => {}
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
         if handle.close.is_set() {
             break;
         }
@@ -842,7 +879,11 @@ async fn process_bytes(
     if handle.conn.borrow().has_outbound() {
         handle.out.notify();
     }
-    Ok(())
+    // One disk round trip for the whole buffer.
+    for w in writes {
+        w.finish(ctx, torrent).await;
+    }
+    result
 }
 
 /// Like `process_bytes` for bytes that are already plaintext.
@@ -857,8 +898,16 @@ async fn process_plain(
         .borrow_mut()
         .receive(bytes)
         .map_err(|e| format!("protocol: {e}"))?;
+    let mut writes = Vec::new();
+    let mut result = Ok(());
     for ev in events {
-        handle_event(ctx, torrent, handle, ev).await?;
+        match handle_event(ctx, torrent, handle, ev, &mut writes).await {
+            Ok(()) => {}
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
         if handle.close.is_set() {
             break;
         }
@@ -866,7 +915,10 @@ async fn process_plain(
     if handle.conn.borrow().has_outbound() {
         handle.out.notify();
     }
-    Ok(())
+    for w in writes {
+        w.finish(ctx, torrent).await;
+    }
+    result
 }
 
 async fn handle_event(
@@ -874,6 +926,7 @@ async fn handle_event(
     torrent: &Rc<RefCell<Torrent>>,
     handle: &Rc<PeerHandle>,
     ev: WireEvent,
+    writes: &mut Vec<torrent::PendingWrite>,
 ) -> Result<(), String> {
     match ev {
         WireEvent::Handshaked { peer_id, .. } => {
@@ -954,6 +1007,17 @@ async fn handle_event(
         WireEvent::ExtHandshake(ext) => {
             *handle.client.borrow_mut() = ext.v.clone();
             handle.listen_port.set(ext.p);
+            // `yourip`: the peer's view of our address is a vote for this
+            // listen family's external address (libtorrent
+            // `on_extended_handshake` → `set_external_address`).
+            if let Some(ip) = ext.yourip {
+                ctx.cast_external_vote(
+                    handle.local.ip(),
+                    ip,
+                    super::external_ip::Source::Peer,
+                    handle.addr.ip(),
+                );
+            }
             handle
                 .holepunch
                 .set(ext.peer_id_for("ut_holepunch").is_some());
@@ -1000,7 +1064,9 @@ async fn handle_event(
                 .request_times
                 .borrow_mut()
                 .retain(|(r, _)| *r != request);
-            torrent::on_block(ctx, torrent, handle, request, data).await;
+            if let Some(w) = torrent::on_block(ctx, torrent, handle, request, data).await {
+                writes.push(w);
+            }
         }
         WireEvent::UnexpectedBlock { length, .. } => {
             torrent.borrow_mut().stats.redundant += u64::from(length);
@@ -1144,13 +1210,12 @@ async fn writer(
 /// whole torrent.
 async fn uploader(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, handle: Rc<PeerHandle>) {
     loop {
-        let next = handle.upload_queue.borrow_mut().pop_front();
-        let Some(r) = next else {
+        if handle.upload_queue.borrow().is_empty() {
             match select2(handle.upload_notify.wait(), handle.close.wait()).await {
                 Either::Left(()) => continue,
                 Either::Right(()) => break,
             }
-        };
+        }
         while handle.conn.borrow().outbound_len() > UPLOAD_BACKLOG {
             match select2(handle.drained.wait(), handle.close.wait()).await {
                 Either::Left(()) => {}
@@ -1160,41 +1225,51 @@ async fn uploader(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, handle: Rc<PeerHa
         if handle.close.is_set() {
             break;
         }
-        // Cancelled or choked meanwhile? `wire` dropped it from its queue.
-        if !handle.conn.borrow().incoming_requests().contains(&r) {
-            continue;
-        }
         let storage = torrent.borrow().storage.clone();
-        let Some(storage) = storage else {
-            handle.conn.borrow_mut().reject(r);
-            handle.out.notify();
-            continue;
-        };
-        if !storage.has_piece(r.index as usize) {
-            handle.conn.borrow_mut().reject(r);
-            handle.out.notify();
-            continue;
-        }
         torrent::wait_not_moving(&torrent).await;
-        match storage
-            .read_block(r.index as usize, r.begin, r.length)
-            .await
-        {
-            Ok(data) => {
-                let mut conn = handle.conn.borrow_mut();
-                if conn.incoming_requests().contains(&r) {
-                    conn.piece(r, data.as_slice());
-                    drop(conn);
-                    let n = u64::from(r.length);
-                    handle.uploaded.set(handle.uploaded.get() + n);
-                    torrent.borrow_mut().stats.uploaded += n;
-                    handle.out.notify();
-                }
+        // Take a batch of requests and put every read in flight on the disk
+        // thread before waiting for the first: the round trips overlap.
+        let batch: Vec<Request> = {
+            let mut q = handle.upload_queue.borrow_mut();
+            let n = q.len().min(UPLOAD_READ_BATCH);
+            q.drain(..n).collect()
+        };
+        let mut reads = Vec::with_capacity(batch.len());
+        for r in batch {
+            // Cancelled or choked meanwhile? `wire` dropped it from its queue.
+            if !handle.conn.borrow().incoming_requests().contains(&r) {
+                continue;
             }
-            Err(e) => {
-                tracing::warn!(addr = %handle.addr, "read for upload failed: {e}");
+            let Some(storage) = storage.as_ref() else {
                 handle.conn.borrow_mut().reject(r);
                 handle.out.notify();
+                continue;
+            };
+            if !storage.has_piece(r.index as usize) {
+                handle.conn.borrow_mut().reject(r);
+                handle.out.notify();
+                continue;
+            }
+            reads.push((r, storage.read_block(r.index as usize, r.begin, r.length)));
+        }
+        for (r, read) in reads {
+            match read.await {
+                Ok(data) => {
+                    let mut conn = handle.conn.borrow_mut();
+                    if conn.incoming_requests().contains(&r) {
+                        conn.piece(r, &data);
+                        drop(conn);
+                        let n = u64::from(r.length);
+                        handle.uploaded.set(handle.uploaded.get() + n);
+                        torrent.borrow_mut().stats.uploaded += n;
+                        handle.out.notify();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(addr = %handle.addr, "read for upload failed: {e}");
+                    handle.conn.borrow_mut().reject(r);
+                    handle.out.notify();
+                }
             }
         }
     }

@@ -31,11 +31,24 @@ another thread would be unsound, and the runtime's park step is
 3. **Hashing overlaps I/O.** `HashPool::verify_async` hands the bytes to a
    worker and resolves through the eventfd; the blocking `verify` remains for
    callers without a reactor. The worker never touches a waker.
-4. **Disk I/O runs on the network ring for now.** `storage::Storage` is
-   async over whichever `uring::Runtime` polls it; in M2 that is `urt-net`.
-   A separate disk ring thread stays the plan (AGENTS.md 5.3) and will be
-   introduced when M3/M7 benchmarks show the network ring competing with disk
-   completions; `Storage` needs no API change for that.
+4. **Disk I/O runs on its own ring (`urt-disk`), through a job queue.**
+   (Amended 2026-09-20; M2–0.1.0 ran torrent file I/O on the network ring.)
+   `storage::DiskRing` owns a second `uring::Runtime` thread that hosts every
+   `storage::Storage` and the SHA-1 `HashPool` (whose completions it drains).
+   The engine holds a `storage::DiskStore` per torrent: its async methods
+   queue a job (`Mutex<VecDeque>` + the disk thread's eventfd) and resolve on
+   the engine ring through a `uring::Bridge` ticket, rung by the engine's
+   eventfd; the same rule as (2), in both directions. Ordering on the disk
+   side is per piece (a verify waits for earlier writes to its piece and
+   holds later ones) with full barriers for check / priorities / move / sync,
+   so reads and writes of different pieces overlap. Peers batch the writes
+   of one receive buffer and wait once; the uploader keeps several reads in
+   flight. `SessionBuilder::disk_thread(false)` runs the same machinery
+   inline on the network ring (no thread hop, same-thread completion slots)
+   for hosts without a spare core. Measured on the 2-vCPU dev VM the two
+   are within run-to-run noise of each other and of the old single-ring
+   design (`docs/perf.md`); the split pays off where disk latency would
+   otherwise stall peer sockets.
 5. **Teardown cancels, never waits.** `Runtime::drop` issues `ASYNC_CANCEL`
    for every in-flight op and reaps with bounded waits, so abandoned `accept`s
    and timers cannot hang a shutting-down engine; buffers stay owned by the

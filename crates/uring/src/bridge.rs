@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use uring::NotifyHandle;
+use crate::NotifyHandle;
 
 struct Slot<T> {
     value: Option<T>,
@@ -106,12 +106,21 @@ impl<T: Send + 'static> Bridge<T> {
 }
 
 impl<T: Send + 'static> Completer<T> {
-    /// Deliver the value (from any thread).
+    /// Deliver the value (from any thread). The eventfd is rung only when
+    /// the queue was empty: the ring drains everything on one wakeup, so
+    /// back-to-back completions coalesce into one notification.
     pub fn complete(self, value: T) {
-        if let Ok(mut q) = self.shared.done.lock() {
-            q.push((self.id, value));
+        let was_empty = match self.shared.done.lock() {
+            Ok(mut q) => {
+                let e = q.is_empty();
+                q.push((self.id, value));
+                e
+            }
+            Err(_) => true,
+        };
+        if was_empty {
+            self.shared.notify.notify();
         }
-        self.shared.notify.notify();
     }
 }
 

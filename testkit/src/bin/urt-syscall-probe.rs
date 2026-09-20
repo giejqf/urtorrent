@@ -4,7 +4,7 @@
 //! A real-session data-path exercise for `cargo xtask syscalls`: two engines
 //! on loopback (one seeding from disk, one leeching through a manual peer),
 //! a small transfer, shutdown. Run under `strace -f -Y`, the engine threads
-//! (`urt-net`, `urt-hash-*`) must issue no epoll/poll/select and no off-ring
+//! (`urt-net`, `urt-disk`, `urt-hash-*`) must issue no epoll/poll/select and no off-ring
 //! socket or torrent-file data syscalls (AGENTS.md rule 4). The main thread
 //! only prepares the fixture and drives the API; `urt-dns` is allowed
 //! anything (blocking `getaddrinfo` is explicitly off the critical path).

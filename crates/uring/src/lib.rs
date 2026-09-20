@@ -36,6 +36,7 @@ compile_error!(
     "the `uring` crate requires Linux io_uring; there is no fallback (AGENTS.md rule 4)"
 );
 
+mod bridge;
 mod bufpool;
 mod error;
 mod fs;
@@ -46,6 +47,7 @@ mod reactor;
 mod runtime;
 mod timer;
 
+pub use bridge::{Bridge, Completer, Ticket};
 pub use bufpool::{Buffer, BufferPool};
 pub use error::{Error, Result};
 pub use fs::File;

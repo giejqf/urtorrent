@@ -5,8 +5,9 @@
 //! pipeline, the piece read/write/verify path, and crash-safe resume data.
 //!
 //! Storage is one of the three crates permitted to perform I/O; its piece I/O
-//! runs on the `uring` reactor (a disk ring), while SHA-1 hashing runs on a
-//! dedicated [`HashPool`] off the reactor thread (AGENTS.md 5.3). Resume data
+//! runs on the `uring` reactor of a dedicated disk thread ([`DiskRing`],
+//! reached from the engine through [`DiskStore`] handles), while SHA-1
+//! hashing runs on a dedicated [`HashPool`] off both reactors (AGENTS.md 5.3). Resume data
 //! is written atomically (temp + fsync + rename + dir fsync) so a `kill -9`
 //! never yields a torrent that claims pieces it does not have (5.4).
 //!
@@ -18,10 +19,13 @@
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod disk;
 mod hash;
+pub mod layout;
 mod resume;
 mod store;
 
+pub use disk::{DiskRing, DiskStore, Reply};
 pub use hash::{HashPool, sha1};
 pub use metainfo::Bitfield;
 pub use resume::{FORMAT_VERSION, ResumeData};

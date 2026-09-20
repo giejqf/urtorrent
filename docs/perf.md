@@ -15,11 +15,22 @@ What the soak checks (and fails on): completion, exact `downloaded`, no
 corrupt pieces, sampled content, fd count back to baseline after shutdown, no
 fds held after every torrent is removed.
 
-Known limits at 0.1.0:
+### Disk ring A/B (2026-09-20, after 0.1.0)
 
-- Disk I/O shares the network ring thread (ADR 0004 §4). On this VM the
-  transfer is disk-bound before the ring is; a separate disk ring is the
-  planned next step once a faster disk shows the ring competing.
+Interleaved `soak transfer --size 2G` runs on the same VM, `sync` between
+runs: v0.1.0 single ring 112 / 136 MiB/s; separate `urt-disk` thread
+(default now) 134 MiB/s; `disk_thread(false)` (inline) 106 MiB/s. Run-to-run
+variance on this VM is about ±20% (page-cache state, writeback of the
+previous run), so the three are indistinguishable here; the CPU is the
+bottleneck (both engines, both disk rings and four SHA-1 workers share two
+cores). A first version with one global barrier per verify cost ~35%: a
+verify must only wait for earlier writes to *its* piece (ADR 0004 §4).
+
+Known limits:
+
+- On a two-core host the extra thread buys nothing measurable; it matters
+  where disk latency would stall peer sockets. `SessionBuilder::disk_thread`
+  chooses.
 - SHA-1 runs on `hash_threads` (default 2) workers; hashing throughput scales
   with that setting.
 - Web seed requests are capped at 4 MiB each (libtorrent asks for up to

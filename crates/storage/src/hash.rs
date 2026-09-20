@@ -104,10 +104,19 @@ impl HashPool {
                                 let _ = tx.send((job.id, digest, job.data));
                             }
                             Reply::Async => {
-                                if let Ok(mut q) = shared.completions.lock() {
-                                    q.push((job.id, digest, job.data));
-                                }
-                                if let Ok(n) = shared.notify.lock()
+                                // Ring the eventfd only when the queue was
+                                // empty: the ring drains all completions at
+                                // once, so a burst coalesces into one wakeup.
+                                let was_empty = match shared.completions.lock() {
+                                    Ok(mut q) => {
+                                        let e = q.is_empty();
+                                        q.push((job.id, digest, job.data));
+                                        e
+                                    }
+                                    Err(_) => true,
+                                };
+                                if was_empty
+                                    && let Ok(n) = shared.notify.lock()
                                     && let Some(n) = n.as_ref()
                                 {
                                     n.notify();

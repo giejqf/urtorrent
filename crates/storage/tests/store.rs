@@ -7,6 +7,7 @@ mod fixture;
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use metainfo::Torrent;
 use storage::{HashPool, ResumeData, Storage};
@@ -51,7 +52,7 @@ async fn write_all(store: &Storage, content: &[u8], piece_length: u32) {
 fn single_file_write_verify_upload() {
     let fx = fixture::single("data.bin", 200_000, 32768, 1);
     let torrent = Torrent::parse(&fx.torrent).unwrap();
-    let info = Rc::new(torrent.info);
+    let info = Arc::new(torrent.info);
     let root = tmpdir("single");
     let pool = Rc::new(HashPool::new(2));
     let rt = Runtime::with_defaults().unwrap();
@@ -81,7 +82,7 @@ fn single_file_write_verify_upload() {
 fn recheck_detects_corruption() {
     let fx = fixture::single("d.bin", 100_000, 16384, 2);
     let torrent = Torrent::parse(&fx.torrent).unwrap();
-    let info = Rc::new(torrent.info);
+    let info = Arc::new(torrent.info);
     let root = tmpdir("recheck");
     let pool = Rc::new(HashPool::new(2));
     let rt = Runtime::with_defaults().unwrap();
@@ -127,7 +128,7 @@ fn multi_file_spans_and_write_verify() {
         3,
     );
     let torrent = Torrent::parse(&fx.torrent).unwrap();
-    let info = Rc::new(torrent.info);
+    let info = Arc::new(torrent.info);
     assert!(!info.single_file);
     let root = tmpdir("multi");
     let pool = Rc::new(HashPool::new(2));
@@ -158,7 +159,7 @@ fn multi_file_spans_and_write_verify() {
 fn write_and_maybe_verify_reports_completion() {
     let fx = fixture::single("w.bin", 40_000, 16384, 4);
     let torrent = Torrent::parse(&fx.torrent).unwrap();
-    let info = Rc::new(torrent.info);
+    let info = Arc::new(torrent.info);
     let root = tmpdir("wmv");
     let pool = Rc::new(HashPool::new(1));
     let rt = Runtime::with_defaults().unwrap();
@@ -192,7 +193,7 @@ fn write_and_maybe_verify_reports_completion() {
 fn resume_roundtrip_and_recheck_on_mismatch() {
     let fx = fixture::single("r.bin", 80_000, 16384, 5);
     let torrent = Torrent::parse(&fx.torrent).unwrap();
-    let info = Rc::new(torrent.info);
+    let info = Arc::new(torrent.info);
     let root = tmpdir("resume");
     let resume_path = root.join("r.resume");
     let pool = Rc::new(HashPool::new(2));
@@ -245,7 +246,7 @@ fn file_priorities_parts_file_and_move() {
         9,
     );
     let torrent = Torrent::parse(&fx.torrent).unwrap();
-    let info = Rc::new(torrent.info);
+    let info = Arc::new(torrent.info);
     let root = tmpdir("prio");
     let root2 = tmpdir("prio-moved");
     let pool = Rc::new(HashPool::new(2));

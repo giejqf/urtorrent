@@ -11,7 +11,7 @@ use std::sync::mpsc::{Sender, channel};
 
 use uring::NotifyHandle;
 
-use super::bridge::{Bridge, Completer};
+use uring::{Bridge, Completer};
 
 type Result = io::Result<Vec<SocketAddr>>;
 

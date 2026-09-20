@@ -19,6 +19,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use metainfo::{FileSlice, Info};
 use uring::{Buffer, File};
@@ -34,7 +35,7 @@ pub const MAX_PRIORITY: u8 = 7;
 
 /// A per-torrent piece store rooted at a save directory.
 pub struct Storage {
-    info: Rc<Info>,
+    info: Arc<Info>,
     root: RefCell<PathBuf>,
     pool: Rc<HashPool>,
     files: RefCell<HashMap<usize, Rc<File>>>,
@@ -50,7 +51,7 @@ pub struct Storage {
 impl Storage {
     /// Create a store for `info` under `root`, using `pool` for hashing.
     /// Every content file starts at [`DEFAULT_PRIORITY`].
-    pub fn new(info: Rc<Info>, root: PathBuf, pool: Rc<HashPool>) -> Storage {
+    pub fn new(info: Arc<Info>, root: PathBuf, pool: Rc<HashPool>) -> Storage {
         let pieces = info.piece_count();
         let priorities = info
             .files
@@ -140,22 +141,7 @@ impl Storage {
     /// Piece priorities derived from the file priorities: the highest
     /// priority of any non-padding file the piece touches (libtorrent).
     pub fn piece_priorities(&self) -> Vec<u8> {
-        let prios = self.priorities.borrow();
-        (0..self.info.piece_count())
-            .map(|i| {
-                self.info
-                    .piece_location(i)
-                    .map(|loc| {
-                        loc.slices
-                            .iter()
-                            .filter(|s| !s.padding)
-                            .map(|s| prios.get(s.file_index).copied().unwrap_or(0))
-                            .max()
-                            .unwrap_or(0)
-                    })
-                    .unwrap_or(0)
-            })
-            .collect()
+        crate::layout::piece_priorities(&self.info, &self.priorities.borrow())
     }
 
     /// Copy the bytes of verified pieces that fall into file `i` from the
@@ -519,30 +505,7 @@ impl Storage {
 
     /// Bytes of file `index` covered by verified pieces (progress per file).
     pub fn file_done(&self, index: usize) -> u64 {
-        let Some(f) = self.info.files.get(index) else {
-            return 0;
-        };
-        if f.length == 0 {
-            return 0;
-        }
-        let have = self.have.borrow();
-        let piece_len = u64::from(self.info.piece_length);
-        let first = (f.offset / piece_len) as usize;
-        let last = ((f.offset + f.length - 1) / piece_len) as usize;
-        let mut done = 0u64;
-        for piece in first..=last {
-            if !have.get(piece) {
-                continue;
-            }
-            let ps = piece as u64 * piece_len;
-            let pe = (ps + piece_len).min(self.info.total_length);
-            let s = ps.max(f.offset);
-            let e = pe.min(f.offset + f.length);
-            if e > s {
-                done += e - s;
-            }
-        }
-        done
+        crate::layout::file_done(&self.info, &self.have.borrow(), index)
     }
 
     /// The file slices covering a block (for diagnostics/tests).

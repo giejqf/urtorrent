@@ -35,3 +35,7 @@ logic carry the original copyright notice; the list is maintained here:
       The deferred allowed-fast set (on `interested`, skipping the peer's
       pieces) follows peer_connection.cpp (send_allowed_set) and the
       have-state rules bt_peer_connection.cpp (write_bitfield, on_metadata).
+  crates/session/src/engine/external_ip.rs
+      External-address voting (vote filtering, rotation thresholds) follows
+      ip_voter.cpp; the listen-port decision follows session_impl.cpp
+      (listen_port(ssl, local_addr)).

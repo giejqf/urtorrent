@@ -15,11 +15,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use metainfo::{Bitfield, InfoHash, Torrent as Metainfo};
 use picker::{Picker, Received};
-use storage::{ResumeData, Storage};
+use storage::{DiskStore, ResumeData};
 use tracker::Announcer;
 use wire::Request;
 
@@ -76,8 +77,8 @@ pub struct Torrent {
     /// torrent never again takes part in PEX or LSD (rule 2).
     pub private: bool,
     /// The metadata, once known (`None` while a magnet link fetches it).
-    pub info: Option<Rc<metainfo::Info>>,
-    pub storage: Option<Rc<Storage>>,
+    pub info: Option<Arc<metainfo::Info>>,
+    pub storage: Option<Rc<DiskStore>>,
     /// The raw bencoded info dictionary, served over `ut_metadata`.
     pub raw_info: Option<Rc<Vec<u8>>>,
     /// Empty (zero pieces) until the metadata is known.
@@ -347,6 +348,11 @@ impl Torrent {
             self.candidates_dirty = true;
         }
         added
+    }
+
+    /// Our external address changed: BEP 40 ranks depend on it.
+    pub fn rerank_candidates(&mut self) {
+        self.candidates_dirty = true;
     }
 
     /// Toggle sequential download (applies to future picks).
@@ -638,12 +644,7 @@ fn attach_metadata(
     resume: Option<&ResumeData>,
 ) -> Result<(), Error> {
     let mut t = torrent.borrow_mut();
-    let info = Rc::new(info);
-    let storage = Rc::new(Storage::new(
-        info.clone(),
-        t.save_path.clone(),
-        ctx.pool.clone(),
-    ));
+    let info = Arc::new(info);
     let requested = t.pending_priorities.take();
     let initial: Option<Vec<u8>> = match requested {
         Some(p) => match expand_priorities(&info, &p) {
@@ -662,9 +663,7 @@ fn attach_metadata(
             .filter(|r| r.matches(&info) && r.file_priorities.len() == info.files.len())
             .map(|r| r.file_priorities.clone()),
     };
-    if let Some(p) = &initial {
-        storage.init_priorities(p);
-    }
+    let storage = Rc::new(ctx.disk.open(info.clone(), t.save_path.clone(), initial));
     let mut picker = Picker::new(info.piece_count(), info.piece_length, info.total_length);
     picker.set_sequential(t.sequential);
     for (i, p) in storage.piece_priorities().into_iter().enumerate() {
@@ -1084,12 +1083,19 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
     let max_half_open = ctx.cfg.max_half_open;
     if t.candidates_dirty {
         t.candidates_dirty = false;
+        // Rank against our external address when known (libtorrent
+        // `torrent_peer::rank` uses `external_address(peer)`), else the
+        // listen address.
         let ours_v4 = SocketAddr::new(
-            IpAddr::V4(ctx.cfg.listen_v4.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)),
+            ctx.external_address(false).unwrap_or(IpAddr::V4(
+                ctx.cfg.listen_v4.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            )),
             ctx.listen_port,
         );
         let ours_v6 = SocketAddr::new(
-            IpAddr::V6(ctx.cfg.listen_v6.unwrap_or(std::net::Ipv6Addr::UNSPECIFIED)),
+            ctx.external_address(true).unwrap_or(IpAddr::V6(
+                ctx.cfg.listen_v6.unwrap_or(std::net::Ipv6Addr::UNSPECIFIED),
+            )),
             ctx.listen_port,
         );
         let mut v: Vec<SocketAddr> = t.candidates.drain(..).collect();
@@ -1139,19 +1145,40 @@ pub fn on_new_candidates(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
     }
 }
 
+/// The pending disk write of one block: queued on the disk thread already,
+/// awaited by the caller when convenient (`PendingWrite::finish`).
+pub struct PendingWrite {
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), storage::Error>>>>,
+}
+
+impl PendingWrite {
+    /// Wait for the write; a failure puts the torrent into the error state.
+    pub async fn finish(self, ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
+        let r = self.fut.await;
+        torrent.borrow_mut().writes_in_flight -= 1;
+        if let Err(e) = r {
+            fail_torrent(ctx, torrent, format!("disk write failed: {e}"));
+        }
+    }
+}
+
 /// A block we requested arrived from a peer: account, hand to the picker,
-/// write, and verify when the piece is complete.
+/// queue the write, and start a verify when the piece is complete. Returns
+/// the pending write for the caller to await (peers batch the writes of one
+/// receive buffer, then wait for all of them: one disk round trip per buffer
+/// instead of one per block, with the buffer as the backpressure unit).
 pub async fn on_block(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
     peer: &Rc<PeerHandle>,
     request: Request,
     data: Vec<u8>,
-) {
+) -> Option<PendingWrite> {
     peer.downloaded
         .set(peer.downloaded.get() + u64::from(request.length));
-    on_block_from(ctx, torrent, peer.key, Some(peer.addr.ip()), request, data).await;
+    let w = on_block_from(ctx, torrent, peer.key, Some(peer.addr.ip()), request, data).await;
     peer.fill_requests(torrent, ctx);
+    w
 }
 
 /// [`on_block`] for any supplier (`key`): a peer with its address for blame,
@@ -1163,7 +1190,7 @@ pub async fn on_block_from(
     ip: Option<IpAddr>,
     request: Request,
     data: Vec<u8>,
-) {
+) -> Option<PendingWrite> {
     let block = picker::Block {
         piece: request.index,
         offset: request.begin,
@@ -1191,31 +1218,23 @@ pub async fn on_block_from(
         (t.storage.clone(), outcome)
     };
     let Received::Accepted { piece_complete, .. } = outcome else {
-        return;
+        return None;
     };
-    let Some(storage) = storage else {
-        return;
-    };
+    let storage = storage?;
     wait_not_moving(torrent).await;
+    // Queued on the disk thread now; a verify submitted after it is ordered
+    // behind it (the disk thread's barrier), whenever the write is awaited.
     torrent.borrow_mut().writes_in_flight += 1;
-    let write = storage
-        .write_block(
-            request.index as usize,
-            request.begin,
-            uring::Buffer::from_vec(data),
-        )
-        .await;
-    torrent.borrow_mut().writes_in_flight -= 1;
-    if let Err(e) = write {
-        fail_torrent(ctx, torrent, format!("disk write failed: {e}"));
-        return;
-    }
+    let write = storage.write_block(request.index as usize, request.begin, data);
     if piece_complete {
         let already = !torrent.borrow_mut().verifying.insert(request.index);
         if !already {
             uring::spawn(verify_piece(ctx.clone(), torrent.clone(), request.index));
         }
     }
+    Some(PendingWrite {
+        fut: Box::pin(write),
+    })
 }
 
 /// Hash a completed piece and act on the result.

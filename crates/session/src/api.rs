@@ -312,6 +312,10 @@ pub struct SessionStats {
     pub download_rate: u64,
     /// Sum of the torrents' smoothed upload rates, bytes per second.
     pub upload_rate: u64,
+    /// External IPv4 address, once trackers / peers voted one in.
+    pub external_v4: Option<std::net::IpAddr>,
+    /// External IPv6 address, once voted in.
+    pub external_v6: Option<std::net::IpAddr>,
 }
 
 /// Something that happened in the engine.
@@ -370,6 +374,12 @@ pub enum Event {
         id: TorrentId,
         /// The announcing peer.
         addr: SocketAddr,
+    },
+    /// Trackers / peers agreed on our external address (libtorrent's
+    /// `external_ip_alert`).
+    ExternalAddress {
+        /// The address.
+        ip: std::net::IpAddr,
     },
     /// The content was moved to a new directory (`Session::move_storage`).
     StorageMoved {
@@ -567,6 +577,14 @@ impl SessionBuilder {
     /// never announced regardless.
     pub fn lsd(mut self, on: bool) -> Self {
         self.cfg.lsd = on;
+        self
+    }
+
+    /// Run torrent file I/O on a dedicated `urt-disk` io_uring thread
+    /// (default) instead of the network ring. Off keeps disk latency on the
+    /// network ring but saves the cross-thread hops; see `docs/perf.md`.
+    pub fn disk_thread(mut self, on: bool) -> Self {
+        self.cfg.disk_thread = on;
         self
     }
 

@@ -66,13 +66,27 @@ pub async fn get(
     url: &Url,
     build: &dyn Fn(&Url) -> Vec<u8>,
 ) -> Result<Response, String> {
+    get_with_endpoints(dns, tls, families, url, build)
+        .await
+        .map(|(r, _)| r)
+}
+
+/// [`get`], also returning `(remote, local)` of the connection that carried
+/// the final response.
+pub async fn get_with_endpoints(
+    dns: &Dns,
+    tls: &TlsClient,
+    families: Families,
+    url: &Url,
+    build: &dyn Fn(&Url) -> Vec<u8>,
+) -> Result<(Response, (SocketAddr, SocketAddr)), String> {
     let mut url = url.clone();
     for _ in 0..=MAX_REDIRECTS {
         if url.scheme != "http" && url.scheme != "https" {
             return Err(format!("unsupported scheme {}", url.scheme));
         }
         let request = build(&url);
-        let resp = fetch_once(dns, tls, families, &url, request).await?;
+        let (resp, endpoints) = fetch_once(dns, tls, families, &url, request).await?;
         match resp.redirect() {
             Some(loc) => {
                 let next = if loc.starts_with("http://") || loc.starts_with("https://") {
@@ -95,7 +109,7 @@ pub async fn get(
                 tracing::debug!(from = %url.host, to = %next.host, "tracker redirect");
                 url = next;
             }
-            None => return Ok(resp),
+            None => return Ok((resp, endpoints)),
         }
     }
     Err("too many redirects".into())
@@ -107,14 +121,15 @@ async fn fetch_once(
     families: Families,
     url: &Url,
     request: Vec<u8>,
-) -> Result<Response, String> {
+) -> Result<(Response, (SocketAddr, SocketAddr)), String> {
     let mut conn = HttpConn::open(dns, tls, families, url).await?;
-    uring::timeout(
+    let resp = uring::timeout(
         RESPONSE_TIMEOUT,
         conn.request(request, tracker::http::MAX_BODY),
     )
     .await
-    .map_err(|_| "tracker response timed out".to_string())?
+    .map_err(|_| "tracker response timed out".to_string())??;
+    Ok((resp, conn.endpoints))
 }
 
 enum Stream {
@@ -130,6 +145,9 @@ pub struct HttpConn {
     pending: Vec<u8>,
     /// The server asked to close after the last response.
     closed: bool,
+    /// `(remote, local)` of the TCP connection (external-address votes need
+    /// both).
+    pub endpoints: (SocketAddr, SocketAddr),
 }
 
 impl HttpConn {
@@ -164,6 +182,9 @@ impl HttpConn {
         for addr in candidates {
             match uring::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
                 Ok(Ok(stream)) => {
+                    let local = stream
+                        .local_addr()
+                        .unwrap_or_else(|_| SocketAddr::new(addr.ip(), 0));
                     let stream = if url.is_tls() {
                         Stream::Tls(Box::new(
                             uring::timeout(
@@ -180,6 +201,7 @@ impl HttpConn {
                         stream,
                         pending: Vec::new(),
                         closed: false,
+                        endpoints: (addr, local),
                     });
                 }
                 Ok(Err(e)) => last_err = format!("connect {addr}: {e}"),

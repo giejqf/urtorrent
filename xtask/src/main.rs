@@ -79,8 +79,8 @@ fn syscalls() -> Result<()> {
     fail_on_violations(&report, "uring probe")?;
 
     // 2. A real session transfer: two engines on loopback. Only the engine's
-    // threads are judged (`urt-net`, `urt-hash-*`); the main thread prepares
-    // the fixture and drives the API, and `urt-dns` may block.
+    // threads are judged (`urt-net`, `urt-disk`, `urt-hash-*`); the main
+    // thread prepares the fixture and drives the API, and `urt-dns` may block.
     run(
         cargo().args(["build", "-q", "-p", "testkit", "--bin", "urt-syscall-probe"]),
         "build urt-syscall-probe",
@@ -88,7 +88,11 @@ fn syscalls() -> Result<()> {
     let probe = root().join("target/debug/urt-syscall-probe");
     let dir = std::env::temp_dir().join(format!("urt-syscall-session-{}", std::process::id()));
     let dir_s = dir.to_string_lossy().into_owned();
-    let report = trace(&probe, &[dir_s.as_str()], Some(&["urt-net", "urt-hash"]))?;
+    let report = trace(
+        &probe,
+        &[dir_s.as_str()],
+        Some(&["urt-net", "urt-disk", "urt-hash"]),
+    )?;
     let _ = std::fs::remove_dir_all(&dir);
     println!(
         "session probe: io_uring_enter calls on engine threads: {}",
