@@ -81,6 +81,10 @@ fn entry(p: &PeerHandle, pieces: usize) -> Option<(SocketAddr, u8)> {
     if p.holepunch.get() {
         flags |= pex_flags::HOLEPUNCH;
     }
+    // libtorrent flags peers it is connected to over uTP.
+    if p.transport.get() == crate::api::PeerTransport::Utp {
+        flags |= pex_flags::UTP;
+    }
     Some((addr, flags))
 }
 
@@ -207,6 +211,11 @@ pub fn on_message(
             if f & pex_flags::ENCRYPTION != 0 {
                 t.mse_retry.insert(*a);
             }
+        }
+    }
+    for (a, f) in &pex.added {
+        if f & pex_flags::UTP != 0 {
+            t.utp_failed.remove(a);
         }
     }
     tracing::debug!(

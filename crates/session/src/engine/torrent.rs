@@ -139,6 +139,14 @@ pub struct Torrent {
     candidates: VecDeque<SocketAddr>,
     /// New candidates arrived; re-rank before the next dial.
     candidates_dirty: bool,
+    /// Addresses whose uTP dial failed (libtorrent's `supports_utp` gone
+    /// false); a PEX uTP flag clears the mark again.
+    pub utp_failed: HashSet<SocketAddr>,
+    /// Addresses whose TCP dial failed or was closed before the handshake:
+    /// under `TransportPolicy::PreferTcp` they are dialled over uTP next.
+    pub tcp_failed: HashSet<SocketAddr>,
+    /// Addresses we connected to over uTP (`confirmed_supports_utp`).
+    pub utp_confirmed: HashSet<SocketAddr>,
     known: HashSet<SocketAddr>,
     sources: HashMap<SocketAddr, PeerSource>,
     failed: HashMap<SocketAddr, Instant>,
@@ -636,6 +644,9 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         peers: HashMap::new(),
         candidates: VecDeque::new(),
         candidates_dirty: false,
+        utp_failed: HashSet::new(),
+        tcp_failed: HashSet::new(),
+        utp_confirmed: HashSet::new(),
         known: HashSet::new(),
         sources: HashMap::new(),
         failed: HashMap::new(),

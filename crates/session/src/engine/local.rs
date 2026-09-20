@@ -163,6 +163,30 @@ impl Drop for Permit {
     }
 }
 
+/// Drive every future to completion concurrently; results in input order.
+pub async fn join_all<F: Future>(futs: Vec<F>) -> Vec<F::Output> {
+    let mut futs: Vec<Option<std::pin::Pin<Box<F>>>> =
+        futs.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut out: Vec<Option<F::Output>> = (0..futs.len()).map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut done = true;
+        for (slot, res) in futs.iter_mut().zip(out.iter_mut()) {
+            if let Some(f) = slot {
+                match f.as_mut().poll(cx) {
+                    Poll::Ready(v) => {
+                        *res = Some(v);
+                        *slot = None;
+                    }
+                    Poll::Pending => done = false,
+                }
+            }
+        }
+        if done { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
+    out.into_iter().flatten().collect()
+}
+
 #[cfg(test)]
 mod semaphore_tests {
     use super::*;

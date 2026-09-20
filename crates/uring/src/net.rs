@@ -654,10 +654,171 @@ impl UdpSocket {
         (r.map_err(Into::into), b)
     }
 
+    /// Receive continuously into `ring`'s buffers (multishot `recvmsg`,
+    /// kernel 6.0+): one SQE serves every datagram. See [`RecvMsgMulti`].
+    pub fn recv_multi(&self, ring: &BufRing) -> RecvMsgMulti {
+        // SAFETY: an all-zero msghdr is a valid value (null pointers, zero
+        // lengths); only `msg_namelen` is consulted by the kernel here.
+        let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
+        hdr.msg_namelen = mem::size_of::<libc::sockaddr_in6>() as u32;
+        RecvMsgMulti {
+            fd: self.fd.raw(),
+            ring: ring.inner().clone(),
+            op: None,
+            msghdr: Box::new(hdr),
+        }
+    }
+
+    /// Set (or clear) the IPv4 don't-fragment flag on every datagram sent
+    /// from now on (`IP_MTU_DISCOVER`); a no-op for IPv6 sockets, where
+    /// the kernel never fragments in transit anyway. One-time-style
+    /// `setsockopt` (AGENTS.md 5.3), used around uTP path-MTU probes.
+    pub fn set_dont_fragment(&self, on: bool) -> Result<()> {
+        if self.local.is_ipv6() {
+            return Ok(());
+        }
+        let v: libc::c_int = if on {
+            libc::IP_PMTUDISC_DO
+        } else {
+            libc::IP_PMTUDISC_WANT
+        };
+        setsockopt(self.fd.raw(), libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, &v)?;
+        Ok(())
+    }
+
     /// Receive a datagram and its sender (`recvmsg`). The buffer is truncated
     /// to the datagram length.
     pub async fn recv_from(&self, buf: Buffer) -> (Result<u32>, Buffer, Option<SocketAddr>) {
         let (r, b, from) = reactor::recv_from(self.fd.raw(), buf).await;
         (r.map_err(Into::into), b, from)
     }
+}
+
+/// A multishot `recvmsg` on a [`UdpSocket`]: `next` yields each datagram
+/// with its sender as it lands. Ring exhaustion (`ENOBUFS`) re-arms once a
+/// buffer is returned, like [`RecvMulti`]. Dropping the `next` future does
+/// not cancel the receive; dropping the `RecvMsgMulti` does.
+pub struct RecvMsgMulti {
+    fd: RawFd,
+    ring: Rc<BufRingInner>,
+    op: Option<MultiOp>,
+    /// Lives as long as the operation: the kernel reads it at submission.
+    msghdr: Box<libc::msghdr>,
+}
+
+impl RecvMsgMulti {
+    fn arm(&mut self) {
+        let ring = self.ring.clone();
+        let fd = self.fd;
+        let bgid = self.ring.bgid();
+        let hdr: *const libc::msghdr = &*self.msghdr;
+        self.op = Some(MultiOp::submit(ring, move |ud| {
+            io_uring::opcode::RecvMsgMulti::new(io_uring::types::Fd(fd), hdr, bgid)
+                .build()
+                .user_data(ud)
+        }));
+    }
+
+    /// Decode one completion: the sender and the payload view.
+    fn decode(&self, res: i32, flags: u32) -> Option<(SocketAddr, RingBuf)> {
+        let bid = io_uring::cqueue::buffer_select(flags)?;
+        if res <= 0 {
+            self.ring.recycle_bid(bid);
+            return None;
+        }
+        let mut buf = self.ring.take(bid, res as usize);
+        let (from, payload_off) = {
+            let whole = buf.as_slice();
+            let out = io_uring::types::RecvMsgOut::parse(whole, &self.msghdr).ok()?;
+            let from = sockaddr_from_bytes(out.name_data())?;
+            (from, whole.len() - out.payload_data().len())
+        };
+        buf.advance(payload_off);
+        Some((from, buf))
+    }
+
+    /// The next datagram.
+    pub async fn next(&mut self) -> Result<(SocketAddr, RingBuf)> {
+        loop {
+            if self.op.is_none() {
+                self.wait_for_buffer().await;
+                self.arm();
+            }
+            let Some(op) = self.op.as_mut() else { continue };
+            match op.next().await {
+                None => self.op = None,
+                Some((res, flags)) => {
+                    if !io_uring::cqueue::more(flags) {
+                        self.op = None;
+                    }
+                    if res == -libc::ENOBUFS {
+                        self.op = None;
+                        continue;
+                    }
+                    if res < 0 {
+                        if let Some(bid) = io_uring::cqueue::buffer_select(flags) {
+                            self.ring.recycle_bid(bid);
+                        }
+                        return Err(io::Error::from_raw_os_error(-res).into());
+                    }
+                    if let Some(d) = self.decode(res, flags) {
+                        return Ok(d);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A datagram that already arrived, without waiting.
+    pub fn try_next(&mut self) -> Option<(SocketAddr, RingBuf)> {
+        loop {
+            let op = self.op.as_mut()?;
+            let (res, flags) = op.try_next()??;
+            if !io_uring::cqueue::more(flags) {
+                self.op = None;
+            }
+            if res < 0 {
+                if let Some(bid) = io_uring::cqueue::buffer_select(flags) {
+                    self.ring.recycle_bid(bid);
+                }
+                // Errors and exhaustion are left for `next`.
+                return None;
+            }
+            if let Some(d) = self.decode(res, flags) {
+                return Some(d);
+            }
+        }
+    }
+
+    async fn wait_for_buffer(&self) {
+        std::future::poll_fn(|cx| {
+            if self.ring.free() > 0 {
+                std::task::Poll::Ready(())
+            } else {
+                self.ring.wait_free(cx.waker());
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
+/// Decode a `sockaddr_in` / `sockaddr_in6` from raw bytes.
+fn sockaddr_from_bytes(b: &[u8]) -> Option<SocketAddr> {
+    if b.len() < 2 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([b[0], b[1]]);
+    if family == libc::AF_INET as u16 && b.len() >= 8 {
+        let port = u16::from_be_bytes([b[2], b[3]]);
+        let ip = std::net::Ipv4Addr::new(b[4], b[5], b[6], b[7]);
+        return Some(SocketAddr::new(ip.into(), port));
+    }
+    if family == libc::AF_INET6 as u16 && b.len() >= 24 {
+        let port = u16::from_be_bytes([b[2], b[3]]);
+        let mut a = [0u8; 16];
+        a.copy_from_slice(&b[8..24]);
+        return Some(SocketAddr::new(std::net::Ipv6Addr::from(a).into(), port));
+    }
+    None
 }

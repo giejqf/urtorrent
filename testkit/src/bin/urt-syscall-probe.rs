@@ -78,7 +78,7 @@ fn make_torrent(name: &str, size: usize, piece_len: usize) -> (Vec<u8>, Vec<u8>)
     (t, data)
 }
 
-fn session(ip: Ipv4Addr) -> Session {
+fn session(ip: Ipv4Addr, utp: bool) -> Session {
     block_on(
         Session::builder()
             .listen_port(0)
@@ -86,19 +86,23 @@ fn session(ip: Ipv4Addr) -> Session {
             .listen_v6(None)
             .lsd(false)
             .dht(false)
+            .transports(if utp {
+                urtorrent::TransportPolicy::UtpOnly
+            } else {
+                urtorrent::TransportPolicy::TcpOnly
+            })
             .build(),
     )
     .expect("engine")
 }
 
-fn main() {
-    let dir: PathBuf = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("urt-probe-{}", std::process::id())));
-    let _ = std::fs::remove_dir_all(&dir);
+/// One seeder-to-leecher transfer between two engines; `utp` selects the
+/// transport (uTP only, or TCP only).
+fn transfer(dir: &std::path::Path, utp: bool) -> usize {
     let a_dir = dir.join("a");
     let b_dir = dir.join("b");
+    let _ = std::fs::remove_dir_all(&a_dir);
+    let _ = std::fs::remove_dir_all(&b_dir);
     std::fs::create_dir_all(&a_dir).unwrap();
     std::fs::create_dir_all(&b_dir).unwrap();
     let size = 3 * 1024 * 1024 + 4321;
@@ -106,7 +110,7 @@ fn main() {
     // Fixture written by the main thread before any engine exists.
     std::fs::write(a_dir.join("probe.bin"), &data).unwrap();
 
-    let a = session(Ipv4Addr::LOCALHOST);
+    let a = session(Ipv4Addr::LOCALHOST, utp);
     let a_id = block_on(a.add_torrent(AddTorrent::metainfo(torrent.clone(), &a_dir))).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -117,7 +121,8 @@ fn main() {
         assert!(Instant::now() < deadline, "seeder never checked: {st:?}");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let b = session(Ipv4Addr::new(127, 0, 0, 2));
+    let b = session(Ipv4Addr::new(127, 0, 0, 2), utp);
+    let mut events = b.events();
     let b_id = block_on(b.add_torrent(AddTorrent::metainfo(torrent, &b_dir))).unwrap();
     block_on(b.add_peer(
         b_id,
@@ -137,8 +142,41 @@ fn main() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(std::fs::read(b_dir.join("probe.bin")).unwrap(), data);
+    // The transport must be the one asked for.
+    let want = if utp {
+        urtorrent::PeerTransport::Utp
+    } else {
+        urtorrent::PeerTransport::Tcp
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match events.try_recv() {
+            Some(urtorrent::Event::PeerDisconnected { info, .. }) => {
+                assert_eq!(info.transport, want, "unexpected transport");
+                break;
+            }
+            Some(_) => {}
+            None => {
+                assert!(Instant::now() < deadline, "no PeerDisconnected event");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
     block_on(b.shutdown()).unwrap();
     block_on(a.shutdown()).unwrap();
+    size
+}
+
+fn main() {
+    let dir: PathBuf = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("urt-probe-{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&dir);
-    println!("probe: transfer of {size} bytes complete");
+    // Both data paths: TCP (multishot recv, vectored sends) and uTP (the
+    // UDP socket's multishot recvmsg and queued sends).
+    let tcp = transfer(&dir, false);
+    let utp = transfer(&dir, true);
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("probe: transfer of {tcp} bytes over TCP and {utp} bytes over uTP complete");
 }

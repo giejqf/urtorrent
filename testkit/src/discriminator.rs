@@ -130,10 +130,171 @@ pub struct Fingerprint {
     pub mse: Option<MseFingerprint>,
     pub pex: Option<PexFingerprint>,
     pub dht: Option<DhtFingerprint>,
+    pub utp: Option<UtpFingerprint>,
     /// L1 (Q19): the handshake carried the same peer id as the announce for
     /// the same torrent. libtorrent 2.0 uses a fresh id per connection, so
     /// this is `false` for the oracle. Set by scenarios that observe both.
     pub handshake_id_is_announce_id: Option<bool>,
+}
+
+/// What the other end of a uTP connection (or a pcap of it) can tell about
+/// the client's uTP implementation: header field choices, the first
+/// packets' relations, extension use, path-MTU probing and the close.
+/// Sequence numbers, connection ids, timestamps and window bookkeeping
+/// that depends on the receiver's pace are never compared.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct UtpFingerprint {
+    /// L2 (connector): `ext=.. wnd=.. ack=.. len=..` of the SYN.
+    pub syn_shape: Option<String>,
+    /// L2 (connector): the first ST_DATA after the SYN: `id=syn+<d>
+    /// ack=peer_seq-<d> wnd=<w>`.
+    pub first_data_shape: Option<String>,
+    /// L2 (acceptor): the SYN-ACK: `type=.. ext=.. wnd=.. len=.. ack=syn_seq`.
+    pub syn_ack_shape: Option<String>,
+    /// L2 (acceptor): whether the first data was preceded by a bare ack
+    /// (STATE then DATA) and the first DATA's seq relation to the SYN-ACK.
+    pub acceptor_first_data: Option<String>,
+    /// L2: distinct ST_DATA payload sizes on the path-MTU ladder (probe
+    /// sizes from the 548-byte floor towards the link ceiling), sorted.
+    pub mtu_ladder: Vec<usize>,
+    /// L2: the largest datagram sent.
+    pub max_datagram: Option<usize>,
+    /// L2: extension types seen on FIN packets and the close reason values.
+    pub fin_shape: Option<String>,
+    /// L2: whether acks of a FIN carried the close-reason extension.
+    pub fin_ack_ext: Option<Vec<u8>>,
+    /// L2: initial advertised window on the first non-SYN packet.
+    pub initial_wnd: Option<u32>,
+    /// L2: kinds of the first three packets sent.
+    pub first_kinds: Vec<String>,
+    /// L2: selective-ack extension seen (only compared when both saw loss).
+    pub sack_seen: bool,
+}
+
+/// The payload sizes libtorrent's binary search visits from the 548-byte
+/// floor to a 1472 (v4) / 1452 (v6) ceiling, UDP payload minus the 20-byte
+/// header.
+fn mtu_ladder_sizes() -> Vec<usize> {
+    let mut v = Vec::new();
+    for ceiling in [1472u32, 1452u32] {
+        let mut floor = 548u32;
+        v.push(floor as usize - 20);
+        loop {
+            let mid = (floor + ceiling) / 2;
+            if mid == floor {
+                break;
+            }
+            v.push(mid as usize - 20);
+            floor = mid;
+        }
+    }
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Fingerprint the uTP packets `records` sent by `ips` (one connection's
+/// worth is enough; more only adds to the ladder).
+pub fn utp_fingerprint(
+    records: &[crate::utp_capture::UtpRecord],
+    ips: &[IpAddr],
+) -> Option<UtpFingerprint> {
+    let ours: Vec<&crate::utp_capture::UtpRecord> = records
+        .iter()
+        .filter(|r| ips.contains(&r.src.ip()))
+        .collect();
+    if ours.is_empty() {
+        return None;
+    }
+    let mut f = UtpFingerprint {
+        first_kinds: ours.iter().take(3).map(|r| r.kind.clone()).collect(),
+        ..Default::default()
+    };
+    // Connector side.
+    if let Some(syn) = ours.iter().find(|r| r.kind == "syn") {
+        f.syn_shape = Some(format!(
+            "ext={:?} wnd={} ack={} tsd={} len={}",
+            syn.extensions, syn.wnd_size, syn.ack_nr, syn.timestamp_diff_us, syn.len
+        ));
+        // The peer's SYN-ACK (first packet from the other side on this id).
+        let syn_ack = records
+            .iter()
+            .find(|r| r.src == syn.dst && r.connection_id == syn.connection_id && r.ts >= syn.ts);
+        if let Some(first_data) = ours.iter().find(|r| r.kind == "data" && r.ts > syn.ts) {
+            let ack_rel = syn_ack.map(|a| a.seq_nr.wrapping_sub(first_data.ack_nr));
+            f.first_data_shape = Some(format!(
+                "id=syn+{} seq=syn+{} ack=peer_seq-{:?} wnd={}",
+                first_data.connection_id.wrapping_sub(syn.connection_id),
+                first_data.seq_nr.wrapping_sub(syn.seq_nr),
+                ack_rel,
+                first_data.wnd_size
+            ));
+        }
+    }
+    // Acceptor side: the peer's SYN arrived at us.
+    if let Some(syn) = records
+        .iter()
+        .find(|r| r.kind == "syn" && ips.contains(&r.dst.ip()))
+        && let Some(ack) = ours
+            .iter()
+            .find(|r| r.connection_id == syn.connection_id && r.ts >= syn.ts)
+    {
+        {
+            f.syn_ack_shape = Some(format!(
+                "type={} ext={:?} wnd={} len={} ack=syn_seq+{}",
+                ack.kind,
+                ack.extensions,
+                ack.wnd_size,
+                ack.len,
+                ack.ack_nr.wrapping_sub(syn.seq_nr)
+            ));
+            let after: Vec<&&crate::utp_capture::UtpRecord> = ours
+                .iter()
+                .filter(|r| r.connection_id == syn.connection_id && r.ts > ack.ts)
+                .take(2)
+                .collect();
+            if let Some(first_data) = ours.iter().find(|r| r.kind == "data" && r.ts > syn.ts) {
+                let bare_ack_first = after.first().is_some_and(|r| r.kind == "state");
+                f.acceptor_first_data = Some(format!(
+                    "bare_ack_first={bare_ack_first} seq=synack_seq+{}",
+                    first_data.seq_nr.wrapping_sub(ack.seq_nr)
+                ));
+            }
+        }
+    }
+    let ladder = mtu_ladder_sizes();
+    let mut sizes: Vec<usize> = ours
+        .iter()
+        .filter(|r| r.kind == "data" && ladder.contains(&r.payload_len))
+        .map(|r| r.payload_len)
+        .collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+    f.mtu_ladder = sizes;
+    f.max_datagram = ours.iter().map(|r| r.len).max();
+    let fins: Vec<&&crate::utp_capture::UtpRecord> =
+        ours.iter().filter(|r| r.kind == "fin").collect();
+    if !fins.is_empty() {
+        let mut reasons: Vec<Option<u32>> = fins.iter().map(|r| r.close_reason).collect();
+        reasons.dedup();
+        f.fin_shape = Some(format!(
+            "ext={:?} payload={} close_reason={:?}",
+            fins[0].extensions, fins[0].payload_len, reasons
+        ));
+    }
+    // Our ack of the peer's FIN.
+    if let Some(peer_fin) = records
+        .iter()
+        .find(|r| r.kind == "fin" && ips.contains(&r.dst.ip()))
+        && let Some(ack) = ours
+            .iter()
+            .find(|r| r.kind == "state" && r.ts >= peer_fin.ts && r.ack_nr == peer_fin.seq_nr)
+    {
+        f.fin_ack_ext = Some(ack.extensions.clone());
+    }
+    f.initial_wnd = ours.iter().find(|r| r.kind != "syn").map(|r| r.wnd_size);
+    f.sack_seen = ours.iter().any(|r| r.sack_len.is_some());
+    Some(f)
 }
 
 /// What a DHT node the client bootstraps from (and one it probes) can tell
@@ -591,6 +752,37 @@ pub fn diff(a: &Fingerprint, b: &Fingerprint) -> Vec<String> {
         (None, None) => {}
         _ => out.push("dht observation missing on one side".into()),
     }
+    match (&a.utp, &b.utp) {
+        (Some(x), Some(y)) => {
+            macro_rules! cmp {
+                ($field:ident, $label:expr) => {
+                    if x.$field != y.$field {
+                        out.push(format!("{}: {:?} vs {:?}", $label, x.$field, y.$field));
+                    }
+                };
+            }
+            cmp!(syn_shape, "L2 utp SYN shape");
+            cmp!(first_data_shape, "L2 utp first data after SYN");
+            cmp!(syn_ack_shape, "L2 utp SYN-ACK shape");
+            cmp!(acceptor_first_data, "L2 utp acceptor first data");
+            cmp!(first_kinds, "L2 utp first packet kinds");
+            cmp!(initial_wnd, "L2 utp initial window");
+            cmp!(max_datagram, "L2 utp largest datagram (path MTU)");
+            cmp!(fin_shape, "L2 utp FIN shape");
+            cmp!(fin_ack_ext, "L2 utp FIN ack extensions");
+            // The ladder depends on how much data flowed: compare the rungs
+            // both sides had the chance to climb.
+            let n = x.mtu_ladder.len().min(y.mtu_ladder.len());
+            if n > 0 && x.mtu_ladder[..n] != y.mtu_ladder[..n] {
+                out.push(format!(
+                    "L2 utp MTU probe ladder: {:?} vs {:?}",
+                    x.mtu_ladder, y.mtu_ladder
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => out.push("utp observation missing on one side".into()),
+    }
     match (&a.udp, &b.udp) {
         (Some(x), Some(y)) => {
             macro_rules! cmp {
@@ -849,6 +1041,7 @@ mod tests {
         );
         let fp = Fingerprint {
             dht: None,
+            utp: None,
             tracker: tracker_fingerprint(&[tr], &["10.0.0.11".parse().unwrap()]),
             peer: None,
             udp: None,
@@ -859,6 +1052,7 @@ mod tests {
         let d = diff(
             &Fingerprint {
                 dht: None,
+                utp: None,
                 tracker: oracle.tracker.clone(),
                 peer: None,
                 udp: None,
@@ -929,6 +1123,7 @@ mod tests {
         };
         let fp = Fingerprint {
             dht: None,
+            utp: None,
             tracker: tracker_fingerprint(&[ev], &["10.0.0.11".parse().unwrap()]),
             peer: None,
             udp: None,
@@ -939,6 +1134,7 @@ mod tests {
         let d = diff(
             &Fingerprint {
                 dht: None,
+                utp: None,
                 tracker: oracle.tracker.clone(),
                 peer: None,
                 udp: None,

@@ -18,7 +18,7 @@ use metainfo::Bitfield;
 use picker::Picker;
 use uring::Buffer;
 
-use super::transport::Transport;
+use super::transport::{Chunk, Transport, TransportKind};
 use wire::{Connection, ConnectionParams, Event as WireEvent, Handshake, PeerHave, Request, Role};
 
 use super::Ctx;
@@ -31,6 +31,9 @@ use crate::api::{EncryptionMode, Event, PeerInfo, PeerSource};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Outgoing connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Outer bound on a uTP dial (the socket itself gives up after its 3 s
+/// connect timeout).
+const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Shared view of one connection.
 pub struct PeerHandle {
@@ -512,7 +515,37 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
             .filter(|a| !a.is_unspecified())
             .map(std::net::IpAddr::V6),
     };
-    let connected = uring::timeout(CONNECT_TIMEOUT, Transport::connect_tcp(local, addr)).await;
+    // The transport: TCP first by default, uTP for addresses whose TCP dial
+    // failed (`PreferTcp`); libtorrent's order under `PreferUtp` (uTP unless
+    // a uTP dial to the address failed, or it was reached over uTP before);
+    // only one of them under the `*Only` policies.
+    let policy = ctx.cfg.transports;
+    let use_utp = {
+        let t = torrent.borrow();
+        let utp_possible =
+            ctx.utp.is_some() && policy.utp_outgoing() && ctx.udp.supports(addr.ip());
+        utp_possible
+            && (!policy.tcp_outgoing()
+                || if policy.utp_first() {
+                    !t.utp_failed.contains(&addr) || t.utp_confirmed.contains(&addr)
+                } else {
+                    t.tcp_failed.contains(&addr) && !t.utp_failed.contains(&addr)
+                })
+    };
+    if !use_utp && !policy.tcp_outgoing() {
+        ctx.connection_closed();
+        let mut t = torrent.borrow_mut();
+        t.half_open = t.half_open.saturating_sub(1);
+        t.connecting.remove(&addr);
+        t.note_disconnect(addr, Instant::now());
+        return;
+    }
+    let connected = match (&ctx.utp, use_utp) {
+        (Some(h), true) => {
+            uring::timeout(UTP_CONNECT_TIMEOUT, Transport::connect_utp(h, addr)).await
+        }
+        _ => uring::timeout(CONNECT_TIMEOUT, Transport::connect_tcp(local, addr)).await,
+    };
     ctx.connection_closed(); // the dial is over; a live connection counts again below
     let (stream, use_mse) = {
         let mut t = torrent.borrow_mut();
@@ -521,16 +554,22 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
         let stream = match connected {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                tracing::debug!(%addr, "connect failed: {e}");
-                t.note_disconnect(addr, Instant::now());
+                tracing::debug!(%addr, utp = use_utp, "connect failed: {e}");
+                dial_failed(&mut t, &ctx, addr, use_utp);
                 return;
             }
             Err(_) => {
-                tracing::debug!(%addr, "connect timed out");
-                t.note_disconnect(addr, Instant::now());
+                tracing::debug!(%addr, utp = use_utp, "connect timed out");
+                dial_failed(&mut t, &ctx, addr, use_utp);
                 return;
             }
         };
+        if use_utp {
+            // Connected over uTP: the address speaks it for sure.
+            t.utp_confirmed.insert(addr);
+        } else {
+            t.tcp_failed.remove(&addr);
+        }
         // Q3: "enabled" connects out in plaintext first and retries with MSE
         // after a failed attempt (libtorrent toggles `pe_support` per peer).
         let use_mse = match ctx.cfg.encryption {
@@ -579,7 +618,15 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
                 tracing::debug!(%addr, "mse initiator failed: {e}");
                 let mut t = torrent.borrow_mut();
                 t.mse_retry.remove(&addr);
-                t.note_disconnect(addr, Instant::now());
+                if !use_utp
+                    && e.contains("closed")
+                    && tcp_closed_before_handshake(&mut t, &ctx, addr)
+                {
+                    // A uTP-only peer accepts and drops TCP: uTP next.
+                    t.allow_reconnect_now(addr);
+                } else {
+                    t.note_disconnect(addr, Instant::now());
+                }
                 return;
             }
             Err(_) => {
@@ -863,7 +910,71 @@ async fn run_connection(
             reason = Some("peer closed the connection".into());
         }
     }
+    // uTP tells the peer why (libtorrent's close_reason_t in the FIN).
+    let why = reason
+        .clone()
+        .or_else(|| handle.close_reason.borrow().clone());
+    if let Some(r) = &why {
+        let code = close_reason_code(r);
+        if code != 0 {
+            stream.set_close_reason(code);
+        }
+    }
     finish_connection(ctx, torrent, handle, key, addr, incoming, reason).await
+}
+
+/// An outgoing TCP connection died before the peer said anything. When uTP
+/// is available for the address and has not failed for it, mark the
+/// address for a uTP dial and say so (the caller reconnects right away).
+fn tcp_closed_before_handshake(t: &mut Torrent, ctx: &Ctx, addr: SocketAddr) -> bool {
+    let fallback = ctx.cfg.transports.utp_outgoing()
+        && ctx.utp.is_some()
+        && ctx.udp.supports(addr.ip())
+        && !t.utp_failed.contains(&addr)
+        && !t.tcp_failed.contains(&addr);
+    if fallback {
+        t.tcp_failed.insert(addr);
+    }
+    fallback
+}
+
+/// A dial failed. A failed uTP attempt marks the address as not speaking
+/// uTP and reconnects over TCP right away (libtorrent's `fast_reconnect`);
+/// a failed TCP attempt marks the address for uTP and reconnects right away
+/// when uTP is available and has not failed for it too. Anything else backs
+/// off as usual.
+fn dial_failed(t: &mut Torrent, ctx: &Ctx, addr: SocketAddr, was_utp: bool) {
+    let policy = ctx.cfg.transports;
+    let retry_now = if was_utp {
+        t.utp_confirmed.remove(&addr);
+        t.utp_failed.insert(addr);
+        policy.tcp_outgoing() && !t.tcp_failed.contains(&addr)
+    } else {
+        t.tcp_failed.insert(addr);
+        policy.utp_outgoing()
+            && ctx.utp.is_some()
+            && ctx.udp.supports(addr.ip())
+            && !t.utp_failed.contains(&addr)
+    };
+    if retry_now {
+        t.allow_reconnect_now(addr);
+    } else {
+        t.note_disconnect(addr, Instant::now());
+    }
+}
+
+/// libtorrent's `close_reason_t` for one of our disconnect reasons (0 =
+/// none: the peer closed, or an I/O error).
+fn close_reason_code(reason: &str) -> u16 {
+    match reason {
+        "duplicate peer id" | "duplicate connection" => 1,
+        "torrent stopped" | "rechecking" => 2,
+        "banned: repeated hash failures" => 5,
+        "both seeds" => 6,
+        "inactive" => 10,
+        r if r.starts_with("protocol:") => 263,
+        _ => 0,
+    }
 }
 
 /// Batches at least this large go out zero-copy when enabled (a block plus
@@ -911,7 +1022,19 @@ async fn finish_connection(
         // A connection dropped as a duplicate says nothing about the address:
         // no backoff (if both ends tossed the coin the wrong way, the next
         // tick dials again).
+        // An outgoing TCP connection the peer closed before any handshake
+        // (a uTP-only peer accepts and drops TCP): try uTP next, at once.
+        let tcp_dead_before_handshake = !incoming
+            && handle.peer_id.get().is_none()
+            && handle.transport.get() == TransportKind::Tcp
+            && (reason == "peer closed the connection" || reason.starts_with("recv:"))
+            && tcp_closed_before_handshake(&mut t, &ctx, addr);
         if reason.starts_with("duplicate") {
+            t.allow_reconnect_now(addr);
+        } else if tcp_dead_before_handshake {
+            if ctx.cfg.encryption == EncryptionMode::Enabled && !handle.encrypted.get() {
+                t.mse_retry.insert(addr); // Q3 still applies to the retry
+            }
             t.allow_reconnect_now(addr);
         } else if !incoming && ctx.cfg.encryption == EncryptionMode::Enabled {
             // Q3: a plaintext attempt that died before the handshake completed
@@ -952,13 +1075,16 @@ async fn process_chunks(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
     handle: &Rc<PeerHandle>,
-    chunks: Vec<uring::RingBuf>,
+    chunks: Vec<Chunk>,
 ) -> Result<(), String> {
     let events = {
         let mut cipher = handle.cipher.borrow_mut();
         let mut conn = handle.conn.borrow_mut();
         let mut events = Vec::new();
         for mut buf in chunks {
+            if buf.is_empty() {
+                continue;
+            }
             if let Some(d) = cipher.dec.as_mut() {
                 d.apply(buf.as_mut_slice());
             }

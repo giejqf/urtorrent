@@ -196,6 +196,7 @@ impl BufRingInner {
         RingBuf {
             ring: self.clone(),
             bid,
+            start: 0,
             len: len.min(self.buf_size),
         }
     }
@@ -278,6 +279,9 @@ pub(crate) fn release_retired(reactor: Option<&Rc<RefCell<reactor::Reactor>>>) {
 pub struct RingBuf {
     ring: Rc<BufRingInner>,
     bid: u16,
+    /// Offset of the first byte of interest (a `recvmsg` completion carries
+    /// its own header before the payload).
+    start: usize,
     len: usize,
 }
 
@@ -285,14 +289,23 @@ impl RingBuf {
     /// The received bytes.
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: the buffer is off the ring while this guard exists (the
-        // kernel does not touch it) and `len <= buf_size`.
-        unsafe { std::slice::from_raw_parts(self.ring.buf_ptr(self.bid), self.len) }
+        // kernel does not touch it) and `start + len <= buf_size`.
+        unsafe { std::slice::from_raw_parts(self.ring.buf_ptr(self.bid).add(self.start), self.len) }
     }
 
     /// The received bytes, mutably (ciphers decrypt in place).
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as above, plus `&mut self` makes this the only reference.
-        unsafe { std::slice::from_raw_parts_mut(self.ring.buf_ptr(self.bid), self.len) }
+        unsafe {
+            std::slice::from_raw_parts_mut(self.ring.buf_ptr(self.bid).add(self.start), self.len)
+        }
+    }
+
+    /// Drop the first `n` bytes from view.
+    pub fn advance(&mut self, n: usize) {
+        let n = n.min(self.len);
+        self.start += n;
+        self.len -= n;
     }
 
     /// Number of received bytes.

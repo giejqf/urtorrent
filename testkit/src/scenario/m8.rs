@@ -340,11 +340,15 @@ fn router(ctx: &mut Ctx, alias: u8) -> Result<TapDht> {
     )
 }
 
+/// Our client for the DHT scenarios: like the oracle's primary capture
+/// configuration, uTP is off (with it on, announces carry `implied_port`,
+/// Q21).
 fn dht_client_config(routers: &[SocketAddr]) -> ClientConfig {
     ClientConfig::default()
         .profile("qbt")
         .lsd(false)
         .pex(false)
+        .protocol("tcp")
         .dht_bootstrap(routers.to_vec())
 }
 

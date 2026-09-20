@@ -36,4 +36,10 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Whether this is `EMSGSIZE` (a datagram larger than the path MTU with
+    /// don't-fragment set).
+    pub fn is_message_too_long(&self) -> bool {
+        matches!(self, Error::Io(e) if e.raw_os_error() == Some(libc::EMSGSIZE))
+    }
 }

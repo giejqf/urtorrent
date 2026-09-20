@@ -26,6 +26,7 @@ mod torrent;
 mod tracker_task;
 mod transport;
 mod udp;
+mod utp;
 mod webseed;
 
 use std::cell::{Cell, RefCell};
@@ -84,6 +85,8 @@ pub struct EngineConfig {
     pub dht_read_only: bool,
     /// Saved DHT state to restore (`Session::dht_state`).
     pub dht_state: Option<Vec<u8>>,
+    /// Peer transports and dial order (`TransportPolicy`, default TCP first).
+    pub transports: crate::api::TransportPolicy,
     /// Torrent file I/O on its own `urt-disk` ring thread (default) rather
     /// than on the network ring.
     pub disk_thread: bool,
@@ -139,6 +142,7 @@ impl Default for EngineConfig {
             dht_bootstrap_nodes: None,
             dht_read_only: false,
             dht_state: None,
+            transports: crate::api::TransportPolicy::PreferTcp,
             disk_thread: true,
             max_checking: 1,
             max_concurrent_announces: 32,
@@ -218,9 +222,11 @@ pub struct Ctx {
     pub lsd: RefCell<Option<lsd::Lsd>>,
     /// The DHT node(s), `None` when disabled.
     pub dht: Option<Rc<dht::Dht>>,
+    /// The uTP endpoint, `None` when both directions are disabled.
+    pub utp: Option<Rc<utp::UtpHost>>,
     /// External-address voters, one per listen family (`[v4, v6]`).
     pub external: RefCell<[external_ip::IpVoter; 2]>,
-    pub rng: rng::Rng,
+    pub rng: Rc<rng::Rng>,
     pub kick: NotifyHandle,
     /// Provided buffers every peer socket receives into (multishot recv).
     pub recv_ring: uring::BufRing,
@@ -540,7 +546,7 @@ pub fn run(
                 return;
             }
         };
-        let rng = rng::Rng::from_os();
+        let rng = Rc::new(rng::Rng::from_os());
         let peer_id = {
             let mut r = rng::RngRef(&rng);
             cfg.profile.peer_id.generate(&mut r)
@@ -603,12 +609,27 @@ pub fn run(
                     return;
                 }
             };
+        let utp_host = if cfg.transports.utp_outgoing()
+            && (udp_demux.supports(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                || udp_demux.supports(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
+        {
+            Some(utp::UtpHost::new(
+                utp::default_config(),
+                udp_demux.clone(),
+                rng.clone(),
+                cfg.transports.utp_incoming(),
+                cfg.max_connections.max(1) * 2,
+            ))
+        } else {
+            None
+        };
         let ctx = Rc::new(Ctx {
             dns: Dns::new(kick.clone()),
             tls,
             udp: udp_demux.clone(),
             lsd: RefCell::new(lsd),
             dht: dht_service,
+            utp: utp_host,
             external: RefCell::new([
                 external_ip::IpVoter::new(now),
                 external_ip::IpVoter::new(now),
@@ -655,6 +676,23 @@ pub fn run(
 
         for l in listeners {
             uring::spawn(accept_loop(ctx.clone(), l));
+        }
+        if let Some(h) = ctx.utp.clone() {
+            // uTP datagrams on the listen port; SYNs become incoming peers.
+            let weak = Rc::downgrade(&ctx);
+            ctx.udp.set_utp(
+                h.clone(),
+                Box::new(move |key| {
+                    if let Some(ctx) = weak.upgrade()
+                        && let Some(h) = ctx.utp.clone()
+                    {
+                        uring::spawn(peer::run_incoming(
+                            ctx.clone(),
+                            transport::Transport::Utp(Rc::new(h.stream(key))),
+                        ));
+                    }
+                }),
+            );
         }
         udp_demux.spawn(ctx.closing.clone());
         if let Some(d) = ctx.dht.clone() {
@@ -707,6 +745,11 @@ async fn accept_loop(ctx: Rc<Ctx>, listener: TcpListener) {
     loop {
         match select2(listener.accept(), ctx.closing.wait()).await {
             Either::Left(Ok(stream)) => {
+                if !ctx.cfg.transports.tcp_incoming() {
+                    // libtorrent accepts and drops (`enable_incoming_tcp`).
+                    drop(stream);
+                    continue;
+                }
                 uring::spawn(peer::run_incoming(
                     ctx.clone(),
                     transport::Transport::Tcp(stream),
@@ -742,6 +785,9 @@ async fn ticker(ctx: Rc<Ctx>) {
         }
         let now = Instant::now();
         ctx.run_due_ticks(now);
+        if let Some(h) = ctx.utp.clone() {
+            h.tick(now);
+        }
         if now.duration_since(last_dht) >= std::time::Duration::from_secs(1) {
             last_dht = now;
             if let Some(d) = ctx.dht.clone() {
@@ -1038,6 +1084,9 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 s.dht_nodes = ds.nodes;
                 s.dht_lookups = ds.lookups;
                 s.dht_stored_peers = ds.peers;
+            }
+            if let Some(h) = &ctx.utp {
+                s.utp_connections = h.connections();
             }
             let _ = reply.send(s);
         }

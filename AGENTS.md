@@ -16,7 +16,7 @@ that trackers and peers see nothing unusual.
 - Any OS other than Linux. No epoll/kqueue/IOCP fallback. Do not add one.
 - **DHT (BEP 5/32) and uTP (BEP 29) were out of scope for 0.1.0** (maintainer decision,
   2026-09-19): 0.1.0 was TCP-only and tracker/PEX/LSD-driven. The DHT shipped in 0.3.0
-  (ADR 0007); uTP is still open. Keep the design open for uTP.
+  (ADR 0007) and uTP in 0.4.0 (ADR 0008).
 - I2P, SOCKS/HTTP proxies, SSL torrents, share mode, super-seeding (revisit later if asked).
 - BEP 52 (v2/hybrid) is *deferred*, not rejected. See section 4.
 
@@ -116,13 +116,14 @@ Tiering reflects what public BT and private-tracker (PT) communities actually us
 **Tier 3 - post-0.1.0, design must not preclude**
 
 BEP 5/32 DHT (**done in 0.3.0**: BEP 5, 42, 43, 51 and libtorrent's extras; BEP 44 items
-are a documented gap, docs/quirks.md Q20), BEP 29 uTP, BEP 55 `ut_holepunch` (needs uTP
-to be useful), BEP 52 v2/hybrid torrents (merkle trees, SHA-256), BEP 17 web seeds,
-UPnP/NAT-PMP/PCP port mapping.
+are a documented gap, docs/quirks.md Q20), BEP 29 uTP (**done in 0.4.0**, ADR 0008:
+libtorrent's `utp_stream` ported; `TransportPolicy` toggle, TCP first by default,
+docs/quirks.md Q21), BEP 55 `ut_holepunch`, BEP 52 v2/hybrid torrents (merkle trees,
+SHA-256), BEP 17 web seeds, UPnP/NAT-PMP/PCP port mapping.
 
 "Must not preclude" concretely: the listen port's UDP socket is owned by `uring` with a
-demultiplexer hook (UDP tracker and DHT today; uTP later), and `session` talks to peers
-through a `Transport` enum that TCP implements today (ADR 0006).
+demultiplexer (UDP tracker, DHT and uTP share it), and `session` talks to peers through a
+`Transport` enum (TCP and uTP, ADR 0006 / 0008).
 
 Note: the libtorrent 2.0 oracle speaks v2. If a Tier-1/2 capture shows v2-related bits on
 v1-only torrents, that becomes a fidelity item and gets pulled forward; otherwise v2 waits.
@@ -139,7 +140,7 @@ crates/
   mse/         encryption handshake + RC4 stream                    (sans-IO)
   tracker/     HTTP + UDP announce/scrape builders and parsers      (sans-IO)
   dht/         Mainline DHT node (BEP 5/42/43/51), sans-IO                (0.3.0)
-  (utp/        reserved name, post-0.3.0)
+  utp/         uTP transport (BEP 29, LEDBAT), sans-IO                    (0.4.0)
   picker/      piece picker, request scheduling
   profile/     identity profiles as data (section 6)
   uring/       io_uring reactor, buffer pools, timers, TCP/UDP/file ops
@@ -200,8 +201,9 @@ Only `uring`, `storage` and `session` may perform I/O.
   of it inside `uring`, with `// SAFETY:` comments and miri/loom-style tests where possible.
 - Network: multishot accept, multishot recv with provided buffer rings for TCP (done,
   ADR 0006: one ring per network thread, required, no single-shot fallback for peers),
-  `recvmsg` multishot for the UDP sockets (UDP tracker now; DHT/uTP demux later),
-  `send_zc` for piece payloads where it measures faster (implemented behind
+  `recvmsg` multishot for the UDP sockets (done, ADR 0008: one provided buffer ring per
+  UDP socket, serving the UDP tracker, DHT and uTP; sends go through an ordered per-socket
+  queue), `send_zc` for piece payloads where it measures faster (implemented behind
   `SessionBuilder::zero_copy_send`, off by default: no gain on loopback).
 - TLS for HTTPS trackers and web seeds: **rustls** (pure Rust, maintainer decision), used
   through its buffer-in/buffer-out API so ciphertext moves over `uring`. No OpenSSL, no
@@ -313,7 +315,8 @@ statistical timing mimicry.
   and that is fine. Still do the cheap things: send SNI, offer ALPN only if the oracle
   does, use system/webpki roots sensibly.
 - **Timing**, as above.
-- **Capability gaps.** The oracle supports DHT and uTP; 0.1.0 does not. Default policy:
+- **Capability gaps.** The oracle supports DHT and uTP; 0.1.0 did not (both do since
+  0.4.0; the policy stays for whatever the next gap is). Default policy:
   advertise the same handshake reserved bits and LTEP `m` entries as the oracle so L1/L2
   stay exact, and handle the consequences gracefully (ignore `PORT` messages; answer
   unsupported extension messages the way the oracle answers a disabled feature). Where
@@ -385,8 +388,9 @@ Golden captures are committed (small) or content-addressed in CI cache (pcaps).
 Leech from oracle seeder - seed to oracle leecher - seed to Transmission - mixed swarm -
 HTTP / HTTPS / UDP tracker - tracker down, tier failover, backoff - PT-style tracker with
 passkey + whitelist accepts us - private torrent emits no DHT/PEX/LSD - encryption
-forced/enabled/disabled on each side - oracle with uTP enabled still connects to us over
-TCP - magnet via ut_metadata with tracker-sourced peers - PEX discovery - LSD discovery - web seed only - pause/resume -
+forced/enabled/disabled on each side - oracle with uTP enabled falls back to TCP when ours
+is off - leech from / seed to the oracle over uTP, uTP shapes indistinguishable (`utp_shape`) -
+magnet via ut_metadata with tracker-sourced peers - PEX discovery - LSD discovery - web seed only - pause/resume -
 `kill -9` and resume - force recheck with corrupted data on disk - file priorities incl.
 parts file - move storage - hash-fail peer gets banned - rate limits honoured - `completed`
 sent exactly once, `stopped` sent on shutdown, stats never go backwards.
@@ -409,7 +413,7 @@ Each milestone ends with its integration scenarios green in CI.
 - **M6 Extensions.** PEX, `ut_metadata`/magnet, `upload_only`, LSD, web seeds, BEP 40.
 - **M7 0.1.0 hardening.** Soak, perf, fuzz time, API review, docs. **Release 0.1.0.**
 - **Post-0.1.0:** each as its own minor release: 0.2.0 performance pass (done), 0.3.0 DHT
-  (done), then uTP (+ holepunch), BEP 52, port mapping.
+  (done), 0.4.0 uTP (done), then `ut_holepunch`, BEP 52, port mapping.
 
 ## 9. Working conventions
 
@@ -432,7 +436,7 @@ Each milestone ends with its integration scenarios green in CI.
   - `cargo xtask fuzz <target> [secs]`
   - `cargo xtask syscalls` - assert no non-uring data-path syscalls (uring probe + a real
     two-engine transfer under strace, engine threads only)
-  - `cargo xtask soak [transfer|many|all] [--size N] [--torrents N]` - perf / leak exercise
+  - `cargo xtask soak [transfer|many|all] [--size N] [--torrents N] [--utp]` - perf / leak exercise
     (release build; baselines in `docs/perf.md`)
 - Definition of done for any change: `xtask check` green; relevant `it`/`diff` scenarios
   green; new parser => new fuzz target; new wire-visible behaviour => profile entry +
@@ -460,7 +464,13 @@ Each milestone ends with its integration scenarios green in CI.
 ### Decided by the maintainer (2026-09-19)
 
 - **0.1.0 scope excludes DHT and uTP.** TCP-only; peers come from trackers, PEX, LSD.
-  (The DHT followed in 0.3.0; uTP is still open.)
+  (The DHT followed in 0.3.0, uTP in 0.4.0.)
+- **uTP is a toggle and TCP stays the default transport** (2026-09-20):
+  `SessionBuilder::transports(TransportPolicy)` with `PreferTcp` as the default; do not
+  copy libtorrent's uTP-first dialling as the default, since TCP performs better. uTP
+  serves incoming SYNs and peers TCP cannot reach; `PreferUtp` / `UtpOnly` / `TcpOnly`
+  exist for callers who want the other behaviours. Recorded as an accepted L3
+  difference in docs/quirks.md Q21.
 - **io_uring is mandatory on every performance-critical path with no fallback of any
   kind** (no epoll, kqueue, IOCP, poll). Non-critical work such as DNS may use whatever
   works. Details and enforcement in 5.3.

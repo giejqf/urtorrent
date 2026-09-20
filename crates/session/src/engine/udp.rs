@@ -2,11 +2,15 @@
 // Copyright (c) 2026 urtorrent contributors
 
 //! The listen port's UDP sockets (one per family) and their demultiplexer
-//! (AGENTS.md 4: owned by the ring, with a hook for DHT / uTP). Consumers:
+//! (AGENTS.md 4: owned by the ring, with hooks for DHT and uTP). Consumers:
 //! the BEP 15 UDP tracker (requests register a waiter keyed by `(tracker
-//! address, transaction id)` and the receive loop hands replies over) and the
-//! DHT (every datagram that is a bencoded dictionary). Anything else is
-//! dropped at `trace`; uTP would hook in the same way.
+//! address, transaction id)` and the receive loop hands replies over), the
+//! DHT (every datagram that is a bencoded dictionary) and uTP (a 20-byte
+//! header with version nibble 1). Anything else is dropped at `trace`.
+//!
+//! Datagrams arrive through one multishot `recvmsg` per socket into a
+//! provided buffer ring; each wakeup drains what is queued and then tells
+//! uTP the round is over (deferred acks go out once per round).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -18,9 +22,19 @@ use std::time::Instant;
 use metainfo::InfoHash;
 use tracker::udp::{self, ConnectionCache, Reply};
 use tracker::{AnnounceRequest, AnnounceResponse};
-use uring::{Buffer, UdpSocket};
+use uring::{BufRing, Buffer, UdpSocket};
 
 use super::local::{Either, Flag, select2};
+use super::utp::UtpHost;
+
+/// Provided buffers per UDP socket (datagrams are at most ~1500 bytes).
+const UDP_RING_ENTRIES: u16 = 256;
+const UDP_BUF_SIZE: usize = 2048;
+/// Buffer group ids for the UDP rings (`RECV_RING_GROUP` is 1).
+const UDP_RING_GROUP_V4: u16 = 2;
+const UDP_RING_GROUP_V6: u16 = 3;
+/// Datagrams handled per wakeup before yielding.
+const MAX_UDP_BATCH: usize = 64;
 
 struct Slot {
     reply: Option<Reply>,
@@ -30,15 +44,36 @@ struct Slot {
 /// Waiters keyed by `(tracker address, transaction id)`.
 type Waiters = HashMap<(SocketAddr, u32), Rc<RefCell<Slot>>>;
 
-/// One bound UDP socket.
+/// A datagram waiting in a socket's send queue.
+struct Queued {
+    to: SocketAddr,
+    data: Vec<u8>,
+    /// Send with don't-fragment set (uTP path-MTU probe) and report the
+    /// result.
+    probe: Option<Box<dyn FnOnce(uring::Result<u32>)>>,
+}
+
+/// One bound UDP socket with its send queue. Datagrams go out in order,
+/// `SEND_BATCH` at a time (each batch fully completes before the next is
+/// submitted): a uTP window's worth of packets is then paced by the ring's
+/// round trip instead of hitting the socket buffer as one burst, which kept
+/// the order and stopped receivers from dropping the tail.
 struct Sock {
     socket: Rc<UdpSocket>,
     v6: bool,
+    queue: RefCell<std::collections::VecDeque<Queued>>,
+    kick: Rc<super::local::Notify>,
 }
+
+/// Datagrams submitted together.
+const SEND_BATCH: usize = 32;
 
 /// A consumer of datagrams that are not tracker replies: `(from, packet,
 /// arrived on the v6 socket)`.
 pub type DhtHook = Box<dyn Fn(SocketAddr, &[u8], bool)>;
+
+/// Called with the key of every connection an incoming SYN opened.
+pub type UtpAccept = Box<dyn Fn(utp::Key)>;
 
 /// The demultiplexer.
 pub struct UdpDemux {
@@ -48,6 +83,8 @@ pub struct UdpDemux {
     next_tid: Cell<u32>,
     /// KRPC (bencoded dictionary) datagrams go here.
     dht: RefCell<Option<DhtHook>>,
+    /// uTP datagrams go here.
+    utp: RefCell<Option<(Rc<UtpHost>, UtpAccept)>>,
 }
 
 impl UdpDemux {
@@ -61,21 +98,21 @@ impl UdpDemux {
         seed: u32,
     ) -> UdpDemux {
         let mut socks = Vec::new();
+        let sock = |s: UdpSocket, v6: bool| Sock {
+            socket: Rc::new(s),
+            v6,
+            queue: RefCell::new(std::collections::VecDeque::new()),
+            kick: super::local::Notify::new(),
+        };
         if let Some(a) = v4 {
             match UdpSocket::bind(SocketAddr::new(IpAddr::V4(a), port)) {
-                Ok(s) => socks.push(Sock {
-                    socket: Rc::new(s),
-                    v6: false,
-                }),
+                Ok(s) => socks.push(sock(s, false)),
                 Err(e) => tracing::warn!("udp v4 bind on {port} failed: {e}"),
             }
         }
         if let Some(a) = v6 {
             match UdpSocket::bind(SocketAddr::new(IpAddr::V6(a), port)) {
-                Ok(s) => socks.push(Sock {
-                    socket: Rc::new(s),
-                    v6: true,
-                }),
+                Ok(s) => socks.push(sock(s, true)),
                 Err(e) => tracing::warn!("udp v6 bind on {port} failed: {e}"),
             }
         }
@@ -85,6 +122,7 @@ impl UdpDemux {
             cache: RefCell::new(ConnectionCache::default()),
             next_tid: Cell::new(seed | 1),
             dht: RefCell::new(None),
+            utp: RefCell::new(None),
         }
     }
 
@@ -97,6 +135,11 @@ impl UdpDemux {
         self.socks.iter().find(|s| s.v6 == ip.is_ipv6())
     }
 
+    /// The local address of the socket serving `ip`'s family.
+    pub fn local_addr_for(&self, ip: IpAddr) -> Option<SocketAddr> {
+        self.sock_for(ip).map(|s| s.socket.local_addr())
+    }
+
     fn tid(&self) -> u32 {
         // Distinct, non-sequential-looking ids are not required by the BEP;
         // a stepping counter keeps them unique within the cache lifetime.
@@ -106,28 +149,58 @@ impl UdpDemux {
         t
     }
 
-    /// Start the receive loops.
+    /// Start the receive loops (one multishot `recvmsg` per socket into its
+    /// own provided buffer ring, draining every queued datagram per wakeup)
+    /// and the send loops.
     pub fn spawn(self: &Rc<Self>, closing: Rc<Flag>) {
+        for i in 0..self.socks.len() {
+            uring::spawn(Self::send_loop(self.clone(), i, closing.clone()));
+        }
         for (i, s) in self.socks.iter().enumerate() {
             let me = self.clone();
             let socket = s.socket.clone();
             let v6 = s.v6;
             let closing = closing.clone();
+            let ring = match BufRing::new(
+                if v6 {
+                    UDP_RING_GROUP_V6
+                } else {
+                    UDP_RING_GROUP_V4
+                },
+                UDP_RING_ENTRIES,
+                UDP_BUF_SIZE,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(socket = i, "udp buffer ring: {e}");
+                    continue;
+                }
+            };
             uring::spawn(async move {
+                let mut rx = socket.recv_multi(&ring);
                 loop {
-                    let buf = Buffer::from_vec(vec![0u8; 2048]);
-                    match select2(socket.recv_from(buf), closing.wait()).await {
-                        Either::Left((Ok(_), buf, Some(from))) => {
-                            me.dispatch(from, buf.as_slice(), v6)
+                    match select2(rx.next(), closing.wait()).await {
+                        Either::Left(Ok((from, buf))) => {
+                            let now = Instant::now();
+                            me.dispatch(from, buf.as_slice(), v6, now);
+                            drop(buf);
+                            let mut n = 1;
+                            while n < MAX_UDP_BATCH
+                                && let Some((from, buf)) = rx.try_next()
+                            {
+                                me.dispatch(from, buf.as_slice(), v6, now);
+                                n += 1;
+                            }
+                            me.round_over(now);
                         }
-                        Either::Left((Ok(_), _, None)) => {}
-                        Either::Left((Err(e), _, _)) => {
+                        Either::Left(Err(e)) => {
                             tracing::warn!(socket = i, "udp recv failed: {e}");
                             uring::sleep(std::time::Duration::from_millis(100)).await;
                         }
                         Either::Right(()) => break,
                     }
                 }
+                drop(ring);
             });
         }
     }
@@ -137,26 +210,129 @@ impl UdpDemux {
         *self.dht.borrow_mut() = Some(hook);
     }
 
-    /// Send a datagram (fire and forget, through the ring).
+    /// Install the uTP endpoint; `accept` is told about connections opened
+    /// by incoming SYNs.
+    pub fn set_utp(&self, host: Rc<UtpHost>, accept: UtpAccept) {
+        *self.utp.borrow_mut() = Some((host, accept));
+    }
+
+    /// End of a receive round.
+    fn round_over(&self, now: Instant) {
+        let host = self.utp.borrow().as_ref().map(|(h, _)| h.clone());
+        if let Some(h) = host {
+            h.drained(now);
+        }
+    }
+
+    /// Queue a datagram (fire and forget, in order, through the ring).
     pub fn send_raw(&self, to: SocketAddr, payload: Vec<u8>) {
         let Some(sock) = self.sock_for(to.ip()) else {
             return;
         };
-        let socket = sock.socket.clone();
-        uring::spawn(async move {
-            let (r, _) = socket.send_to(Buffer::from_vec(payload), to).await;
-            if let Err(e) = r {
-                tracing::trace!(%to, "udp send failed: {e}");
-            }
+        sock.queue.borrow_mut().push_back(Queued {
+            to,
+            data: payload,
+            probe: None,
         });
+        sock.kick.notify();
     }
 
-    fn dispatch(&self, from: SocketAddr, pkt: &[u8], v6: bool) {
+    /// Queue a path-MTU probe: sent alone with don't-fragment set (IPv4),
+    /// `on_result` gets the outcome (`EMSGSIZE` = too big for the path).
+    pub fn send_probe(
+        &self,
+        to: SocketAddr,
+        payload: Vec<u8>,
+        on_result: Box<dyn FnOnce(uring::Result<u32>)>,
+    ) {
+        let Some(sock) = self.sock_for(to.ip()) else {
+            return;
+        };
+        sock.queue.borrow_mut().push_back(Queued {
+            to,
+            data: payload,
+            probe: Some(on_result),
+        });
+        sock.kick.notify();
+    }
+
+    /// The send loop of socket `i`.
+    async fn send_loop(me: Rc<Self>, i: usize, closing: Rc<Flag>) {
+        let Some(sock) = me.socks.get(i) else { return };
+        let socket = sock.socket.clone();
+        loop {
+            if sock.queue.borrow().is_empty() {
+                match select2(sock.kick.wait(), closing.wait()).await {
+                    Either::Left(()) => {}
+                    Either::Right(()) => break,
+                }
+            }
+            // Plain datagrams up to the batch size, stopping at a probe.
+            let mut batch = Vec::new();
+            let mut probe = None;
+            {
+                let mut q = sock.queue.borrow_mut();
+                while batch.len() < SEND_BATCH {
+                    match q.front() {
+                        None => break,
+                        Some(f) if f.probe.is_some() => {
+                            if batch.is_empty()
+                                && let Some(p) = q.pop_front()
+                            {
+                                probe = Some(p);
+                            }
+                            break;
+                        }
+                        Some(_) => {
+                            if let Some(p) = q.pop_front() {
+                                batch.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let sends: Vec<_> = batch
+                    .into_iter()
+                    .map(|q| socket.send_to(Buffer::from_vec(q.data), q.to))
+                    .collect();
+                for (r, _) in super::local::join_all(sends).await {
+                    if let Err(e) = r {
+                        tracing::trace!(socket = i, "udp send failed: {e}");
+                    }
+                }
+            }
+            if let Some(p) = probe {
+                let df = socket.set_dont_fragment(true).is_ok();
+                let (r, _) = socket.send_to(Buffer::from_vec(p.data), p.to).await;
+                if df {
+                    let _ = socket.set_dont_fragment(false);
+                }
+                if let Some(cb) = p.probe {
+                    cb(r);
+                }
+            }
+        }
+    }
+
+    fn dispatch(&self, from: SocketAddr, pkt: &[u8], v6: bool, now: Instant) {
         // KRPC messages are bencoded dictionaries; tracker replies never
         // start with 'd' (their first field is a big-endian action).
         if pkt.first() == Some(&b'd') {
             if let Some(h) = self.dht.borrow().as_ref() {
                 h(from, pkt, v6);
+            }
+            return;
+        }
+        // uTP: version nibble 1 in the first byte (a tracker reply's first
+        // byte is the high byte of a small action, 0).
+        if utp::is_utp(pkt) {
+            let host = self.utp.borrow().as_ref().map(|(h, _)| h.clone());
+            if let Some(h) = host
+                && let Some(key) = h.incoming(from, pkt, now)
+                && let Some((_, accept)) = self.utp.borrow().as_ref()
+            {
+                accept(key);
             }
             return;
         }
@@ -178,7 +354,6 @@ impl UdpDemux {
                     None => tracing::trace!(%from, "unmatched udp tracker reply"),
                 }
             }
-            // Not a tracker reply and not KRPC: uTP demux hook goes here (post-0.3.0).
             Err(_) => tracing::trace!(%from, len = pkt.len(), "udp datagram ignored"),
         }
     }

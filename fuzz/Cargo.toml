@@ -17,6 +17,7 @@ tracker = { path = "../crates/tracker" }
 profile = { path = "../crates/profile" }
 mse = { path = "../crates/mse" }
 dht = { path = "../crates/dht" }
+utp = { path = "../crates/utp" }
 
 [[bin]]
 name = "bencode_decode"
@@ -135,6 +136,13 @@ bench = false
 [[bin]]
 name = "dht_krpc"
 path = "fuzz_targets/dht_krpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "utp_packet"
+path = "fuzz_targets/utp_packet.rs"
 test = false
 doc = false
 bench = false

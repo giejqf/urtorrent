@@ -330,12 +330,67 @@ pub struct PeerInfo {
     pub connected_for: Duration,
 }
 
+/// Which transports peers are reached over, and in which order.
+///
+/// TCP is the fast path (`docs/perf.md`); uTP (BEP 29) is the compatibility
+/// transport that reaches peers only listening on UDP and yields to other
+/// traffic. libtorrent dials every new peer over uTP first; this library
+/// does not by default (maintainer decision: performance over that one L3
+/// nuance), but [`TransportPolicy::PreferUtp`] reproduces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportPolicy {
+    /// TCP only: uTP is off, incoming uTP SYNs are ignored.
+    TcpOnly,
+    /// The default: dial TCP first and accept both. A peer whose TCP dial
+    /// fails (refused, timed out, or closed before the handshake) gets one
+    /// uTP attempt right away and is dialled over uTP from then on while
+    /// that keeps working.
+    #[default]
+    PreferTcp,
+    /// libtorrent's behaviour: dial uTP first (every peer is assumed to
+    /// speak it), fall back to TCP at once when the uTP attempt fails and
+    /// remember; accept both.
+    PreferUtp,
+    /// uTP only (qBittorrent's "μTP only"): every dial is uTP, accepted TCP
+    /// connections are dropped.
+    UtpOnly,
+}
+
+impl TransportPolicy {
+    /// Whether TCP connections are accepted.
+    pub fn tcp_incoming(self) -> bool {
+        !matches!(self, TransportPolicy::UtpOnly)
+    }
+
+    /// Whether peers are ever dialled over TCP.
+    pub fn tcp_outgoing(self) -> bool {
+        !matches!(self, TransportPolicy::UtpOnly)
+    }
+
+    /// Whether uTP SYNs are accepted.
+    pub fn utp_incoming(self) -> bool {
+        !matches!(self, TransportPolicy::TcpOnly)
+    }
+
+    /// Whether peers are ever dialled over uTP.
+    pub fn utp_outgoing(self) -> bool {
+        !matches!(self, TransportPolicy::TcpOnly)
+    }
+
+    /// Whether the first dial to a fresh address is uTP.
+    pub fn utp_first(self) -> bool {
+        matches!(self, TransportPolicy::PreferUtp | TransportPolicy::UtpOnly)
+    }
+}
+
 /// The byte transport under a peer connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PeerTransport {
-    /// Plain TCP (the only transport in 0.x; uTP is planned).
+    /// Plain TCP.
     Tcp,
+    /// uTP (BEP 29) over the listen port's UDP socket.
+    Utp,
 }
 
 /// Session-wide counters.
@@ -375,6 +430,8 @@ pub struct SessionStats {
     pub dht_lookups: usize,
     /// Peers other nodes announced to us and we store for them.
     pub dht_stored_peers: usize,
+    /// Live uTP connections, including ones finishing their close handshake.
+    pub utp_connections: usize,
 }
 
 /// Something that happened in the engine.
@@ -672,6 +729,14 @@ impl SessionBuilder {
     /// its own `ro`.
     pub fn dht_read_only(mut self, on: bool) -> Self {
         self.cfg.dht_read_only = on;
+        self
+    }
+
+    /// Which peer transports to use and in which order (default
+    /// [`TransportPolicy::PreferTcp`]). The transport a peer ended up on
+    /// shows in [`PeerInfo::transport`].
+    pub fn transports(mut self, policy: TransportPolicy) -> Self {
+        self.cfg.transports = policy;
         self
     }
 

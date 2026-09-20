@@ -89,6 +89,9 @@ fn zero_torrent(name: &str, size: u64, piece_len: u32, salt: u64) -> Vec<u8> {
 
 static DISK_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static ZERO_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `--utp`: uTP-only engines, to measure that data path (the default policy
+/// dials TCP first).
+static UTP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn session(ip: Ipv4Addr, max_peers: usize) -> Result<Session> {
     Ok(block_on(
@@ -102,6 +105,11 @@ fn session(ip: Ipv4Addr, max_peers: usize) -> Result<Session> {
             .hash_threads(2)
             .disk_thread(DISK_THREAD.load(std::sync::atomic::Ordering::Relaxed))
             .zero_copy_send(ZERO_COPY.load(std::sync::atomic::Ordering::Relaxed))
+            .transports(if UTP.load(std::sync::atomic::Ordering::Relaxed) {
+                urtorrent::TransportPolicy::UtpOnly
+            } else {
+                urtorrent::TransportPolicy::PreferTcp
+            })
             .build(),
     )?)
 }
@@ -354,6 +362,10 @@ fn main() -> Result<()> {
         }
         if k == "--zero-copy" {
             ZERO_COPY.store(true, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        if k == "--utp" {
+            UTP.store(true, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
         let v = args.next().with_context(|| format!("{k} needs a value"))?;

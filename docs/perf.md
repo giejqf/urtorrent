@@ -108,3 +108,27 @@ Known limits:
   with that setting.
 - Web seed requests are capped at 4 MiB each (libtorrent asks for up to
   16 MiB); an accepted L3 difference.
+
+### uTP (2026-09-20, 0.4.0)
+
+`soak transfer --size 1G` (1 MiB pieces, both engines in one process, release
+build); the default policy dials TCP, `--utp` runs uTP-only engines:
+
+| Transport | Rate | CPU (user + sys) | Notes |
+|---|---|---|---|
+| TCP (default) | 232 MiB/s | 5.4 + 2.5 s | unchanged data path (ADR 0006) |
+| uTP (`--utp`) | 62 MiB/s | 8.1 + 8.2 s | one 1471-byte datagram per packet, an ack per receive round, payload copied once into the reorder queue and once into packets |
+
+This gap is why TCP stays the default transport (`TransportPolicy::PreferTcp`)
+rather than libtorrent's uTP-first order. uTP is the compatibility
+transport, not the fast path: LEDBAT yields to TCP by design and
+libtorrent's own uTP tops out in the same range on loopback (the
+oracle-to-oracle capture moved 4 MiB in ~60 ms). Two things
+mattered for it to work at all at this rate: draining the UDP socket with
+one multishot `recvmsg` per socket (256 × 2 KiB provided buffers, up to 64
+datagrams per wakeup), and an ordered per-socket send queue that submits
+32 datagrams per ring round trip — submitting a whole congestion window as
+one burst reordered packets and overflowed the receiver's socket buffer,
+which the oracle answered with selective acks and retransmits. Zero-copy
+sends and larger batches are the obvious next steps if uTP throughput
+ever matters. `xtask syscalls` covers both transports.

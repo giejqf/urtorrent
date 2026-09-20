@@ -392,3 +392,50 @@ fn zero_copy_vectored_send() {
         drop(client);
     });
 }
+
+#[test]
+fn udp_multishot_recvmsg_with_buffer_ring() {
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on(async {
+        for (bind, bgid) in [("127.0.0.1:0", 21u16), ("[::1]:0", 22u16)] {
+            let a = UdpSocket::bind(bind.parse().unwrap()).unwrap();
+            let b = UdpSocket::bind(bind.parse().unwrap()).unwrap();
+            let ring = uring::BufRing::new(bgid, 8, 2048).unwrap();
+            let mut rx = b.recv_multi(&ring);
+            // 40 datagrams of distinct sizes with a ring of 8: the ring runs
+            // dry while nobody reads, ENOBUFS re-arms transparently.
+            for i in 0..40u32 {
+                let payload = vec![i as u8; 100 + i as usize * 30];
+                let (r, _) = a.send_to(Buffer::from_vec(payload), b.local_addr()).await;
+                assert!(r.is_ok());
+            }
+            let mut got = std::collections::BTreeSet::new();
+            while got.len() < 40 {
+                match timeout(std::time::Duration::from_millis(500), rx.next()).await {
+                    Ok(Ok((from, buf))) => {
+                        assert_eq!(from, a.local_addr());
+                        let i = buf.as_slice()[0];
+                        assert_eq!(buf.len(), 100 + usize::from(i) * 30);
+                        assert!(buf.as_slice().iter().all(|&x| x == i));
+                        got.insert(i);
+                        // Drain what else is queued without waiting.
+                        while let Some((from, buf)) = rx.try_next() {
+                            assert_eq!(from, a.local_addr());
+                            let i = buf.as_slice()[0];
+                            assert_eq!(buf.len(), 100 + usize::from(i) * 30);
+                            got.insert(i);
+                        }
+                    }
+                    Ok(Err(e)) => panic!("recv: {e}"),
+                    // Datagrams stay queued in the socket while the ring is
+                    // dry; nothing is lost.
+                    Err(_) => panic!("only {} datagrams received", got.len()),
+                }
+            }
+            assert_eq!(got.len(), 40);
+            // A DF toggle is accepted (v4) or a no-op (v6).
+            a.set_dont_fragment(true).unwrap();
+            a.set_dont_fragment(false).unwrap();
+        }
+    });
+}

@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-20
+
+uTP (BEP 29). TCP stays the default transport; uTP accepts incoming
+connections and reaches peers TCP cannot (`TransportPolicy`). The wire shape
+matches the oracle's on every probed detail (`utp_shape`, `xtask diff`).
+
+### Added
+
+- `crates/utp`: a sans-IO uTP implementation ported from libtorrent 2.0.14's
+  `utp_stream` (ADR 0008): LEDBAT with slow start, RTT-based retransmission
+  timeouts, fast resends, selective acks, nagle, the close-reason
+  extension, path-MTU discovery with libtorrent's probe ladder, and the
+  per-port connection table (`utp::Manager`) with deferred acks.
+- `SessionBuilder::transports(TransportPolicy)`: `PreferTcp` (default: dial
+  TCP, accept both, one immediate uTP attempt for an address whose TCP dial
+  failed or died before the handshake), `PreferUtp` (libtorrent's uTP-first
+  order with TCP fallback), `UtpOnly` (qBittorrent's "μTP only"), `TcpOnly`.
+  `PeerTransport::Utp`; `PeerInfo::transport` reports it.
+  `SessionStats::utp_connections`.
+- Close reasons: our disconnect reasons travel in the FIN as libtorrent's
+  `close_reason_t` codes (`both seeds` = 6, ...).
+- `uring::UdpSocket::recv_multi` (multishot `recvmsg` into a provided
+  buffer ring), `uring::RecvMsgMulti`, `RingBuf::advance`,
+  `UdpSocket::set_dont_fragment`, `uring::monotonic_micros`,
+  `uring::Error::is_message_too_long`.
+- Testkit: `capture_utp` goldens (`utp-shape.json`), a pcap reader and uTP
+  decoder (`testkit::utp_capture`), `UtpFingerprint` in the discriminator,
+  scenarios `utp_leech_from_oracle` (v4/v6), `utp_seed_to_oracle`,
+  `utp_shape` (differential); `urt-client --protocol both|tcp|utp|utp-first`.
+  `xtask soak --utp`. Fuzz
+  target `utp_packet`. `xtask syscalls` transfers over TCP and uTP.
+- `docs/quirks.md` Q21 (uTP wire shape, the oracle's uTP-first dialling as
+  an accepted difference, the FIN-round data drop, `implied_port` with uTP
+  on).
+
+### Changed
+
+- The listen port's UDP sockets receive through one multishot `recvmsg`
+  per socket (DHT, UDP trackers and uTP share it) and send through an
+  ordered per-socket queue, 32 datagrams per ring round trip.
+- DHT announces carry `implied_port: 1` while incoming uTP is enabled
+  (libtorrent's rule); the DHT lab scenarios run our client with uTP off,
+  matching the oracle's primary capture configuration.
+- `oracle_utp_tcp_fallback` runs us TCP-only so the oracle's TCP fallback
+  is what gets exercised.
+- The `native` profile's version tags are `0.4.0` / `-UR0040-`.
+
 ## [0.3.0] - 2026-09-20
 
 The DHT (BEP 5). Peers now also come from the Mainline DHT; the public API

@@ -45,6 +45,19 @@ logic carry the original copyright notice; the list is maintained here:
       filters, BEP 51 samples), dos_blocker.cpp.
   crates/session/src/engine/dht.rs
       The announce round-robin follows session_impl.cpp (on_dht_announce).
+  crates/utp/src/socket.rs, manager.rs, packet_buffer.rs, history.rs
+      The uTP implementation ports libtorrent's utp_stream.cpp (LEDBAT
+      congestion control, slow start, RTT / timeout estimation, loss and
+      fast-resend handling, nagle, selective acks, close reason, path-MTU
+      discovery, the close handshake), utp_socket_manager.cpp (connection
+      ids, SYN acceptance, deferred acks, MTU restriction), packet_buffer.cpp
+      (the sequence-number-indexed ring), timestamp_history.cpp and
+      sliding_average.hpp.
+  crates/session/src/engine/peer.rs
+      The uTP-first transport choice and the TCP fallback after a failed uTP
+      dial follow torrent.cpp (connect_to_peer), torrent_peer.cpp
+      (supports_utp) and peer_connection.cpp (on_connection_complete,
+      on_connect_timeout); the close reason codes follow close_reason.hpp.
   crates/picker/src/lib.rs
       Piece extent affinity (extent size, the five recent extents, when an
       extent is recorded) follows piece_picker.cpp

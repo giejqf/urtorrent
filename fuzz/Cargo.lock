@@ -22,7 +22,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bencode"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "thiserror",
 ]
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "dht"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bencode",
  "metainfo",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "metainfo"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bencode",
  "sha1",
@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "mse"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "metainfo",
  "num-bigint",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "profile"
-version = "0.2.0"
+version = "0.4.0"
 
 [[package]]
 name = "quote"
@@ -311,7 +311,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "storage"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bencode",
  "metainfo",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "tracker"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bencode",
  "metainfo",
@@ -420,7 +420,7 @@ checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
 name = "uring"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -440,7 +440,17 @@ dependencies = [
  "profile",
  "storage",
  "tracker",
+ "utp",
  "wire",
+]
+
+[[package]]
+name = "utp"
+version = "0.4.0"
+dependencies = [
+ "profile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -451,7 +461,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "wire"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bencode",
  "metainfo",

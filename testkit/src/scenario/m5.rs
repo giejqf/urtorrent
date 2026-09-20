@@ -1149,8 +1149,9 @@ fn pt_tracker(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The oracle with uTP enabled (its default) leeches from us: it may try uTP
-/// first, but must end up transferring over TCP.
+/// The oracle with uTP enabled (its default) leeches from us with uTP off:
+/// libtorrent dials every new peer over uTP first, its SYN goes unanswered
+/// (3 s), and it must fall back to TCP and complete.
 fn oracle_utp_tcp_fallback(ctx: &mut Ctx) -> Result<()> {
     let tracker = tap_tracker_http(ctx)?;
     let fx = Arc::new(Fixture::generate(
@@ -1166,7 +1167,9 @@ fn oracle_utp_tcp_fallback(ctx: &mut Ctx) -> Result<()> {
     fx.write_data(&actor.log_dir.join("data"))?;
     let mut client = crate::client::UrtClient::launch(
         &actor,
-        crate::client::ClientConfig::default().profile("qbt"),
+        crate::client::ClientConfig::default()
+            .profile("qbt")
+            .protocol("tcp"),
         &torrent_path,
     )?;
     client.wait_for(Duration::from_secs(60), "seeding", |s| s.complete)?;
@@ -1196,6 +1199,22 @@ fn oracle_utp_tcp_fallback(ctx: &mut Ctx) -> Result<()> {
             .map(|p| format!("{}:{} {} conn={}", p.ip, p.port, p.client, p.connection))
             .collect::<Vec<_>>()
     ));
+    let st = client
+        .status()
+        .ok_or_else(|| anyhow::anyhow!("no client status"))?;
+    ensure!(
+        st.peers_seen
+            .iter()
+            .chain(st.peer_list.iter())
+            .all(|p| p.transport != "Utp"),
+        "a uTP connection with uTP disabled: {:?}",
+        st.peers_seen
+    );
+    ensure!(
+        st.utp_connections == 0,
+        "utp connections: {}",
+        st.utp_connections
+    );
     client.shutdown()?;
     Ok(())
 }

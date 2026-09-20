@@ -109,7 +109,7 @@ fn syscalls() -> Result<()> {
 }
 
 /// `cargo xtask soak [transfer|many|all] [--size 2G] [--piece 1M]
-/// [--torrents 500]`: the release-built `urt-soak` binary against
+/// [--torrents 500] [--utp] [--zero-copy] [--inline-disk]`: the release-built `urt-soak` binary against
 /// `target/soak`.
 fn soak(args: &[String]) -> Result<()> {
     run(

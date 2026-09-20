@@ -8,7 +8,7 @@
 | Fuzz | `fuzz/` | `cargo xtask fuzz <target> [secs]` |
 | Replay | crate tests fed from `testkit/golden` | `cargo xtask check` |
 | Integration | `testkit/src/scenario` | `cargo xtask it [--shape v4\|v6\|dual] [scenario]` |
-| Differential | scenarios tagged `Diff` (`diff_identity`, `mse_shape`, `dual_stack_announce`, `pex_discovery`, `web_seed_only`, ...) | `cargo xtask diff` |
+| Differential | scenarios tagged `Diff` (`diff_identity`, `mse_shape`, `dual_stack_announce`, `pex_discovery`, `web_seed_only`, `dht_shape`, `utp_shape`, ...) | `cargo xtask diff` |
 | Captures | scenarios tagged `Capture` | `cargo xtask capture` |
 | Enforcement | `xtask syscalls` (uring probe + real session under `strace -f -Y`) | `cargo xtask syscalls` |
 | Soak / perf | `testkit/src/bin/urt-soak.rs` | `cargo xtask soak [transfer\|many\|all] [--size 20G] [--torrents 500]` (see `docs/perf.md`) |
@@ -83,6 +83,10 @@ identity and wire shape (AGENTS.md 6). Formats:
   the decoded dictionary (binary strings as hex). `capture_dht` also records
   the oracle's replies to a fixed probe list (every query kind, good and
   bad); the `dht_shape` scenario replays that list against us.
+- `utp-shape.json`: a compact summary of a pcap of uTP traffic decoded by
+  `testkit::utp_capture` (the first packets, every SYN/FIN/RESET, packets
+  carrying extensions, the ST_DATA payload-size histogram, the largest
+  datagram). The pcap itself stays in the run directory (git-ignored).
 
 Bumping `testkit/oracle.lock` regenerates all of them in the same PR.
 
@@ -94,7 +98,9 @@ peer-id prefix, `User-Agent`, header and parameter order, escape style,
 `key` format, `numwant`/flags, reserved bits, LTEP `m`/keys/`reqq`/`v`, the
 first-messages sequence; for the DHT the `v` tag, transaction id length,
 bootstrap / lookup / announce argument sets, replies to the probe list and
-the `port` position). `diff(a, b)` lists the tells; `classify` compares against the
+the `port` position; for uTP the SYN, SYN-ACK and first-data shapes, the
+initial window, the path-MTU probe ladder and largest datagram, the FIN
+shape and FIN-ack extensions, from a pcap). `diff(a, b)` lists the tells; `classify` compares against the
 oracle's fingerprint computed from the committed goldens. `diff_identity`
 runs the oracle, us (qbt and native) and Transmission through the same taps
 and asserts the discriminator separates exactly the right ones. When a new

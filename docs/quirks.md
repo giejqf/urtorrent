@@ -321,3 +321,65 @@ Capability gap: BEP 44 `put` is not implemented (we answer `unknown
 message`; the oracle stores the item). `get` is answered like the oracle's
 "no such item" reply (nodes + token). A DHT-aware discriminator that probes
 `put` would tell us apart; `dht_shape` does not.
+
+## Q21. uTP (BEP 29) wire shape: libtorrent's `utp_stream`
+
+Capture: `testkit/golden/capture_utp/{v4,v6}/utp-shape.json` (two oracles,
+uTP only, cleartext). Confirmed in libtorrent 2.0.14 `utp_stream.cpp`,
+`utp_socket_manager.cpp`, `torrent.cpp`, `torrent_peer.cpp`,
+`peer_connection.cpp`. Everything here is mirrored by `crates/utp` and the
+engine and checked by shape in `utp_shape` (`xtask diff`):
+
+- **The oracle dials every new peer over uTP first.**
+  `torrent_peer::supports_utp` starts true ("assume peers support utp"); a
+  peer is dialled over TCP only after a uTP attempt to it failed (then
+  immediately, `fast_reconnect`), or when uTP is disabled. A PEX `added`
+  flag `0x04` re-enables uTP for an address. **Accepted difference (L3,
+  maintainer decision 2026-09-20):** we dial TCP first by default because it
+  performs better, and go to uTP for an address only after its TCP dial
+  failed or was closed before the handshake; `TransportPolicy::PreferUtp`
+  reproduces the oracle's order when wanted. Our own PEX entries carry the
+  flag for peers connected over uTP, as the oracle's do.
+- **SYN**: type/version `0x41`, no extension, `connection_id` = the id we
+  will *receive* on (the peer replies with it and sends data with id + 1),
+  `wnd_size` 0, `ack_nr` 0, `timestamp_difference` 0, 20 bytes. It is never
+  retransmitted: an unconfirmed connection fails at its first (3 s) timeout.
+- **SYN-ACK** is a bare ST_STATE with a random `seq_nr`, `ack_nr` = the SYN's
+  `seq_nr`, `wnd_size` 1 048 576 (the receive buffer capacity). The
+  connector's first ST_DATA carries `seq = syn + 1` and `ack = peer_seq - 1`
+  (a STATE consumes no sequence number). The acceptor acks that data with a
+  bare STATE before its own first ST_DATA (the ack is deferred to the end
+  of the receive round; the BitTorrent handshake reply comes from the peer
+  layer afterwards).
+- **Path-MTU probing**: the search runs between a 548-byte floor
+  (`576 - 20 - 8`) and the link ceiling (`1500 - 8 - 20` = 1472 for v4,
+  1452 for v6, 1280-based for Teredo). Probes carry the mid-point size, all
+  other packets the floor; an acked probe raises the floor, so payload
+  sizes climb 528, 990, 1221, 1336, 1394, 1423, 1437, 1444, 1448, 1450, 1451
+  (v4) and the largest datagram is `ceiling - 1` (1471 / 1451). Probes are
+  sent with DF on IPv4 only.
+- **Extensions**: selective acks (type 1) sized `ceil(reorder span / 8)`
+  bytes whenever the reorder buffer is non-empty; the close reason (type 3,
+  4 bytes: two reserved + a `close_reason_t` code) on the FIN and on any
+  ack sent after the reason was set. Two seeds parting send reason 6
+  (`upload_to_upload`); a peer closing on end-of-stream sends none.
+- **Data delivered in the same receive round as the FIN is dropped.**
+  libtorrent copies the payload into the outstanding read and then reports
+  the read with `eof` when the FIN completes the stream in the same round;
+  `peer_connection::on_receive_data` discards the bytes on any error. The
+  visible effect: a leecher's last `have` followed at once by its FIN is
+  not acted upon by the seeder, whose FIN then carries no close reason
+  (when the two land in different rounds the `have` completes the peer's
+  bitfield and the seeder closes with reason 6). Timing-dependent in the
+  oracle; we reproduce the rule (`utp::Socket::end_round`), and `utp_shape`
+  compares the FIN shape in the role where the client closes on its own.
+- **Unknown connections get no ST_RESET**; stray non-SYN packets and SYNs
+  with uTP disabled are ignored silently.
+- **`implied_port`** appears in DHT announces only with uTP enabled
+  (Q20 noted its absence with uTP off); with uTP on the oracle announces
+  `implied_port: 1`. Our DHT announce follows the same rule.
+
+Accepted differences: the number of floor-sized packets between two probe
+steps and the ack cadence depend on how fast the application drains its
+buffers (L3 timing); a burst's exact pacing differs (we submit 32 datagrams
+per ring round trip, libtorrent one per `sendto`).

@@ -42,6 +42,8 @@ struct Args {
     lsd: bool,
     /// DHT routers; empty = DHT off (never the public defaults in the lab).
     dht_routers: Vec<String>,
+    /// `both` (TCP first) / `utp-first` / `tcp` / `utp`.
+    protocol: String,
     pex: bool,
     add_peers: Vec<std::net::SocketAddr>,
     file_priorities: Option<Vec<u8>>,
@@ -68,6 +70,7 @@ fn parse_args() -> Result<Args> {
         encryption: "enabled".into(),
         lsd: true,
         dht_routers: Vec::new(),
+        protocol: "both".into(),
         pex: true,
         add_peers: Vec::new(),
         file_priorities: None,
@@ -80,6 +83,7 @@ fn parse_args() -> Result<Args> {
             "--magnet" => a.magnet = Some(val()?),
             "--no-lsd" => a.lsd = false,
             "--dht-router" => a.dht_routers.push(val()?),
+            "--protocol" => a.protocol = val()?,
             "--no-pex" => a.pex = false,
             "--add-peer" => a.add_peers.push(val()?.parse()?),
             "--file-priorities" => a.file_priorities = Some(parse_priorities(&val()?)?),
@@ -103,7 +107,7 @@ fn parse_args() -> Result<Args> {
     }
     if (a.torrent.as_os_str().is_empty() && a.magnet.is_none()) || a.save.as_os_str().is_empty() {
         bail!(
-            "usage: urt-client (--torrent <file> | --magnet <uri>) --save <dir> [--resume <dir>] [--status <file>] [--control <file>] [--listen-port N] [--profile native|qbt] [--v4 ip|--no-v4] [--v6 ip|--no-v6] [--exit-when-complete] [--sequential] [--no-lsd] [--no-pex] [--dht-router ip:port]... [--add-peer ip:port]..."
+            "usage: urt-client (--torrent <file> | --magnet <uri>) --save <dir> [--resume <dir>] [--status <file>] [--control <file>] [--listen-port N] [--profile native|qbt] [--v4 ip|--no-v4] [--v6 ip|--no-v6] [--exit-when-complete] [--sequential] [--no-lsd] [--no-pex] [--dht-router ip:port]... [--protocol both|tcp|utp|utp-first] [--add-peer ip:port]..."
         );
     }
     Ok(a)
@@ -123,6 +127,7 @@ fn peer_json(p: &urtorrent::PeerInfo) -> serde_json::Value {
         "encrypted": p.encrypted,
         "source": format!("{:?}", p.source),
         "upload_only": p.upload_only,
+        "transport": format!("{:?}", p.transport),
     })
 }
 
@@ -155,6 +160,13 @@ async fn main() -> Result<()> {
         .pex(args.pex)
         .dht(!args.dht_routers.is_empty())
         .dht_bootstrap_nodes(args.dht_routers.clone());
+    builder = builder.transports(match args.protocol.as_str() {
+        "both" => urtorrent::TransportPolicy::PreferTcp,
+        "utp-first" => urtorrent::TransportPolicy::PreferUtp,
+        "tcp" => urtorrent::TransportPolicy::TcpOnly,
+        "utp" => urtorrent::TransportPolicy::UtpOnly,
+        other => bail!("unknown protocol {other}"),
+    });
     if args.no_v4 {
         builder = builder.listen_v4(None);
     } else if let Some(v4) = args.v4 {
@@ -255,6 +267,7 @@ async fn main() -> Result<()> {
                 "dht_nodes": stats.dht_nodes,
                 "dht_lookups": stats.dht_lookups,
                 "dht_stored_peers": stats.dht_stored_peers,
+                "utp_connections": stats.utp_connections,
             });
             write_status(p, &v);
         }

@@ -33,6 +33,10 @@ pub struct ClientConfig {
     /// DHT bootstrap routers (`ip:port`); empty = DHT off. Never the
     /// library's public defaults (AGENTS.md rule 3).
     pub dht_bootstrap: Vec<std::net::SocketAddr>,
+    /// Peer transports: `both` (default: TCP first, uTP fallback and
+    /// incoming) / `utp-first` (libtorrent's order) / `tcp` / `utp`
+    /// (qBittorrent's `BTProtocol`).
+    pub protocol: String,
     /// Manually added peers (`Session::add_peer`).
     pub add_peers: Vec<std::net::SocketAddr>,
     /// Initial file priorities.
@@ -55,6 +59,7 @@ impl Default for ClientConfig {
             lsd: true,
             pex: true,
             dht_bootstrap: Vec::new(),
+            protocol: "both".into(),
             add_peers: Vec::new(),
             file_priorities: None,
             env: vec![("RUST_LOG".into(), "debug".into())],
@@ -71,6 +76,11 @@ impl ClientConfig {
         self.dht_bootstrap = routers;
         self
     }
+    pub fn protocol(mut self, p: &str) -> Self {
+        self.protocol = p.into();
+        self
+    }
+
     pub fn lsd(mut self, on: bool) -> Self {
         self.lsd = on;
         self
@@ -172,6 +182,8 @@ pub struct ClientStatus {
     #[serde(default)]
     pub dht_stored_peers: usize,
     #[serde(default)]
+    pub utp_connections: usize,
+    #[serde(default)]
     pub exited: bool,
 }
 
@@ -219,6 +231,9 @@ pub struct ClientPeer {
     pub source: String,
     #[serde(default)]
     pub upload_only: bool,
+    /// `Tcp` / `Utp`.
+    #[serde(default)]
+    pub transport: String,
 }
 
 /// A running client.
@@ -303,6 +318,7 @@ impl UrtClient {
         if !config.lsd {
             cmd.arg("--no-lsd");
         }
+        cmd.arg("--protocol").arg(&config.protocol);
         for r in &config.dht_bootstrap {
             cmd.arg("--dht-router").arg(r.to_string());
         }

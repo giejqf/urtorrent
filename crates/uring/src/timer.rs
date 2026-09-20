@@ -37,3 +37,19 @@ pub async fn timeout<F: Future>(dur: Duration, future: F) -> Result<F::Output> {
     })
     .await
 }
+
+/// `CLOCK_MONOTONIC` in microseconds (time since boot, what libtorrent
+/// stamps into uTP headers). A plain syscall, not I/O.
+pub fn monotonic_micros() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes a timespec through a valid pointer.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+    u64::try_from(ts.tv_sec).unwrap_or(0) * 1_000_000
+        + u64::try_from(ts.tv_nsec).unwrap_or(0) / 1000
+}

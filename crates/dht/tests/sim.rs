@@ -141,7 +141,7 @@ impl Net {
 /// answers a refresh probe, one every 5 s), so time passes between joins —
 /// as in libtorrent, a cold router hands out nobody it has not pinged.
 fn small_network(n: u8) -> Net {
-    let mut net = Net::new(n, Some(b"UR\x00\x03".to_vec()));
+    let mut net = Net::new(n, Some(b"UR\x00\x04".to_vec()));
     for i in 2..=n {
         let now = net.now;
         net.node(i).add_router(addr(1));
@@ -183,7 +183,7 @@ fn bootstrap_learns_the_network_and_marks_router_queries() {
             ..
         }
     ));
-    assert_eq!(q.version.as_deref(), Some(&b"UR\x00\x03"[..]));
+    assert_eq!(q.version.as_deref(), Some(&b"UR\x00\x04"[..]));
     assert_eq!(q.tid.len(), 2);
     // Bootstrap completion was reported.
     assert!(
