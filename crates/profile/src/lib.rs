@@ -255,6 +255,10 @@ pub struct LtepExtension {
 pub struct LtepShape {
     /// The `m` map (bencode sorts keys on the wire; this is the set + ids).
     pub m: &'static [LtepExtension],
+    /// The `m` map for **private** torrents (BEP 27): libtorrent attaches
+    /// neither `ut_pex` nor `ut_metadata` to a private torrent, and sends no
+    /// `metadata_size` (docs/quirks.md Q11).
+    pub m_private: &'static [LtepExtension],
     /// `reqq`: the request queue depth we advertise.
     pub reqq: u32,
     /// Whether `complete_ago` is sent (libtorrent extra; `-1` when unknown).
@@ -278,15 +282,10 @@ pub enum FirstMessage {
     /// The LTEP extended handshake (only if both sides set the LTEP bit).
     ExtendedHandshake,
     /// `have_all` / `have_none` when the fast extension is negotiated and we
-    /// have all / no pieces; otherwise a `bitfield` (omitted if empty and
-    /// fast is off, matching BEP 3's "may be omitted" allowance is *not*
-    /// used: libtorrent always sends it).
+    /// have all / no pieces; otherwise a `bitfield`, omitted when we have no
+    /// pieces and fast is off (libtorrent `write_bitfield`). Nothing at all
+    /// before the metadata is known (magnet links).
     HaveState,
-    /// `allowed_fast` for the peer's BEP 6 set (fast extension only), for
-    /// the pieces we have. Nothing is sent when we have no pieces (the oracle
-    /// as a leecher sent none; as a seed it sent `allowed_fast_count`).
-    /// UNVERIFIED for a partial seed: whether pieces we lack are announced.
-    AllowedFast,
 }
 
 /// Which address bytes seed the BEP 6 allowed-fast set.
@@ -309,7 +308,8 @@ pub struct PeerShape {
     pub allowed_fast_addr: AllowedFastAddr,
     /// Messages sent immediately after the handshake, in order.
     pub first_messages: &'static [FirstMessage],
-    /// Number of `allowed_fast` pieces we grant (BEP 6); 0 disables.
+    /// Number of `allowed_fast` pieces we grant (BEP 6) on the peer's first
+    /// `interested`, skipping pieces it has; 0 disables.
     pub allowed_fast_count: u32,
     /// Maximum number of outstanding incoming requests we accept per peer
     /// (what `reqq` advertises).
@@ -425,15 +425,55 @@ const QBT_LTEP_M: &[LtepExtension] = &[
     },
 ];
 
-/// Our own `m` map: only what is implemented (M6 adds `ut_pex`, `ut_metadata`,
-/// `upload_only`).
-const NATIVE_LTEP_M: &[LtepExtension] = &[];
-
-const FIRST_MESSAGES: &[FirstMessage] = &[
-    FirstMessage::ExtendedHandshake,
-    FirstMessage::HaveState,
-    FirstMessage::AllowedFast,
+/// The oracle's `m` map for private torrents (`capture_peer_private`):
+/// `{lt_donthave: 7, share_mode: 8, upload_only: 3, ut_holepunch: 4}`.
+const QBT_LTEP_M_PRIVATE: &[LtepExtension] = &[
+    LtepExtension {
+        name: "upload_only",
+        id: 3,
+    },
+    LtepExtension {
+        name: "ut_holepunch",
+        id: 4,
+    },
+    LtepExtension {
+        name: "lt_donthave",
+        id: 7,
+    },
+    LtepExtension {
+        name: "share_mode",
+        id: 8,
+    },
 ];
+
+/// Our own `m` map: what is implemented (`ut_pex`, `ut_metadata`,
+/// `upload_only`; the ids follow libtorrent's so peers see familiar values).
+const NATIVE_LTEP_M: &[LtepExtension] = &[
+    LtepExtension {
+        name: "ut_pex",
+        id: 1,
+    },
+    LtepExtension {
+        name: "ut_metadata",
+        id: 2,
+    },
+    LtepExtension {
+        name: "upload_only",
+        id: 3,
+    },
+];
+
+/// Our own private map: no peer exchange, no metadata exchange.
+const NATIVE_LTEP_M_PRIVATE: &[LtepExtension] = &[LtepExtension {
+    name: "upload_only",
+    id: 3,
+}];
+
+/// Both profiles: LTEP handshake, then the have-state. The allowed-fast set
+/// is not a first message: libtorrent sends it on the peer's first
+/// `interested` (`capture_peer_plain`: `extended, have_all, unchoke` and
+/// only then `allowed_fast`), skipping pieces the peer has.
+const FIRST_MESSAGES: &[FirstMessage] = &[FirstMessage::ExtendedHandshake, FirstMessage::HaveState];
 
 /// The characters libtorrent draws the peer-id tail from (`url_random`):
 /// alphanumerics plus `- _ . ! ~ * ( )`. Every one of the 70 characters was
@@ -472,6 +512,7 @@ impl Profile {
             },
             ltep: LtepShape {
                 m: NATIVE_LTEP_M,
+                m_private: NATIVE_LTEP_M_PRIVATE,
                 reqq: 250,
                 complete_ago: false,
                 yourip: true,
@@ -533,6 +574,7 @@ impl Profile {
             },
             ltep: LtepShape {
                 m: QBT_LTEP_M,
+                m_private: QBT_LTEP_M_PRIVATE,
                 reqq: 2000,
                 complete_ago: true,
                 yourip: true,

@@ -23,7 +23,7 @@ use super::Ctx;
 use super::local::{Either, Flag, Notify, select2};
 use super::rate::Limiter;
 use super::torrent::{self, INACTIVITY_TIMEOUT, KEEPALIVE_AFTER, REQUEST_TIMEOUT, Torrent};
-use crate::api::{EncryptionMode, Event, PeerInfo};
+use crate::api::{EncryptionMode, Event, PeerInfo, PeerSource};
 
 /// Time allowed for an incoming peer to send its handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,6 +63,16 @@ pub struct PeerHandle {
     cipher: RefCell<Cipher>,
     /// Negotiated encryption, for `PeerInfo`.
     pub encrypted: Cell<bool>,
+    /// How we learned of the peer.
+    pub source: PeerSource,
+    /// The listen port the peer advertised (LTEP `p`).
+    pub listen_port: Cell<Option<u16>>,
+    /// The peer advertised `ut_holepunch`.
+    pub holepunch: Cell<bool>,
+    /// BEP 11 state.
+    pub pex: RefCell<super::pex::PeerState>,
+    /// BEP 9 state.
+    pub meta: RefCell<super::metadata::PeerState>,
 }
 
 /// The RC4 layer between the socket and `wire` (absent for plaintext).
@@ -84,6 +94,7 @@ impl PeerHandle {
         incoming: bool,
         conn: Connection,
         pieces: usize,
+        source: PeerSource,
     ) -> PeerHandle {
         let now = Instant::now();
         PeerHandle {
@@ -110,7 +121,52 @@ impl PeerHandle {
             last_unchoke: Cell::new(None),
             cipher: RefCell::new(Cipher::default()),
             encrypted: Cell::new(false),
+            source,
+            listen_port: Cell::new(None),
+            holepunch: Cell::new(false),
+            pex: RefCell::new(Default::default()),
+            meta: RefCell::new(Default::default()),
         }
+    }
+
+    /// The address this peer is exchanged under (BEP 11): the remote address
+    /// of a connection we dialled; for an incoming one, its IP with the
+    /// listen port it advertised, or nothing.
+    pub fn pex_addr(&self) -> Option<SocketAddr> {
+        if !self.incoming {
+            return Some(self.addr);
+        }
+        self.listen_port
+            .get()
+            .filter(|p| *p != 0)
+            .map(|p| SocketAddr::new(self.addr.ip(), p))
+    }
+
+    /// BEP 21: tell the peer whether we are upload-only.
+    pub fn send_upload_only(&self, on: bool) {
+        let payload = wire::ext::upload_only_payload(on);
+        if self.conn.borrow_mut().extended("upload_only", &payload) {
+            self.out.notify();
+        }
+    }
+
+    /// The metadata became known (BEP 9): size the connection, announce our
+    /// have-state, refresh availability and interest.
+    pub fn on_metadata(&self, torrent: &Rc<RefCell<Torrent>>, pieces: usize, have: &Bitfield) {
+        let r = self.conn.borrow_mut().set_metadata(pieces, have.clone());
+        match r {
+            Ok(_) => {}
+            Err(e) => {
+                self.close(&format!("protocol: {e}"));
+                return;
+            }
+        }
+        let mut t = torrent.borrow_mut();
+        *self.last_have.borrow_mut() = Bitfield::new(pieces);
+        self.sync_availability(&mut t.picker, pieces);
+        self.update_interest(&t.picker);
+        self.send_upload_only(t.is_complete());
+        self.out.notify();
     }
 
     /// Choke or unchoke (choker decision). Choking drops the upload queue;
@@ -158,6 +214,7 @@ impl PeerHandle {
         let have = conn.peer_have();
         PeerInfo {
             addr: self.addr,
+            source: self.source,
             peer_id: self.peer_id.get(),
             client: self.client.borrow().clone(),
             incoming: self.incoming,
@@ -173,6 +230,7 @@ impl PeerHandle {
             am_interested: conn.am_interested(),
             outstanding: conn.outstanding().len(),
             encrypted: self.encrypted.get(),
+            upload_only: conn.peer_upload_only() || have.is_seed(pieces),
         }
     }
 
@@ -215,7 +273,7 @@ impl PeerHandle {
 
     /// As [`PeerHandle::fill_requests`], with the torrent already borrowed.
     pub fn fill_requests_locked(&self, t: &mut Torrent, ctx: &Ctx) {
-        if !t.is_running() || t.picker.is_complete() {
+        if !t.is_running() || !t.has_metadata() || t.is_complete() {
             return;
         }
         let mut conn = self.conn.borrow_mut();
@@ -304,17 +362,21 @@ fn connection_params(
 ) -> ConnectionParams {
     ConnectionParams {
         role,
-        info_hash: t.info.info_hash,
+        info_hash: t.info_hash,
         our_peer_id: t.peer_id,
         profile: ctx.cfg.profile.clone(),
-        piece_count: Some(t.info.piece_count()),
-        our_have: t.storage.have(),
+        piece_count: t.info.as_ref().map(|i| i.piece_count()),
+        our_have: t
+            .storage
+            .as_ref()
+            .map_or_else(|| Bitfield::new(0), |s| s.have()),
         listen_port: ctx.listen_port,
         peer_ip: Some(peer_ip),
-        metadata_size: Some(t.metadata_size),
-        // Q6: without external-address voting (M6 candidate), a v4 listen
-        // socket matches any v4 connection; a v6 one matches nothing yet.
+        metadata_size: t.has_metadata().then_some(t.metadata_size),
+        // Q6: without external-address voting, a v4 listen socket matches
+        // any v4 connection; a v6 one matches nothing yet.
         advertise_port: peer_ip.is_ipv4(),
+        private: t.private,
     }
 }
 
@@ -383,7 +445,24 @@ async fn mse_initiate(
 
 /// Connect out to `addr` for `torrent` and run the connection.
 pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: SocketAddr) {
-    let connected = uring::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
+    // Outgoing connections originate from the listen address when one is
+    // configured (libtorrent binds them to the listen interface).
+    let local = match addr {
+        SocketAddr::V4(_) => ctx
+            .cfg
+            .listen_v4
+            .filter(|a| !a.is_unspecified())
+            .map(std::net::IpAddr::V4),
+        SocketAddr::V6(_) => ctx
+            .cfg
+            .listen_v6
+            .filter(|a| !a.is_unspecified())
+            .map(std::net::IpAddr::V6),
+    };
+    let connected = match local {
+        Some(l) => uring::timeout(CONNECT_TIMEOUT, TcpStream::connect_from(l, addr)).await,
+        None => uring::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await,
+    };
     let (stream, use_mse) = {
         let mut t = torrent.borrow_mut();
         t.half_open = t.half_open.saturating_sub(1);
@@ -417,7 +496,7 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
         }
         (
             Connection::new(connection_params(&ctx, &t, Role::Initiator, addr.ip())),
-            t.info.info_hash,
+            t.info_hash,
         )
     };
     let _ = stream.set_nodelay(true);
@@ -452,7 +531,11 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
             }
         }
     }
-    run_connection(ctx, torrent, stream, conn, addr, false, initial, cipher).await;
+    let source = torrent.borrow().source_of(addr);
+    run_connection(
+        ctx, torrent, stream, conn, addr, false, initial, cipher, source,
+    )
+    .await;
 }
 
 /// An accepted socket: read the handshake (plaintext, or through an MSE
@@ -585,7 +668,18 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: TcpStream) {
         Connection::new(connection_params(&ctx, &t, Role::Responder, addr.ip()))
     };
     let _ = stream.set_nodelay(true);
-    run_connection(ctx, torrent, stream, conn, addr, true, raw, cipher).await;
+    run_connection(
+        ctx,
+        torrent,
+        stream,
+        conn,
+        addr,
+        true,
+        raw,
+        cipher,
+        PeerSource::Incoming,
+    )
+    .await;
 }
 
 /// The connection's main loop. `initial` holds bytes already read (the
@@ -600,10 +694,11 @@ async fn run_connection(
     incoming: bool,
     initial: Vec<u8>,
     cipher: Cipher,
+    source: PeerSource,
 ) {
     let key = ctx.new_peer_key();
-    let pieces = torrent.borrow().info.piece_count();
-    let handle = Rc::new(PeerHandle::new(key, addr, incoming, conn, pieces));
+    let pieces = torrent.borrow().piece_count();
+    let handle = Rc::new(PeerHandle::new(key, addr, incoming, conn, pieces, source));
     handle.encrypted.set(cipher.enc.is_some());
     *handle.cipher.borrow_mut() = cipher;
     torrent.borrow_mut().peers.insert(key, handle.clone());
@@ -679,7 +774,7 @@ async fn run_connection(
         t.picker.peer_gone(key);
         let last = handle.last_have.borrow().clone();
         t.picker.peer_left(&last);
-        *handle.last_have.borrow_mut() = Bitfield::new(pieces);
+        *handle.last_have.borrow_mut() = Bitfield::new(t.piece_count());
         // Q3: a plaintext attempt that died before the handshake completed
         // makes the next attempt to this address encrypted (and soon).
         if !incoming && ctx.cfg.encryption == EncryptionMode::Enabled {
@@ -701,6 +796,7 @@ async fn run_connection(
     };
     tracing::debug!(%addr, torrent = id.0, "peer disconnected: {reason}");
     if handle.peer_id.get().is_some() {
+        let pieces = torrent.borrow().piece_count();
         ctx.emit(Event::PeerDisconnected {
             id,
             addr,
@@ -811,15 +907,40 @@ async fn handle_event(
                 addr: handle.addr,
                 incoming: handle.incoming,
             });
+            // libtorrent unchokes a fresh peer right away when it has pieces
+            // and a slot is free, saving the round-trip should it be
+            // interested (`capture_peer_plain`: `have_all, unchoke` before
+            // the peer's `interested`).
+            let has_pieces = {
+                let t = torrent.borrow();
+                t.has_metadata() && t.picker.have_count() > 0
+            };
+            if has_pieces {
+                super::maybe_unchoke_now(ctx, torrent, handle);
+            }
         }
         WireEvent::ExtHandshake(ext) => {
             *handle.client.borrow_mut() = ext.v.clone();
+            handle.listen_port.set(ext.p);
+            handle
+                .holepunch
+                .set(ext.peer_id_for("ut_holepunch").is_some());
+            let mut t = torrent.borrow_mut();
+            // libtorrent `upload_upload_connection`: two upload-only ends
+            // have nothing to exchange.
+            if t.is_complete() && handle.conn.borrow().peer_upload_only() {
+                return Err("both upload-only".into());
+            }
+            super::metadata::on_ext_handshake(&mut t, handle, ext.metadata_size, Instant::now());
         }
         WireEvent::HaveChanged => {
             let mut t = torrent.borrow_mut();
-            let pieces = t.info.piece_count();
+            if !t.has_metadata() {
+                return Ok(());
+            }
+            let pieces = t.piece_count();
             handle.sync_availability(&mut t.picker, pieces);
-            if t.picker.is_complete() && handle.is_seed(pieces) {
+            if t.is_complete() && handle.is_seed(pieces) {
                 return Err("both seeds".into());
             }
             handle.update_interest(&t.picker);
@@ -875,10 +996,37 @@ async fn handle_event(
             // Free slot: unchoke right away rather than at the next round.
             super::maybe_unchoke_now(ctx, torrent, handle);
         }
-        WireEvent::NotInterested
-        | WireEvent::Port(_)
-        | WireEvent::KeepAlive
-        | WireEvent::Extended { .. } => {}
+        WireEvent::Extended { id, payload } => {
+            let name = {
+                let conn = handle.conn.borrow();
+                ["ut_pex", "ut_metadata", "upload_only", "lt_donthave"]
+                    .into_iter()
+                    .find(|n| conn.our_ext_id(n) == Some(id))
+            };
+            let now = Instant::now();
+            match name {
+                Some("ut_pex") => {
+                    let mut t = torrent.borrow_mut();
+                    super::pex::on_message(ctx, &mut t, handle, &payload, now)?;
+                }
+                Some("ut_metadata") => {
+                    super::metadata::on_message(ctx, torrent, handle, &payload, now)?;
+                }
+                Some("upload_only") => {
+                    let on = wire::ext::parse_upload_only(&payload)
+                        .map_err(|e| format!("protocol: {e}"))?;
+                    handle.conn.borrow_mut().set_peer_upload_only(on);
+                    let t = torrent.borrow();
+                    if on && t.is_complete() {
+                        return Err("both upload-only".into());
+                    }
+                }
+                // `lt_donthave` and anything else we advertise but do not
+                // act on is dropped, as the oracle does for a disabled feature.
+                _ => {}
+            }
+        }
+        WireEvent::NotInterested | WireEvent::Port(_) | WireEvent::KeepAlive => {}
     }
     Ok(())
 }
@@ -985,6 +1133,11 @@ async fn uploader(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, handle: Rc<PeerHa
             continue;
         }
         let storage = torrent.borrow().storage.clone();
+        let Some(storage) = storage else {
+            handle.conn.borrow_mut().reject(r);
+            handle.out.notify();
+            continue;
+        };
         if !storage.has_piece(r.index as usize) {
             handle.conn.borrow_mut().reject(r);
             handle.out.notify();

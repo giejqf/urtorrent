@@ -120,3 +120,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     tracker_failover, pt_tracker, oracle_utp_tcp_fallback; UDP and MSE sides
     of the discriminator.
   - Fuzz: mse_responder, udp_reply, scrape_response.
+- M6 extensions:
+  - `ut_metadata` / magnet links (BEP 9): `AddTorrent::magnet`,
+    `TorrentState::FetchingMetadata`, `Event::MetadataReceived`; fetch with
+    libtorrent's request/penalty rules, serving in 16 KiB pieces, `left=16384`
+    until the metadata is known (Q12); connections without metadata send no
+    have-state and are sized when it arrives (Q13).
+  - PEX (BEP 11) with the oracle's cadence, eligibility and flags (Q15);
+    `Event::PexPeers`, `PeerSource::Pex`, `SessionBuilder::pex`.
+  - `upload_only` (BEP 21): sent on completion / metadata, honoured on
+    receipt (upload-upload connections closed); `PeerInfo::upload_only`.
+  - Local Service Discovery (BEP 14): multicast sockets over io_uring,
+    libtorrent's datagram and retry schedule (Q16), `Event::LsdPeer`,
+    `PeerSource::Lsd`, `SessionBuilder::lsd`; the codec lives in
+    `tracker::lsd`.
+  - Web seeds (BEP 19): one kept-alive HTTP connection per `url-list` entry,
+    range requests with the oracle's header order (Q17), contiguous picking,
+    failure backoff, blame drops a seed that served bad data;
+    `Event::WebSeedError`, `TorrentStatus::web_seeds`.
+  - BEP 40 canonical peer priority (`wire::peer_priority`, CRC32-C) ranks
+    connection candidates.
+  - Private torrents (rule 2): `m` without `ut_pex` / `ut_metadata` and no
+    `metadata_size` (Q11); no PEX, no LSD, PEX/LSD-sourced addresses refused;
+    `TorrentStatus::private`.
+  - Allowed-fast now goes out on the peer's first `interested`, skipping its
+    pieces, after a preemptive unchoke (Q14), matching the oracle's
+    first-messages sequence as a seed.
+  - `Session::add_peer` (manual peer source), `PeerSource` on `PeerInfo`,
+    outgoing connections bound to the configured listen address.
+  - testkit: `tap-webseed` (range server recording raw requests), tap-peer
+    serves `ut_metadata` and publishes live captures, `urt-client --magnet /
+    --no-lsd / --no-pex / --add-peer`; captures capture_peer_private,
+    capture_pex, capture_magnet; scenarios pex_discovery (Diff),
+    magnet_via_ut_metadata, lsd_discovery, web_seed_only (Diff),
+    private_no_pex_lsd (v4 / v6); PEX side of the discriminator.
+  - Fuzz: pex_message, metadata_message, lsd_datagram.

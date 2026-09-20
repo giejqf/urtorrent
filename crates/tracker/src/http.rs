@@ -67,6 +67,7 @@ pub struct ResponseParser {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     gzip: bool,
+    max_body: usize,
 }
 
 impl Default for ResponseParser {
@@ -78,6 +79,11 @@ impl Default for ResponseParser {
 impl ResponseParser {
     /// A fresh parser.
     pub fn new() -> ResponseParser {
+        ResponseParser::with_max_body(MAX_BODY)
+    }
+
+    /// A parser accepting bodies up to `max_body` bytes (web seed ranges).
+    pub fn with_max_body(max_body: usize) -> ResponseParser {
         ResponseParser {
             buf: Vec::new(),
             state: State::Head,
@@ -85,6 +91,17 @@ impl ResponseParser {
             headers: Vec::new(),
             body: Vec::new(),
             gzip: false,
+            max_body,
+        }
+    }
+
+    /// Bytes buffered beyond the current response (the start of the next one
+    /// on a kept-alive connection). Empty unless the server pipelined.
+    pub fn leftover(&self) -> &[u8] {
+        if matches!(self.state, State::Done) {
+            &self.buf
+        } else {
+            &[]
         }
     }
 
@@ -113,7 +130,7 @@ impl ResponseParser {
                 }
                 State::Body(Body::Length(n)) => {
                     let n = *n;
-                    if n > MAX_BODY {
+                    if n > self.max_body {
                         return Err(Error::Http("body too large"));
                     }
                     if self.buf.len() < n {
@@ -150,7 +167,7 @@ impl ResponseParser {
                             return self.complete().map(Some);
                         }
                         let need = line_end + 2 + size + 2;
-                        if self.body.len() + size > MAX_BODY {
+                        if self.body.len() + size > self.max_body {
                             return Err(Error::Http("body too large"));
                         }
                         if self.buf.len() < need {
@@ -165,7 +182,7 @@ impl ResponseParser {
                     }
                 }
                 State::Body(Body::UntilClose) => {
-                    if self.body.len() + self.buf.len() > MAX_BODY {
+                    if self.body.len() + self.buf.len() > self.max_body {
                         return Err(Error::Http("body too large"));
                     }
                     self.body.append(&mut self.buf);

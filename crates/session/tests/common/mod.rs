@@ -103,6 +103,7 @@ pub fn spawn_seeder(info_hash: [u8; 20], data: Arc<Vec<u8>>, piece_len: usize) -
                     peer_ip: stream.peer_addr().ok().map(|a| a.ip()),
                     metadata_size: None,
                     advertise_port: true,
+                    private: false,
                 });
                 stream
                     .set_read_timeout(Some(Duration::from_secs(20)))

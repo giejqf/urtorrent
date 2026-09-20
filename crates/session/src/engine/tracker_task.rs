@@ -69,7 +69,7 @@ pub async fn run(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
 
 fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
     AnnounceRequest {
-        info_hash: t.info.info_hash,
+        info_hash: t.info_hash,
         peer_id: t.peer_id,
         port: ctx.listen_port,
         uploaded: t.stats.uploaded,
@@ -137,7 +137,7 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
                 if let Some(w) = &resp.warning {
                     tracing::info!(url = %job.url, "tracker warning: {w}");
                 }
-                t.add_candidates(ctx, &resp.peers)
+                t.add_candidates(ctx, &resp.peers, crate::api::PeerSource::Tracker)
             };
             tracing::debug!(
                 url = %job.url,
@@ -209,7 +209,7 @@ async fn announce_udp(
 pub async fn scrape_all(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
     let (urls, hash, id) = {
         let t = torrent.borrow();
-        (t.announcer.urls(), t.info.info_hash, t.id)
+        (t.announcer.urls(), t.info_hash, t.id)
     };
     for announce_url in urls {
         let Some(scrape_url) = tracker::scrape::scrape_url(&announce_url) else {

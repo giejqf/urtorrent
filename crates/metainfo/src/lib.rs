@@ -136,6 +136,13 @@ pub struct Info {
 }
 
 impl Info {
+    /// Parse a bare bencoded `info` dictionary (what `ut_metadata` delivers,
+    /// BEP 9). The caller checks its SHA-1 against the expected info-hash.
+    pub fn from_info_dict(bytes: &[u8]) -> Result<Info, Error> {
+        let v = Decoder::new(bytes).decode_all()?;
+        parse_info(&v)
+    }
+
     /// Number of pieces.
     pub fn piece_count(&self) -> usize {
         self.piece_hashes.len()

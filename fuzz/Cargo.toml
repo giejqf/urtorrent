@@ -108,4 +108,25 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "pex_message"
+path = "fuzz_targets/pex_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_message"
+path = "fuzz_targets/metadata_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lsd_datagram"
+path = "fuzz_targets/lsd_datagram.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

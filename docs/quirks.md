@@ -136,3 +136,101 @@ carries option 2 (URL data) with the URL's path and query (`\x02\x09/announce`),
 `key` as the HTTP announces. Connection ids are reused for 60 s. The UDP
 source port is the listen port. `tracker::udp` reproduces all of it; the
 `udp_tracker` scenario shows no UDP-side tells vs the oracle.
+
+## Q11. Private torrents drop `ut_pex`, `ut_metadata` and `metadata_size`
+
+Capture: `capture_peer_private` (oracle on a `private=1` torrent, both roles).
+The LTEP handshake's `m` is `{lt_donthave: 7, share_mode: 8, upload_only: 3,
+ut_holepunch: 4}` and carries no `metadata_size`; everything else (`reqq`,
+`v`, `yourip`, `p` on outgoing, `upload_only: 1` when seeding, `complete_ago`)
+is unchanged. libtorrent never creates the `ut_pex` / `ut_metadata` plugins
+for a private torrent (`create_ut_pex_plugin`, `create_ut_metadata_plugin`),
+so the ids are simply absent. Consequence: `profile::LtepShape::m_private`
+and the `private` flag on `wire::ConnectionParams`; a `ut_pex` message under
+a stale id is an unknown extension and is dropped. Pinned byte-exact in
+`crates/wire/tests/replay.rs`; the no-traffic guarantee (rule 2) is checked on
+the wire by the `private_no_pex_lsd` scenario (pcap + tap-peer).
+
+## Q12. `left=16384` before the metadata is known
+
+Capture: `capture_magnet/v4/tap-tracker-magnet.jsonl` — the oracle's first
+announce for a magnet link carries `left=16384` (`downloaded=0`); once the
+metadata is known the real size follows. libtorrent uses 16 KiB when
+`bytes_left()` is unknown (`torrent.cpp`, `announce_with_tracker`). BEP 3 has
+no way to say "unknown", and `left` here is not a claim about data we hold
+(rule 1); we announce the same value in the same situation.
+
+## Q13. qBittorrent stops and re-adds a magnet torrent when its metadata arrives
+
+Capture: `capture_magnet`. Two milliseconds after receiving the metadata the
+oracle closes its peer connection, announces `stopped` (`left=1048576` now
+that it knows), then announces `started` again about a second later and
+reconnects with a fresh connection that carries `metadata_size`, `have_none`
+and `interested`. This is qBittorrent re-creating the torrent from the
+received metadata, not libtorrent (`set_metadata` keeps connections). It is
+an L3 behaviour we do **not** copy: we keep the connection, send our
+have-state (`bitfield` / `have_none`) and a BEP 21 `upload_only` message on
+it, as libtorrent's `on_metadata` does, and keep the single `started`.
+
+Also from this capture: **without metadata libtorrent sends no have-state at
+all** (no `have_none`, no `bitfield`) after the handshake; the LTEP handshake
+omits `metadata_size`; the first `ut_metadata` request is for piece 0 and has
+no `total_size`. `wire::Connection` with `piece_count: None` matches
+(`qbt_magnet_mode_matches_capture`).
+
+## Q14. The allowed-fast set waits for `interested`; a preemptive `unchoke` comes first
+
+Capture: `capture_peer_plain/v4/tap-peer-plain-oracle-responder.jsonl` (and
+`capture_peer_private`): the oracle seeding to a tap leecher sends `extended`,
+`have_all`, then `unchoke`, and only after the tap's `interested` the five
+`allowed_fast` messages. libtorrent unchokes a fresh peer right away when it
+has pieces and a slot is free (`maybe_unchoke_this_peer`) and defers
+`send_allowed_set` to the first `interested`, skipping pieces the peer already
+has (and granting every piece the peer lacks when the torrent has no more
+pieces than the set size). Our profile data used to list allowed-fast as a
+first message; the first-messages sequence is now `[extended, have-state]`
+for both profiles, the allowed set goes out on `interested`, and the engine
+unchokes preemptively when it has pieces.
+
+Also confirmed from `write_bitfield`: with the fast extension off and no
+pieces, libtorrent sends no `bitfield` at all.
+
+## Q15. PEX cadence and eligibility (BEP 11 as libtorrent does it)
+
+Capture: `capture_pex` (oracle seeding to two silent tap leechers that
+advertise `p`). The first `ut_pex` to a peer is sent on the first one-second
+tick at which the torrent has more than one peer (4.7 s after start in the
+capture, when the second tap had connected); it lists every exchangeable
+connection *including the recipient*, with all six keys present (`added`,
+`added.f`, `added6`, `added6.f`, `dropped`, `dropped6`; empty strings when
+empty). Later messages carry the torrent-wide delta rebuilt once a minute,
+and are skipped when the delta is empty. Exchangeable: connections past the
+handshake that libtorrent dialled, or incoming ones that sent a listen port
+(`p`). Flags: `0x02` seed, `0x01` encrypted connection, `0x08` advertised
+`ut_holepunch`; `0x04` (uTP) and `0x10` are never set by 2.0.14 (it masks
+`0x10` on receipt). Receiving more than six messages a minute or one over
+500 KiB is a disconnect. The engine's `pex` module reproduces this; the
+`pex_discovery` scenario shows no tells against the golden.
+
+## Q16. LSD: one announce per listen socket, three datagrams each
+
+Capture: `lsd_discovery` pcaps. Each `lsd_announce` is three datagrams (at
+once, +2 s, +4 s), and the oracle runs one LSD instance *per listen socket*
+(three sockets on the lab actor: three datagrams at the same instant with
+different `cookie`s). The datagram text is exactly libtorrent's
+`render_lsd_packet` (`Infohash` lowercase hex, `cookie` `%x`, a blank line
+plus a stray `\r\n` at the end). We send one announce per address family
+with a session-wide cookie; the datagram itself is byte-identical after
+normalising port, hash and cookie. Re-announce cadence is
+`local_service_announce_interval` (5 min) divided among the torrents,
+round-robin. Announces from our own cookie are ignored.
+
+## Q17. Web seed requests
+
+Capture: `web_seed_only`. The oracle fetches with `GET <path> HTTP/1.1`,
+headers in the order `Host`, `User-Agent`, `Connection: keep-alive`,
+`Range: bytes=a-b`, no `Accept-Encoding`, and asks for whole runs of pieces
+in one request (the whole 2 MiB file in the capture; libtorrent caps at
+16 MiB). We match the request line and header order/values and request
+contiguous runs capped at 4 MiB over a kept-alive connection (an accepted L3
+difference in request count).

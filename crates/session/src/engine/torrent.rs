@@ -30,7 +30,7 @@ use super::rate::Limiter;
 use super::rng::RngRef;
 use crate::Error;
 use crate::api::{
-    AddTorrent, Event, PeerInfo, TorrentId, TorrentSource, TorrentState, TorrentStatus,
+    AddTorrent, Event, PeerInfo, PeerSource, TorrentId, TorrentSource, TorrentState, TorrentStatus,
     TrackerStatus,
 };
 
@@ -69,9 +69,30 @@ pub struct Stats {
 /// One torrent.
 pub struct Torrent {
     pub id: TorrentId,
-    pub info: Rc<metainfo::Info>,
-    pub storage: Rc<Storage>,
+    pub info_hash: InfoHash,
+    /// Display name (`info.name`, or the magnet's `dn` / hex hash until then).
+    pub name: String,
+    /// BEP 27. `false` until the metadata says otherwise; once `true` the
+    /// torrent never again takes part in PEX or LSD (rule 2).
+    pub private: bool,
+    /// The metadata, once known (`None` while a magnet link fetches it).
+    pub info: Option<Rc<metainfo::Info>>,
+    pub storage: Option<Rc<Storage>>,
+    /// The raw bencoded info dictionary, served over `ut_metadata`.
+    pub raw_info: Option<Rc<Vec<u8>>>,
+    /// Empty (zero pieces) until the metadata is known.
     pub picker: Picker,
+    /// BEP 9 fetch state (magnet links).
+    pub metadata: super::metadata::Fetch,
+    /// BEP 11 state.
+    pub pex: super::pex::State,
+    /// BEP 19 web seeds (`url-list`).
+    pub web_seeds: Vec<String>,
+    pub webseed: super::webseed::State,
+    pub save_path: PathBuf,
+    sequential: bool,
+    /// The tracker / tick tasks are running.
+    pub tasks_running: bool,
     pub announcer: Announcer,
     pub announce_key: u32,
     /// The peer id used for this torrent's announces and handshakes (per
@@ -89,7 +110,10 @@ pub struct Torrent {
     pub peers: HashMap<u32, Rc<PeerHandle>>,
     /// Addresses learned from trackers, not yet tried.
     candidates: VecDeque<SocketAddr>,
+    /// New candidates arrived; re-rank before the next dial.
+    candidates_dirty: bool,
     known: HashSet<SocketAddr>,
+    sources: HashMap<SocketAddr, PeerSource>,
     failed: HashMap<SocketAddr, Instant>,
     /// Addresses with a connect in progress.
     pub connecting: HashSet<SocketAddr>,
@@ -119,11 +143,31 @@ pub struct Torrent {
 
 impl Torrent {
     pub fn info_hash(&self) -> InfoHash {
-        self.info.info_hash
+        self.info_hash
     }
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Whether the metadata is known.
+    pub fn has_metadata(&self) -> bool {
+        self.info.is_some()
+    }
+
+    /// Pieces in the torrent (0 before the metadata is known).
+    pub fn piece_count(&self) -> usize {
+        self.info.as_ref().map_or(0, |i| i.piece_count())
+    }
+
+    /// Every wanted piece is verified (never true without metadata).
+    pub fn is_complete(&self) -> bool {
+        self.info.is_some() && self.picker.is_complete()
+    }
+
+    /// PEX and LSD are allowed for this torrent (rule 2).
+    pub fn discovery_allowed(&self) -> bool {
+        !self.private
     }
 
     /// The lifecycle state as reported to callers.
@@ -134,6 +178,8 @@ impl Torrent {
             TorrentState::Checking
         } else if self.paused {
             TorrentState::Paused
+        } else if self.info.is_none() {
+            TorrentState::FetchingMetadata
         } else if self.picker.is_complete() {
             TorrentState::Seeding
         } else {
@@ -151,8 +197,13 @@ impl Torrent {
         !self.paused && self.error.is_none()
     }
 
-    /// Bytes still needed (from the verified have-set).
+    /// Bytes still needed (from the verified have-set). Without metadata the
+    /// size is unknown; libtorrent announces 16 KiB then (docs/quirks.md Q12)
+    /// and so do we: the value is not a claim about data we hold.
     pub fn left(&self) -> u64 {
+        if self.info.is_none() {
+            return 16 * 1024;
+        }
         self.picker.bytes_left()
     }
 
@@ -173,20 +224,19 @@ impl Torrent {
                 next_announce_in: t.next_announce.map(|a| a.saturating_duration_since(now)),
             })
             .collect();
-        let seeds = self
-            .peers
-            .values()
-            .filter(|p| p.is_seed(self.info.piece_count()))
-            .count();
+        let n = self.piece_count();
+        let seeds = self.peers.values().filter(|p| p.is_seed(n)).count();
         TorrentStatus {
             id: self.id,
-            info_hash: self.info.info_hash,
-            name: self.info.name.clone(),
+            info_hash: self.info_hash,
+            name: self.name.clone(),
             state: self.state(),
             error: self.error.clone(),
+            has_metadata: self.info.is_some(),
+            private: self.private,
             pieces_have: self.picker.have_count(),
-            pieces_total: self.info.piece_count(),
-            total_size: self.info.total_length,
+            pieces_total: n,
+            total_size: self.info.as_ref().map_or(0, |i| i.total_length),
             downloaded: self.stats.downloaded,
             uploaded: self.stats.uploaded,
             left: self.left(),
@@ -197,12 +247,13 @@ impl Torrent {
             peers: self.peers.len(),
             seeds,
             trackers,
-            complete: self.picker.is_complete(),
+            complete: self.is_complete(),
+            web_seeds: self.web_seeds.len(),
         }
     }
 
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
-        let n = self.info.piece_count();
+        let n = self.piece_count();
         let mut v: Vec<PeerInfo> = self.peers.values().map(|p| p.info(n)).collect();
         v.sort_by_key(|p| p.addr);
         v
@@ -213,19 +264,35 @@ impl Torrent {
         self.tracker_kick.notify();
     }
 
-    /// Add tracker-supplied peers, filtering what AGENTS.md 5.5 says to drop.
-    pub fn add_candidates(&mut self, ctx: &Ctx, peers: &[SocketAddr]) -> usize {
+    /// Add peers learned from `source`, filtering what AGENTS.md 5.5 says to
+    /// drop. PEX / LSD peers are refused for private torrents (rule 2).
+    pub fn add_candidates(&mut self, ctx: &Ctx, peers: &[SocketAddr], source: PeerSource) -> usize {
+        if self.private && matches!(source, PeerSource::Pex | PeerSource::Lsd) {
+            return 0;
+        }
         let mut added = 0;
         for &p in peers {
             if !usable_peer_addr(ctx, p) || self.banned.contains(&p.ip()) {
                 continue;
             }
             if self.known.insert(p) {
+                self.sources.insert(p, source);
                 self.candidates.push_back(p);
                 added += 1;
             }
         }
+        if added > 0 {
+            self.candidates_dirty = true;
+        }
         added
+    }
+
+    /// Where an address was learned (for `PeerInfo::source`).
+    pub fn source_of(&self, addr: SocketAddr) -> PeerSource {
+        self.sources
+            .get(&addr)
+            .copied()
+            .unwrap_or(PeerSource::Incoming)
     }
 
     /// Whether we already have (or are opening) a connection to this IP.
@@ -257,7 +324,12 @@ impl Torrent {
     }
 
     /// Adjust a peer's trust; ban (and drop) it when it falls to `BAN_AT`.
+    /// Web seeds (blamed under the unspecified address) are not tracked by
+    /// address; a failed piece drops the seed instead (`verify_piece`).
     fn adjust_trust(&mut self, ip: IpAddr, delta: i32) {
+        if ip.is_unspecified() {
+            return;
+        }
         let t = self.trust.entry(ip).or_insert(0);
         *t = (*t + delta).min(TRUST_CAP);
         if *t <= BAN_AT {
@@ -273,8 +345,8 @@ impl Torrent {
     /// Everyone must know when we gain a piece; once complete, connections to
     /// other seeds are pointless on both sides and are closed.
     fn broadcast_have(&self, piece: u32) {
-        let complete = self.picker.is_complete();
-        let n = self.info.piece_count();
+        let complete = self.is_complete();
+        let n = self.piece_count();
         for p in self.peers.values() {
             p.conn.borrow_mut().have(piece);
             p.out.notify();
@@ -326,69 +398,72 @@ fn resume_file(dir: &std::path::Path, h: &InfoHash) -> PathBuf {
 
 /// `Session::add_torrent`.
 pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<TorrentId, Error> {
-    let (meta, metadata_size) = match &params.source {
+    let now = Instant::now();
+    let (info_hash, name, tiers, web_seeds, parsed) = match &params.source {
         TorrentSource::Metainfo(bytes) => {
             let meta = Metainfo::parse(bytes).map_err(|e| Error::Metainfo(e.to_string()))?;
-            let size = bencode::from_bytes(bytes)
+            if meta.info.has_v2 && meta.info.piece_hashes.is_empty() {
+                return Err(Error::Unsupported("v2-only torrents (BEP 52) are deferred"));
+            }
+            let raw = bencode::from_bytes(bytes)
                 .ok()
-                .and_then(|v| v.get_str("info").and_then(|i| i.raw()).map(|r| r.len()))
-                .unwrap_or(0)
-                .min(u32::MAX as usize) as u32;
-            (meta, size)
+                .and_then(|v| v.get_str("info").and_then(|i| i.raw()).map(|r| r.to_vec()))
+                .ok_or_else(|| Error::Metainfo("no raw info dictionary".into()))?;
+            (
+                meta.info.info_hash,
+                meta.info.name.clone(),
+                meta.tiers(),
+                meta.url_list.clone(),
+                Some((meta.info.clone(), raw)),
+            )
         }
-        TorrentSource::Magnet(_) => {
-            return Err(Error::Unsupported(
-                "magnet links need ut_metadata (BEP 9), which lands in M6",
-            ));
+        TorrentSource::Magnet(uri) => {
+            let m = metainfo::MagnetLink::parse(uri).map_err(|e| Error::Metainfo(e.to_string()))?;
+            let name = m.name.clone().unwrap_or_else(|| bencode::hex(&m.info_hash));
+            (m.info_hash, name, m.tiers(), Vec::new(), None)
         }
     };
-    if meta.info.has_v2 && meta.info.piece_hashes.is_empty() {
-        return Err(Error::Unsupported("v2-only torrents (BEP 52) are deferred"));
-    }
-    if ctx.by_hash.borrow().contains_key(&meta.info.info_hash) {
+    if ctx.by_hash.borrow().contains_key(&info_hash) {
         return Err(Error::Duplicate);
     }
-    let info = Rc::new(meta.info.clone());
-    let storage = Rc::new(Storage::new(
-        info.clone(),
-        params.save_path.clone(),
-        ctx.pool.clone(),
-    ));
-    // Before any file is created: does the resume data still describe what
-    // is on disk?
-    let files_present = info
-        .content_files()
-        .all(|f| std::fs::metadata(f.path.to_path(&params.save_path)).is_ok());
-    storage.create_files()?;
     let resume_path = params
         .resume_dir
         .as_deref()
-        .map(|d| resume_file(d, &info.info_hash));
+        .map(|d| resume_file(d, &info_hash));
     if let Some(dir) = &params.resume_dir {
         std::fs::create_dir_all(dir)?;
     }
-
-    let mut picker = Picker::new(info.piece_count(), info.piece_length, info.total_length);
-    picker.set_sequential(params.sequential);
-    let now = Instant::now();
-    let announcer = Announcer::new(meta.tiers(), ctx.families.endpoints().len());
+    let announcer = Announcer::new(tiers, ctx.families.endpoints().len());
     let torrent = Rc::new(RefCell::new(Torrent {
         id,
-        info: info.clone(),
-        storage,
-        picker,
+        info_hash,
+        name,
+        private: false,
+        info: None,
+        storage: None,
+        raw_info: None,
+        picker: Picker::new(0, 0, 0),
+        metadata: super::metadata::Fetch::default(),
+        pex: super::pex::State::default(),
+        web_seeds,
+        webseed: super::webseed::State::default(),
+        save_path: params.save_path.clone(),
+        sequential: params.sequential,
+        tasks_running: false,
         announcer,
         announce_key: ctx.new_announce_key(),
         peer_id: ctx.new_torrent_peer_id(),
         paused: params.paused,
-        checking: true,
+        checking: parsed.is_some(),
         error: None,
         stats: Stats::default(),
         up_limit: Limiter::new(0, now),
         down_limit: Limiter::new(0, now),
         peers: HashMap::new(),
         candidates: VecDeque::new(),
+        candidates_dirty: false,
         known: HashSet::new(),
+        sources: HashMap::new(),
         failed: HashMap::new(),
         connecting: HashSet::new(),
         mse_retry: HashSet::new(),
@@ -404,33 +479,139 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         verifying: HashSet::new(),
         finished_emitted: false,
         announces_in_flight: 0,
-        metadata_size,
+        metadata_size: 0,
     }));
     ctx.torrents.borrow_mut().insert(id, torrent.clone());
-    ctx.by_hash.borrow_mut().insert(info.info_hash, id);
+    ctx.by_hash.borrow_mut().insert(info_hash, id);
     ctx.emit(Event::TorrentAdded { id });
-    uring::spawn(initial_check(
-        ctx.clone(),
-        torrent.clone(),
-        files_present,
-        params.save_path,
-    ));
+    match parsed {
+        Some((info, raw)) => {
+            attach_metadata(&ctx, &torrent, info, raw)?;
+            let files_present = files_present(&torrent);
+            if let Err(e) = create_files(&torrent) {
+                ctx.remove_torrent_entry(id);
+                return Err(e);
+            }
+            uring::spawn(initial_check(ctx.clone(), torrent.clone(), files_present));
+        }
+        None => {
+            // A magnet: nothing to check yet; announce and find peers to
+            // fetch the metadata from.
+            if !params.paused {
+                start_tasks(&ctx, &torrent);
+            }
+        }
+    }
     Ok(id)
+}
+
+/// Install the metadata: the info dictionary, storage, picker, privacy.
+fn attach_metadata(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    info: metainfo::Info,
+    raw: Vec<u8>,
+) -> Result<(), Error> {
+    let mut t = torrent.borrow_mut();
+    let info = Rc::new(info);
+    let storage = Rc::new(Storage::new(
+        info.clone(),
+        t.save_path.clone(),
+        ctx.pool.clone(),
+    ));
+    let mut picker = Picker::new(info.piece_count(), info.piece_length, info.total_length);
+    picker.set_sequential(t.sequential);
+    t.metadata_size = raw.len().min(u32::MAX as usize) as u32;
+    t.name = info.name.clone();
+    t.private = info.private;
+    t.picker = picker;
+    t.storage = Some(storage);
+    t.raw_info = Some(Rc::new(raw));
+    t.info = Some(info);
+    Ok(())
+}
+
+/// Whether every content file exists on disk (checked before any is created,
+/// to decide whether resume data still describes the disk).
+fn files_present(torrent: &Rc<RefCell<Torrent>>) -> bool {
+    let t = torrent.borrow();
+    let Some(info) = &t.info else {
+        return false;
+    };
+    info.content_files()
+        .all(|f| std::fs::metadata(f.path.to_path(&t.save_path)).is_ok())
+}
+
+fn create_files(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
+    let storage = torrent.borrow().storage.clone();
+    if let Some(s) = storage {
+        s.create_files()?;
+    }
+    Ok(())
+}
+
+/// The metadata arrived over `ut_metadata` (BEP 9): install it, tell every
+/// connected peer, and check the disk before downloading.
+pub fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec<u8>) {
+    let info = match metainfo::Info::from_info_dict(&raw) {
+        Ok(i) => i,
+        Err(e) => {
+            fail_torrent(ctx, torrent, format!("metadata unusable: {e}"));
+            return;
+        }
+    };
+    if info.has_v2 && info.piece_hashes.is_empty() {
+        fail_torrent(ctx, torrent, "v2-only metadata (BEP 52) is deferred".into());
+        return;
+    }
+    let files_present = {
+        let t = torrent.borrow();
+        info.content_files()
+            .all(|f| std::fs::metadata(f.path.to_path(&t.save_path)).is_ok())
+    };
+    if let Err(e) = attach_metadata(ctx, torrent, info, raw) {
+        fail_torrent(ctx, torrent, e.to_string());
+        return;
+    }
+    if let Err(e) = create_files(torrent) {
+        fail_torrent(ctx, torrent, e.to_string());
+        return;
+    }
+    let (id, private, peers) = {
+        let mut t = torrent.borrow_mut();
+        t.checking = true;
+        let peers: Vec<Rc<PeerHandle>> = t.peers.values().cloned().collect();
+        if t.private {
+            // Rule 2: a private torrent takes no part in PEX from the moment
+            // we know. Connections learned through PEX stay (they were legal
+            // when made); nothing more is exchanged.
+            t.pex = super::pex::State::default();
+        }
+        (t.id, t.private, peers)
+    };
+    tracing::info!(torrent = id.0, private, "metadata received");
+    ctx.emit(Event::MetadataReceived { id });
+    let (n, have) = {
+        let t = torrent.borrow();
+        (t.piece_count(), Bitfield::new(t.piece_count()))
+    };
+    for p in peers {
+        p.on_metadata(torrent, n, &have);
+    }
+    uring::spawn(initial_check(ctx.clone(), torrent.clone(), files_present));
 }
 
 /// Resume data or recheck, then start. A resume file only ever records pieces
 /// that were verified and fsynced, so it is trusted when it matches the
 /// torrent and every content file is still present; otherwise, if any content
 /// exists on disk, it is rechecked (AGENTS.md 5.4: when unsure, recheck).
-async fn initial_check(
-    ctx: Rc<Ctx>,
-    torrent: Rc<RefCell<Torrent>>,
-    files_present: bool,
-    save_path: PathBuf,
-) {
-    let (storage, info, resume_path) = {
+async fn initial_check(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, files_present: bool) {
+    let (storage, info, resume_path, save_path) = {
         let t = torrent.borrow();
-        (t.storage.clone(), t.info.clone(), t.resume_path.clone())
+        let (Some(s), Some(i)) = (t.storage.clone(), t.info.clone()) else {
+            return;
+        };
+        (s, i, t.resume_path.clone(), t.save_path.clone())
     };
     let resume = match &resume_path {
         Some(p) => ResumeData::load(p).unwrap_or_else(|e| {
@@ -464,26 +645,36 @@ async fn initial_check(
     finish_check(&ctx, &torrent, have, carried);
 }
 
-/// Apply a check result and start (unless paused).
+/// Apply a check result and start (unless paused). When the tasks are already
+/// running (metadata arrived on a running magnet torrent) they are refreshed
+/// instead.
 fn finish_check(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
     have: Bitfield,
     carried: Option<(u64, u64)>,
 ) {
-    let (id, start) = {
+    let (id, start, running, kick) = {
         let mut t = torrent.borrow_mut();
-        t.storage.set_have(have.clone());
+        if let Some(s) = &t.storage {
+            s.set_have(have.clone());
+        }
         t.picker.set_have(&have);
         if let Some((d, u)) = carried {
             t.stats.downloaded = d;
             t.stats.uploaded = u;
         }
         t.checking = false;
-        t.finished_emitted = t.picker.is_complete();
+        t.finished_emitted = t.is_complete();
         // Addresses backed off during the check may be dialled again.
         t.failed.clear();
-        (t.id, !t.paused && t.error.is_none())
+        let running = t.tasks_running && !t.closing.is_set();
+        (
+            t.id,
+            !t.paused && t.error.is_none() && !running,
+            running,
+            t.tracker_kick.clone(),
+        )
     };
     ctx.emit(Event::Checked {
         id,
@@ -491,6 +682,17 @@ fn finish_check(
     });
     if start {
         start_tasks(ctx, torrent);
+    } else if running {
+        // Peers connected during the metadata fetch learn our have-set and
+        // get requests; trackers hear the real `left`.
+        let peers: Vec<Rc<PeerHandle>> = torrent.borrow().peers.values().cloned().collect();
+        let n = torrent.borrow().piece_count();
+        for p in &peers {
+            p.on_metadata(torrent, n, &have);
+        }
+        kick.notify();
+        on_new_candidates(ctx, torrent);
+        super::webseed::start(ctx, torrent);
     }
 }
 
@@ -506,7 +708,11 @@ pub async fn recheck(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
         for p in t.peers.values() {
             p.close("rechecking");
         }
-        t.storage.clone()
+        let Some(storage) = t.storage.clone() else {
+            t.checking = false;
+            return;
+        };
+        storage
     };
     match storage.check_all().await {
         Ok(have) => {
@@ -529,10 +735,12 @@ fn finish_check_after_recheck(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, hav
     };
     let (id, kick) = {
         let mut t = torrent.borrow_mut();
-        t.storage.set_have(have.clone());
+        if let Some(s) = &t.storage {
+            s.set_have(have.clone());
+        }
         t.picker.set_have(&have);
         t.checking = false;
-        t.finished_emitted = t.picker.is_complete();
+        t.finished_emitted = t.is_complete();
         t.failed.clear();
         (t.id, t.tracker_kick.clone())
     };
@@ -555,10 +763,13 @@ fn start_tasks(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
         let mut t = torrent.borrow_mut();
         t.closing = Flag::new();
         t.paused = false;
+        t.tasks_running = true;
         t.announcer.start();
     }
     uring::spawn(super::tracker_task::run(ctx.clone(), torrent.clone()));
     uring::spawn(tick(ctx.clone(), torrent.clone()));
+    super::lsd::announce_now(ctx, torrent);
+    super::webseed::start(ctx, torrent);
 }
 
 /// `Session::resume`.
@@ -607,6 +818,7 @@ pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, _final: bool) {
     }
     let (closing, jobs, peers) = {
         let mut t = torrent.borrow_mut();
+        t.tasks_running = false;
         let jobs = t.announcer.stop();
         let peers: Vec<Rc<PeerHandle>> = t.peers.values().cloned().collect();
         (t.closing.clone(), jobs, peers)
@@ -651,13 +863,18 @@ pub async fn save_resume(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
         let Some(path) = t.resume_path.clone() else {
             return Ok(());
         };
+        let (Some(storage), Some(info)) = (t.storage.clone(), t.info.clone()) else {
+            // Nothing verified yet (metadata pending): nothing to persist.
+            return Ok(());
+        };
+        let have = storage.have();
         (
-            t.storage.clone(),
+            storage,
             path,
-            t.storage.have(),
+            have,
             t.stats.downloaded,
             t.stats.uploaded,
-            t.info.clone(),
+            info,
         )
     };
     storage.sync_all().await?;
@@ -704,6 +921,8 @@ async fn tick(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
             for p in &peers {
                 p.tick(&mut t, &ctx, now);
             }
+            super::pex::tick(&ctx, &mut t, now);
+            super::metadata::tick(&mut t, now);
             connect_more(&ctx, &torrent, &mut t, now);
             t.resume_dirty && now.duration_since(t.last_resume_save) > RESUME_SAVE_EVERY
         };
@@ -713,14 +932,33 @@ async fn tick(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
     }
 }
 
-/// Open connections up to the limits. Candidates rotate through the queue so
-/// an address that is busy, backed off or connected now is retried later.
+/// Open connections up to the limits. Candidates are ranked by BEP 40
+/// canonical priority (libtorrent `peer_list` order, highest first) and
+/// rotate through the queue so an address that is busy, backed off or
+/// connected now is retried later.
 fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, now: Instant) {
     if !t.is_running() {
         return;
     }
     let max_peers = ctx.cfg.max_peers;
     let max_half_open = ctx.cfg.max_half_open;
+    if t.candidates_dirty {
+        t.candidates_dirty = false;
+        let ours_v4 = SocketAddr::new(
+            IpAddr::V4(ctx.cfg.listen_v4.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)),
+            ctx.listen_port,
+        );
+        let ours_v6 = SocketAddr::new(
+            IpAddr::V6(ctx.cfg.listen_v6.unwrap_or(std::net::Ipv6Addr::UNSPECIFIED)),
+            ctx.listen_port,
+        );
+        let mut v: Vec<SocketAddr> = t.candidates.drain(..).collect();
+        v.sort_by_key(|a| {
+            let ours = if a.is_ipv4() { ours_v4 } else { ours_v6 };
+            std::cmp::Reverse(wire::peer_priority(ours, *a).unwrap_or(0))
+        });
+        t.candidates.extend(v);
+    }
     for _ in 0..t.candidates.len() {
         if t.peers.len() + t.half_open >= max_peers || t.half_open >= max_half_open {
             break;
@@ -756,12 +994,28 @@ pub fn on_new_candidates(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
     }
 }
 
-/// A block we requested arrived: account, hand to the picker, write, and
-/// verify when the piece is complete.
+/// A block we requested arrived from a peer: account, hand to the picker,
+/// write, and verify when the piece is complete.
 pub async fn on_block(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
     peer: &Rc<PeerHandle>,
+    request: Request,
+    data: Vec<u8>,
+) {
+    peer.downloaded
+        .set(peer.downloaded.get() + u64::from(request.length));
+    on_block_from(ctx, torrent, peer.key, Some(peer.addr.ip()), request, data).await;
+    peer.fill_requests(torrent, ctx);
+}
+
+/// [`on_block`] for any supplier (`key`): a peer with its address for blame,
+/// or a web seed (`None`; blamed by key, see `verify_piece`).
+pub async fn on_block_from(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    key: u32,
+    ip: Option<IpAddr>,
     request: Request,
     data: Vec<u8>,
 ) {
@@ -773,9 +1027,7 @@ pub async fn on_block(
     let (storage, outcome) = {
         let mut t = torrent.borrow_mut();
         t.stats.downloaded += u64::from(request.length);
-        peer.downloaded
-            .set(peer.downloaded.get() + u64::from(request.length));
-        let outcome = t.picker.block_received(peer.key, &block);
+        let outcome = t.picker.block_received(key, &block);
         if let Received::Accepted { cancel, .. } = &outcome {
             for k in cancel {
                 if let Some(other) = t.peers.get(k) {
@@ -783,13 +1035,20 @@ pub async fn on_block(
                     other.out.notify();
                 }
             }
-            t.note_supplier(request.index, peer.key, peer.addr.ip());
+            t.note_supplier(
+                request.index,
+                key,
+                ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            );
         } else {
             t.stats.redundant += u64::from(request.length);
         }
         (t.storage.clone(), outcome)
     };
     let Received::Accepted { piece_complete, .. } = outcome else {
+        return;
+    };
+    let Some(storage) = storage else {
         return;
     };
     let write = storage
@@ -809,12 +1068,13 @@ pub async fn on_block(
             uring::spawn(verify_piece(ctx.clone(), torrent.clone(), request.index));
         }
     }
-    peer.fill_requests(torrent, ctx);
 }
 
 /// Hash a completed piece and act on the result.
 async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
-    let storage = torrent.borrow().storage.clone();
+    let Some(storage) = torrent.borrow().storage.clone() else {
+        return;
+    };
     let result = storage.verify_piece(piece as usize).await;
     let now = Instant::now();
     let finished = {
@@ -837,6 +1097,11 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
                     t.tracker_kick.notify();
                     tracing::info!(torrent = id.0, "download complete");
                     ctx.emit(Event::TorrentFinished { id });
+                    // BEP 21: tell every peer we are upload-only now.
+                    for p in t.peers.values() {
+                        p.send_upload_only(true);
+                    }
+                    super::webseed::stop_all(&t);
                     true
                 } else {
                     false
@@ -848,6 +1113,14 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
                 t.picker.piece_failed(piece as usize);
                 let blamed = t.suppliers.remove(&piece).unwrap_or_default();
                 tracing::warn!(torrent = id.0, piece, ?blamed, "hash check failed");
+                // A web seed that supplied a failed piece is dropped outright.
+                for (k, ip) in blamed.iter().filter(|(_, ip)| ip.is_unspecified()) {
+                    let urls: Vec<String> = t.webseed.running_urls_for(*k).into_iter().collect();
+                    for u in urls {
+                        t.webseed.abandon(&u);
+                    }
+                    let _ = ip;
+                }
                 if blamed.len() == 1 {
                     // One supplier: it is the culprit.
                     t.adjust_trust(blamed[0].1, -SOLE_FAIL_COST);
@@ -922,4 +1195,15 @@ pub fn pick_blocks(
 ) -> Vec<picker::Block> {
     let mut rng = RngRef(&ctx.rng);
     picker.pick(peer, has, want, &mut rng)
+}
+
+/// Pick contiguous blocks (web seeds).
+pub fn pick_contiguous(
+    ctx: &Ctx,
+    picker: &mut Picker,
+    peer: u32,
+    want: usize,
+) -> Vec<picker::Block> {
+    let mut rng = RngRef(&ctx.rng);
+    picker.pick_contiguous(peer, &|_| true, want, &mut rng)
 }

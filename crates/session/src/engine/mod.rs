@@ -14,13 +14,17 @@ mod choker;
 mod dns;
 mod http;
 mod local;
+mod lsd;
+mod metadata;
 mod peer;
+mod pex;
 mod rate;
 mod rng;
 mod tls;
 mod torrent;
 mod tracker_task;
 mod udp;
+mod webseed;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -63,6 +67,10 @@ pub struct EngineConfig {
     pub extra_roots: Vec<Vec<u8>>,
     /// MSE policy.
     pub encryption: crate::api::EncryptionMode,
+    /// Peer exchange enabled.
+    pub pex: bool,
+    /// Local Service Discovery enabled.
+    pub lsd: bool,
 }
 
 impl Default for EngineConfig {
@@ -81,6 +89,8 @@ impl Default for EngineConfig {
             unchoke_slots: choker::DEFAULT_SLOTS,
             extra_roots: Vec::new(),
             encryption: crate::api::EncryptionMode::Enabled,
+            pex: true,
+            lsd: true,
         }
     }
 }
@@ -97,6 +107,7 @@ pub enum Command {
     Stats(oneshot::Sender<SessionStats>),
     SaveResume(TorrentId, oneshot::Sender<Result<(), Error>>),
     ForceReannounce(TorrentId, oneshot::Sender<Result<(), Error>>),
+    AddPeer(TorrentId, SocketAddr, oneshot::Sender<Result<(), Error>>),
     ForceRecheck(TorrentId, oneshot::Sender<Result<(), Error>>),
     Scrape(
         TorrentId,
@@ -129,6 +140,8 @@ pub struct Ctx {
     pub dns: Dns,
     pub tls: tls::TlsClient,
     pub udp: Rc<udp::UdpDemux>,
+    /// Local Service Discovery sockets (`None` when disabled or unavailable).
+    pub lsd: RefCell<Option<lsd::Lsd>>,
     pub rng: rng::Rng,
     pub kick: NotifyHandle,
     pub recv_pool: BufferPool,
@@ -340,11 +353,21 @@ pub fn run(
         ));
         let pool = Rc::new(HashPool::new(cfg.hash_threads));
         pool.attach_notifier(kick.clone());
+        let lsd = if cfg.lsd {
+            lsd::Lsd::open(
+                if families.v4 { cfg.listen_v4 } else { None },
+                if families.v6 { cfg.listen_v6 } else { None },
+                (rng.next_u64() >> 33) as u32,
+            )
+        } else {
+            None
+        };
         let now = Instant::now();
         let ctx = Rc::new(Ctx {
             dns: Dns::new(kick.clone()),
             tls,
             udp: udp_demux.clone(),
+            lsd: RefCell::new(lsd),
             up_limit: rate::Limiter::new(cfg.upload_rate, now),
             down_limit: rate::Limiter::new(cfg.download_rate, now),
             slots: Cell::new(cfg.unchoke_slots),
@@ -382,6 +405,9 @@ pub fn run(
             uring::spawn(accept_loop(ctx.clone(), l));
         }
         udp_demux.spawn(ctx.closing.clone());
+        if let Some(l) = ctx.lsd.borrow().as_ref() {
+            l.spawn(ctx.clone());
+        }
         uring::spawn(ticker(ctx.clone()));
 
         // Command loop. The eventfd read is always in flight, so the runtime
@@ -431,6 +457,8 @@ async fn accept_loop(ctx: Rc<Ctx>, listener: TcpListener) {
 async fn ticker(ctx: Rc<Ctx>) {
     let mut last_choke = Instant::now();
     let mut last_optimistic = Instant::now();
+    let mut next_lsd = Instant::now() + lsd::ANNOUNCE_INTERVAL;
+    let mut lsd_index = 0usize;
     loop {
         match select2(
             uring::sleep(std::time::Duration::from_millis(100)),
@@ -459,6 +487,21 @@ async fn ticker(ctx: Rc<Ctx>) {
             }
             choke_round(&ctx, &torrents, rotate, now);
         }
+        // LSD: one torrent every `interval / torrents`, round-robin
+        // (libtorrent `on_lsd_announce`).
+        if now >= next_lsd {
+            let n = torrents.len().max(1);
+            next_lsd = now + lsd::ANNOUNCE_INTERVAL / n as u32;
+            if !torrents.is_empty() {
+                let mut ids: Vec<TorrentId> = torrents.iter().map(|t| t.borrow().id).collect();
+                ids.sort();
+                lsd_index %= ids.len();
+                if let Some(t) = ctx.torrent(ids[lsd_index]) {
+                    lsd::announce_now(&ctx, &t);
+                }
+                lsd_index += 1;
+            }
+        }
     }
 }
 
@@ -475,8 +518,8 @@ fn choke_round(ctx: &Ctx, torrents: &[Rc<RefCell<torrent::Torrent>>], rotate: bo
         if !t.is_running() {
             continue;
         }
-        let seeding = t.picker.is_complete();
-        let n = t.info.piece_count();
+        let seeding = t.is_complete();
+        let n = t.piece_count();
         for p in t.peers.values() {
             let (established, interested, choked) = p.choke_state();
             if !established {
@@ -533,7 +576,7 @@ pub fn maybe_unchoke_now(
         .sum();
     let (running, n) = {
         let t = torrent.borrow();
-        (t.is_running(), t.info.piece_count())
+        (t.is_running(), t.piece_count())
     };
     if running && unchoked < ctx.slots.get() && !handle.is_seed(n) {
         handle.set_choked(false, Instant::now());
@@ -634,6 +677,17 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                     let r = torrent::save_resume(&t).await;
                     let _ = reply.send(r);
                 });
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::AddPeer(id, addr, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                t.borrow_mut()
+                    .add_candidates(ctx, &[addr], crate::api::PeerSource::Manual);
+                torrent::on_new_candidates(ctx, &t);
+                let _ = reply.send(Ok(()));
             }
             None => {
                 let _ = reply.send(Err(Error::NoSuchTorrent));

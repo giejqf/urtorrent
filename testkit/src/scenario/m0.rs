@@ -264,6 +264,18 @@ pub fn run_peer_capture(
     tap_enc: crate::tap::peer::TapEncryption,
     tap_initiates_mse: bool,
 ) -> Result<()> {
+    run_peer_capture_with(ctx, oracle_cfg, tag, tap_enc, tap_initiates_mse, false)
+}
+
+/// As [`run_peer_capture`], optionally with **private** torrents (BEP 27).
+pub fn run_peer_capture_with(
+    ctx: &mut Ctx,
+    oracle_cfg: OracleConfig,
+    tag: &str,
+    tap_enc: crate::tap::peer::TapEncryption,
+    tap_initiates_mse: bool,
+    private: bool,
+) -> Result<()> {
     let http: Vec<SocketAddr> = ctx
         .host_addrs()
         .into_iter()
@@ -284,7 +296,13 @@ pub fn run_peer_capture(
         interval: 30,
         ..Default::default()
     })?;
-    let fx_a = fixture("peer-out.bin", &tracker.http_url(0));
+    let fx_a = Arc::new(Fixture::generate(
+        FixtureSpec::small("peer-out.bin")
+            .with_size(2 << 20)
+            .with_piece_length(64 << 10)
+            .private(private)
+            .with_tracker(&tracker.http_url(0)),
+    ));
     tracker.inject_peer(fx_a.info_hash, peer_addr, 0);
     let tap_seed = TapPeer::start(
         TapPeerConfig::new(fx_a.info_hash, Role::Seeder)
@@ -342,6 +360,7 @@ pub fn run_peer_capture(
         FixtureSpec::small("peer-in.bin")
             .with_size(1 << 20)
             .with_piece_length(64 << 10)
+            .private(private)
             .with_tracker(&tracker.http_url(0))
             .with_seed(7),
     ));

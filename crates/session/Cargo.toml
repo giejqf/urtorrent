@@ -23,6 +23,8 @@ mse = { path = "../mse", version = "0.1.0" }
 getrandom = "0.3"
 uring = { path = "../uring", version = "0.1.0" }
 storage = { path = "../storage", version = "0.1.0" }
+# Verifying fetched metadata against the info-hash (BEP 9).
+sha1.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # Public API surface only (AGENTS.md 5.6): runtime-agnostic channels. The
@@ -39,3 +41,4 @@ rustls-pemfile = "2"
 [dev-dependencies]
 # Tests drive the API with a minimal thread-parking executor (no tokio runtime
 # in the library graph, even as a dev-dependency).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }

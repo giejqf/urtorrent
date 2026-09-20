@@ -379,6 +379,31 @@ impl Picker {
         want: usize,
         rng: &mut dyn Rng,
     ) -> Vec<Block> {
+        let sequential = self.sequential;
+        self.pick_mode(peer, has, want, rng, sequential)
+    }
+
+    /// [`Picker::pick`] preferring the lowest-index pieces regardless of the
+    /// torrent's mode: contiguous ranges for web seeds (BEP 19), which fetch
+    /// byte ranges rather than blocks.
+    pub fn pick_contiguous(
+        &mut self,
+        peer: PeerKey,
+        has: &dyn Fn(usize) -> bool,
+        want: usize,
+        rng: &mut dyn Rng,
+    ) -> Vec<Block> {
+        self.pick_mode(peer, has, want, rng, true)
+    }
+
+    fn pick_mode(
+        &mut self,
+        peer: PeerKey,
+        has: &dyn Fn(usize) -> bool,
+        want: usize,
+        rng: &mut dyn Rng,
+        sequential: bool,
+    ) -> Vec<Block> {
         let mut out = Vec::with_capacity(want);
         let mut used: Vec<usize> = Vec::new();
         let end_game = self.end_game();
@@ -399,7 +424,7 @@ impl Picker {
                     continue;
                 }
                 let partial = u64::from(p.blocks.is_none());
-                let key = if self.sequential {
+                let key = if sequential {
                     ((7 - u64::from(p.priority)) << 40) | (i as u64)
                 } else {
                     ((7 - u64::from(p.priority)) << 40)
@@ -415,7 +440,7 @@ impl Picker {
                         best = Some((key, i));
                         ties = 1;
                     }
-                    Some((bk, _)) if key == bk && !self.sequential => {
+                    Some((bk, _)) if key == bk && !sequential => {
                         ties += 1;
                         if rng.below(ties) == 0 {
                             best = Some((key, i));

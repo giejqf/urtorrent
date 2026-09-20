@@ -186,7 +186,7 @@ fn leech_from_seeder_via_tracker() {
 }
 
 #[test]
-fn add_twice_is_duplicate_and_magnet_is_unsupported() {
+fn add_twice_is_duplicate_and_magnets_wait_for_metadata() {
     let dir = std::env::temp_dir().join(format!("urt-session-dup-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let (torrent_bytes, _) = make_torrent("dup.bin", 1000, 16384, "http://127.0.0.1:1/announce");
@@ -204,18 +204,35 @@ fn add_twice_is_duplicate_and_magnet_is_unsupported() {
         block_on(session.add_torrent(AddTorrent::metainfo(torrent_bytes, &dir))),
         Err(session::Error::Duplicate)
     );
+    // A magnet for the same info-hash is the same torrent.
+    let hex = bencode::hex(&block_on(session.status(id)).unwrap().info_hash);
+    assert_eq!(
+        block_on(session.add_torrent(AddTorrent::magnet(
+            format!("magnet:?xt=urn:btih:{hex}"),
+            &dir
+        ))),
+        Err(session::Error::Duplicate)
+    );
     assert!(matches!(
-        block_on(session.add_torrent(AddTorrent {
-            source: session::TorrentSource::Magnet(
-                "magnet:?xt=urn:btih:0000000000000000000000000000000000000000".into()
-            ),
-            save_path: dir.clone(),
-            resume_dir: None,
-            paused: false,
-            sequential: false,
-        })),
-        Err(session::Error::Unsupported(_))
+        block_on(session.add_torrent(AddTorrent::magnet("magnet:?dn=nohash", &dir))),
+        Err(session::Error::Metainfo(_))
     ));
+    // A fresh magnet is accepted and waits for its metadata (BEP 9); until
+    // then the size is unknown and `left` is libtorrent's 16 KiB placeholder
+    // (docs/quirks.md Q12).
+    let magnet = block_on(session.add_torrent(AddTorrent::magnet(
+        "magnet:?xt=urn:btih:0102030405060708090a0b0c0d0e0f1011121314&dn=later&tr=http://127.0.0.1:1/announce",
+        &dir,
+    )))
+    .unwrap();
+    let ms = block_on(session.status(magnet)).unwrap();
+    assert_eq!(ms.state, TorrentState::FetchingMetadata);
+    assert!(!ms.has_metadata);
+    assert_eq!(ms.name, "later");
+    assert_eq!(ms.pieces_total, 0);
+    assert_eq!(ms.left, 16 * 1024);
+    assert_eq!(ms.trackers.len(), 1);
+    block_on(session.remove_torrent(magnet)).unwrap();
     let st = block_on(session.status(id)).unwrap();
     assert_eq!(st.state, TorrentState::Downloading);
     assert_eq!(st.pieces_total, 1);

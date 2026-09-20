@@ -122,6 +122,7 @@ fn replay_oracle_leeching_from_us() {
             .map(|a| a.ip()),
         metadata_size: Some(714),
         advertise_port: true,
+        private: false,
     });
     let mut requests = 0;
     let mut haves = 0;
@@ -229,6 +230,7 @@ fn qbt_ltep_handshake_is_byte_exact() {
                 yourip,
                 oracle.metadata_size,
                 seeding,
+                false,
             );
             if outgoing && !routable {
                 assert_eq!(oracle.p, None, "{file}: Q6 no longer holds");
@@ -306,4 +308,152 @@ fn allowed_fast_set_matches_oracle() {
         }
     }
     assert!(checked >= 1, "no capture with allowed_fast grants");
+}
+
+/// Q11: for a private torrent the oracle's handshake has neither `ut_pex` nor
+/// `ut_metadata` in `m`, and no `metadata_size`; ours must match byte for byte.
+#[test]
+fn qbt_private_ltep_handshake_is_byte_exact() {
+    let profile = profile::Profile::qbt_5_2_3_lt2_0_14();
+    let mut checked = 0;
+    for (file, outgoing, seeding) in [
+        (
+            "capture_peer_private/v4/tap-peer-private-oracle-initiator.jsonl",
+            true,
+            false,
+        ),
+        (
+            "capture_peer_private/v4/tap-peer-private-oracle-responder.jsonl",
+            false,
+            true,
+        ),
+    ] {
+        let Some(conns) = golden(file) else { continue };
+        for c in conns.iter().filter(|c| c["handshake"].is_object()) {
+            let ext_ev = c["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["dir"] == "recv" && e["kind"] == "extended")
+                .expect("oracle ext handshake");
+            let oracle_payload = unhex(ext_ev["detail"]["raw_hex"].as_str().unwrap());
+            let oracle = ExtHandshake::parse(&oracle_payload).unwrap();
+            assert_eq!(
+                oracle.peer_id_for("ut_pex"),
+                None,
+                "{file}: Q11 no longer holds"
+            );
+            assert_eq!(oracle.metadata_size, None, "{file}: Q11 no longer holds");
+            let ours = ExtHandshake::build(
+                &profile.ltep,
+                profile.ltep_version,
+                outgoing,
+                Some(6881),
+                oracle.yourip,
+                Some(393),
+                seeding,
+                true,
+            );
+            assert_eq!(
+                bencode::hex(&ours.encode()),
+                bencode::hex(&oracle_payload),
+                "{file}: private LTEP handshake differs"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 1, "no private capture");
+}
+
+/// Magnet mode (`capture_magnet`): before it has the metadata the oracle
+/// sends its handshake, an LTEP handshake without `metadata_size`, no
+/// have-state at all, and then a `ut_metadata` request for piece 0. Our
+/// connection without metadata behaves the same, byte for byte where bytes
+/// are deterministic.
+#[test]
+fn qbt_magnet_mode_matches_capture() {
+    let Some(conns) = golden("capture_magnet/v4/tap-peer-magnet-oracle.jsonl") else {
+        return;
+    };
+    let profile = profile::Profile::qbt_5_2_3_lt2_0_14();
+    // The first connection is the one without metadata (Q13: the oracle
+    // reconnects once it has it).
+    let c = conns
+        .iter()
+        .find(|c| c["handshake"].is_object())
+        .expect("a connection");
+    let recv: Vec<&Value> = c["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["dir"] == "recv")
+        .collect();
+    let kinds: Vec<&str> = recv.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        &kinds[..3],
+        ["handshake", "extended", "extended"],
+        "oracle first messages in magnet mode: {kinds:?}"
+    );
+    let ext_payload = unhex(recv[1]["detail"]["raw_hex"].as_str().unwrap());
+    let oracle_ext = ExtHandshake::parse(&ext_payload).unwrap();
+    assert_eq!(
+        oracle_ext.metadata_size, None,
+        "no metadata_size without metadata"
+    );
+    assert_eq!(
+        recv[2]["detail"]["ext_id"].as_u64(),
+        Some(2),
+        "ut_metadata under the tap's id"
+    );
+    let req_payload = unhex(recv[2]["detail"]["raw_hex"].as_str().unwrap());
+    assert_eq!(
+        req_payload,
+        wire::ext::Metadata::Request { piece: 0 }.encode(None),
+        "request for piece 0 without total_size"
+    );
+
+    // Ours: same situation (initiator, v4, no metadata).
+    let tap_hs = hs_from_hex(
+        c["events"].as_array().unwrap()[1]["raw_hex"]
+            .as_str()
+            .unwrap(),
+    );
+    let mut conn = Connection::new(ConnectionParams {
+        role: Role::Initiator,
+        info_hash: tap_hs.info_hash,
+        our_peer_id: *b"-qB5230-000000000000",
+        profile: profile.clone(),
+        piece_count: None,
+        our_have: Bitfield::new(0),
+        listen_port: 6881,
+        peer_ip: oracle_ext.yourip,
+        metadata_size: None,
+        advertise_port: true,
+        private: false,
+    });
+    let hs_out = conn.take_outbound();
+    assert_eq!(hs_out.len(), wire::HANDSHAKE_LEN);
+    conn.receive(&tap_hs.encode()).unwrap();
+    let out = conn.take_outbound();
+    let mut f = wire::Framer::new();
+    f.push(&out).unwrap();
+    let mut msgs = Vec::new();
+    while let Some(body) = f.next_frame().unwrap() {
+        msgs.push(Message::decode(body).unwrap());
+    }
+    assert_eq!(
+        msgs.len(),
+        1,
+        "only the LTEP handshake before metadata: {msgs:?}"
+    );
+    match &msgs[0] {
+        Message::Extended { id: 0, payload } => {
+            assert_eq!(
+                bencode::hex(payload),
+                bencode::hex(&ext_payload),
+                "LTEP handshake in magnet mode differs"
+            );
+        }
+        other => panic!("expected LTEP handshake, got {other:?}"),
+    }
 }

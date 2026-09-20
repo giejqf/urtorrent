@@ -9,9 +9,10 @@
 //! libtorrent semantics), event sequencing (`started` / `completed` exactly
 //! once / `stopped`) and failure backoff over an injected clock.
 //!
-//! Also: the BEP 15 UDP tracker packets and connection-id cache ([`udp`]) and
-//! BEP 48 scrape ([`scrape`]). Sans-IO (AGENTS.md 5.2): no sockets, no DNS,
-//! no clocks.
+//! Also: the BEP 15 UDP tracker packets and connection-id cache ([`udp`]),
+//! BEP 48 scrape ([`scrape`]) and the BEP 14 Local Service Discovery
+//! datagrams ([`lsd`]; a peer source like trackers are). Sans-IO (AGENTS.md
+//! 5.2): no sockets, no DNS, no clocks.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -20,6 +21,7 @@
 mod announce;
 mod announcer;
 pub mod http;
+pub mod lsd;
 pub mod scrape;
 pub mod udp;
 mod url;

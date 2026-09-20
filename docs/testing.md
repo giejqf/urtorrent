@@ -8,7 +8,7 @@
 | Fuzz | `fuzz/` | `cargo xtask fuzz <target> [secs]` |
 | Replay | crate tests fed from `testkit/golden` | `cargo xtask check` |
 | Integration | `testkit/src/scenario` | `cargo xtask it [--shape v4\|v6\|dual] [scenario]` |
-| Differential | scenarios tagged `Diff` (`diff_identity`) | `cargo xtask diff` |
+| Differential | scenarios tagged `Diff` (`diff_identity`, `mse_shape`, `dual_stack_announce`, `pex_discovery`, `web_seed_only`, ...) | `cargo xtask diff` |
 | Captures | scenarios tagged `Capture` | `cargo xtask capture` |
 
 ## The lab
@@ -43,7 +43,19 @@ entries).
 The tap-peer speaks MSE (using the library's `mse` crate: interop with the
 oracle validates it, since a symmetric mistake cannot complete a handshake
 with libtorrent) and records the peer's `crypto_provide` / `select` and pad
-lengths (`PeerCapture::mse`).
+lengths (`PeerCapture::mse`). It also serves `ut_metadata` from its fixture
+(so the oracle can be observed in magnet mode) and publishes live snapshots
+of open connections, so a lingering silent tap can be inspected while it is
+still connected (`TapPeer::captures` / `wait_for`).
+
+`tap-webseed` is a GetRight-style range server for a fixture that records
+raw requests; the `web_seed_only` scenario has the oracle and us fetch the
+same torrent from it and compares request line and header order.
+
+Rule 2 (private torrents) is checked on the wire by `private_no_pex_lsd`: a
+pcap of the bridge must hold no LSD datagram from our address, and a silent
+tap connected to us must receive no `ut_pex` message and see an `m` map
+without `ut_pex` / `ut_metadata` (Q11). It needs `tcpdump`.
 
 Run artifacts land in `testkit/runs/<stamp>-<scenario>-<shape>/` (gitignored):
 actor stdout/stderr, oracle profiles and logs, tap logs (`*.jsonl`), pcaps.

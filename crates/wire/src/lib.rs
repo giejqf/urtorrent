@@ -19,11 +19,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod conn;
+pub mod ext;
 mod fast;
 mod framer;
 mod handshake;
 mod ltep;
 mod message;
+mod priority;
 
 pub use conn::{Connection, ConnectionParams, Event, PeerHave, Role};
 pub use fast::allowed_fast_set;
@@ -31,6 +33,7 @@ pub use framer::{Framer, MAX_FRAME};
 pub use handshake::{HANDSHAKE_LEN, Handshake};
 pub use ltep::{EXT_HANDSHAKE_ID, ExtHandshake, MAX_EXT_PAYLOAD};
 pub use message::{MAX_BITFIELD, MAX_BLOCK, Message, Request};
+pub use priority::{crc32c, peer_priority};
 
 /// A peer-wire error. `Protocol` means the peer misbehaved and the connection
 /// must be closed; nothing here is recoverable in place.

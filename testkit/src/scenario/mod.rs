@@ -19,6 +19,7 @@ pub mod m2;
 pub mod m3;
 pub mod m4;
 pub mod m5;
+pub mod m6;
 
 /// Which command a scenario belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +132,7 @@ pub fn all() -> Vec<ScenarioDef> {
     v.extend(m3::scenarios());
     v.extend(m4::scenarios());
     v.extend(m5::scenarios());
+    v.extend(m6::scenarios());
     v
 }
 

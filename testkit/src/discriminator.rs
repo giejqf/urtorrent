@@ -123,6 +123,71 @@ pub struct Fingerprint {
     pub peer: Option<PeerFingerprint>,
     pub udp: Option<UdpFingerprint>,
     pub mse: Option<MseFingerprint>,
+    pub pex: Option<PexFingerprint>,
+}
+
+/// What a tap peer can tell from the first `ut_pex` message it receives
+/// (BEP 11; libtorrent-specific shape).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PexFingerprint {
+    /// Dictionary keys present, sorted (libtorrent always writes all six).
+    pub keys: Vec<String>,
+    /// `added.f` / `added6.f` have one byte per `added` / `added6` entry.
+    pub flags_consistent: bool,
+    /// The recipient's own IP appears in the list (libtorrent does not
+    /// exclude the recipient from the full list).
+    pub includes_recipient_ip: bool,
+    /// Flag bits used across every entry (`0x10` never by libtorrent 2.0).
+    pub flag_bits: u8,
+}
+
+/// Build a PEX fingerprint from the first `ut_pex` message in `c` (the tap
+/// advertised `ut_pex` under `tap_pex_id`).
+pub fn pex_fingerprint(c: &PeerCapture, tap_pex_id: u64) -> Option<PexFingerprint> {
+    let ev = c.recv().find(|e| {
+        e.kind == "extended" && e.detail.get("ext_id").and_then(|v| v.as_u64()) == Some(tap_pex_id)
+    })?;
+    let raw = crate::bencode::unhex(ev.detail.get("raw_hex")?.as_str()?)?;
+    let (v, _) = crate::bencode::decode_prefix(&raw).ok()?;
+    let crate::bencode::Value::Dict(entries) = &v else {
+        return None;
+    };
+    let keys: Vec<String> = entries
+        .keys()
+        .map(|k| String::from_utf8_lossy(k).into_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let bytes = |k: &str| v.get(k).and_then(|x| x.as_bytes()).unwrap_or(&[]).to_vec();
+    let added = bytes("added");
+    let added_f = bytes("added.f");
+    let added6 = bytes("added6");
+    let added6_f = bytes("added6.f");
+    let flags_consistent = added.len() / 6 == added_f.len() && added6.len() / 18 == added6_f.len();
+    let local_ip = c.local.ip();
+    let mut includes = false;
+    for e in added.as_chunks::<6>().0 {
+        if IpAddr::from([e[0], e[1], e[2], e[3]]) == local_ip {
+            includes = true;
+        }
+    }
+    for e in added6.as_chunks::<18>().0 {
+        let mut o = [0u8; 16];
+        o.copy_from_slice(&e[..16]);
+        if IpAddr::from(o) == local_ip {
+            includes = true;
+        }
+    }
+    let flag_bits = added_f
+        .iter()
+        .chain(added6_f.iter())
+        .fold(0u8, |a, b| a | b);
+    Some(PexFingerprint {
+        keys,
+        flags_consistent,
+        includes_recipient_ip: includes,
+        flag_bits,
+    })
 }
 
 /// Build a UDP fingerprint from the datagrams sent by `ips`.
@@ -440,6 +505,25 @@ pub fn diff(a: &Fingerprint, b: &Fingerprint) -> Vec<String> {
         (None, None) => {}
         _ => out.push("peer observation missing on one side".into()),
     }
+    // PEX is only observable in scenarios built for it; its absence on one
+    // side is not a tell.
+    if let (Some(x), Some(y)) = (&a.pex, &b.pex) {
+        if x.keys != y.keys {
+            out.push(format!("L2 ut_pex keys: {:?} vs {:?}", x.keys, y.keys));
+        }
+        if x.flags_consistent != y.flags_consistent {
+            out.push("L2 ut_pex flags length".into());
+        }
+        if x.includes_recipient_ip != y.includes_recipient_ip {
+            out.push(format!(
+                "L2 ut_pex includes recipient: {} vs {}",
+                x.includes_recipient_ip, y.includes_recipient_ip
+            ));
+        }
+        if (x.flag_bits & 0x10) != (y.flag_bits & 0x10) {
+            out.push("L2 ut_pex 0x10 flag use".into());
+        }
+    }
     out
 }
 
@@ -474,6 +558,15 @@ pub fn golden_oracle() -> anyhow::Result<Fingerprint> {
             .map(serde_json::from_str)
             .collect::<Result<_, _>>()?;
         fp.peer = caps.iter().find_map(peer_fingerprint);
+    }
+    if let Some(p) = golden_file("capture_pex", Shape::V4, "tap-peer-pex-A.jsonl") {
+        let caps: Vec<PeerCapture> = std::fs::read_to_string(p)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        // The tap advertises `ut_pex` as 1 (`TapPeerConfig::new`).
+        fp.pex = caps.iter().find_map(|c| pex_fingerprint(c, 1));
     }
     Ok(fp)
 }
@@ -559,6 +652,7 @@ mod tests {
             peer: None,
             udp: None,
             mse: None,
+            pex: None,
         };
         let d = diff(
             &Fingerprint {
@@ -566,6 +660,7 @@ mod tests {
                 peer: None,
                 udp: None,
                 mse: None,
+                pex: None,
             },
             &fp,
         );
@@ -633,6 +728,7 @@ mod tests {
             peer: None,
             udp: None,
             mse: None,
+            pex: None,
         };
         let d = diff(
             &Fingerprint {
@@ -640,6 +736,7 @@ mod tests {
                 peer: None,
                 udp: None,
                 mse: None,
+                pex: None,
             },
             &fp,
         );

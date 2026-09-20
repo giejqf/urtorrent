@@ -40,7 +40,8 @@ pub struct TorrentId(pub u64);
 pub enum TorrentSource {
     /// The bytes of a `.torrent` file.
     Metainfo(Vec<u8>),
-    /// A magnet link (needs `ut_metadata`, M6).
+    /// A magnet link (BEP 9): the metadata is fetched from peers found
+    /// through its trackers (and PEX / LSD).
     Magnet(String),
 }
 
@@ -72,6 +73,17 @@ impl AddTorrent {
         }
     }
 
+    /// Add from a magnet link, saving under `save_path`.
+    pub fn magnet(uri: impl Into<String>, save_path: impl Into<PathBuf>) -> AddTorrent {
+        AddTorrent {
+            source: TorrentSource::Magnet(uri.into()),
+            save_path: save_path.into(),
+            resume_dir: None,
+            paused: false,
+            sequential: false,
+        }
+    }
+
     /// Set the resume directory.
     pub fn resume_dir(mut self, dir: impl Into<PathBuf>) -> AddTorrent {
         self.resume_dir = Some(dir.into());
@@ -94,6 +106,8 @@ impl AddTorrent {
 /// A torrent's lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TorrentState {
+    /// A magnet link waiting for its metadata (BEP 9).
+    FetchingMetadata,
     /// Verifying data on disk.
     Checking,
     /// Downloading (or waiting for peers).
@@ -142,6 +156,11 @@ pub struct TorrentStatus {
     pub state: TorrentState,
     /// Error text when `state == Error`.
     pub error: Option<String>,
+    /// The metadata is known (always true for a `.torrent`; false while a
+    /// magnet link is fetching it).
+    pub has_metadata: bool,
+    /// BEP 27 private torrent (no PEX / LSD / DHT).
+    pub private: bool,
     /// Verified pieces.
     pub pieces_have: usize,
     /// Total pieces.
@@ -170,6 +189,8 @@ pub struct TorrentStatus {
     pub trackers: Vec<TrackerStatus>,
     /// Whether the torrent is complete (all wanted pieces).
     pub complete: bool,
+    /// Web seeds (BEP 19) configured.
+    pub web_seeds: usize,
 }
 
 impl TorrentStatus {
@@ -183,11 +204,28 @@ impl TorrentStatus {
     }
 }
 
+/// Where a peer's address was learned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerSource {
+    /// A tracker reply.
+    Tracker,
+    /// [`Session::add_peer`].
+    Manual,
+    /// Peer exchange (BEP 11).
+    Pex,
+    /// Local Service Discovery (BEP 14).
+    Lsd,
+    /// It connected to us.
+    Incoming,
+}
+
 /// A connected peer, copied out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
     /// Remote address.
     pub addr: SocketAddr,
+    /// How we learned of the peer.
+    pub source: PeerSource,
     /// Peer id (after handshake).
     pub peer_id: Option<[u8; 20]>,
     /// Client name from the LTEP handshake `v`.
@@ -210,6 +248,8 @@ pub struct PeerInfo {
     pub outstanding: usize,
     /// The connection is RC4-encrypted (MSE).
     pub encrypted: bool,
+    /// The peer declared itself upload-only (BEP 21) or is a seed.
+    pub upload_only: bool,
 }
 
 /// Session-wide counters.
@@ -258,6 +298,38 @@ pub enum Event {
     TorrentFinished {
         /// The torrent.
         id: TorrentId,
+    },
+    /// A magnet link's metadata arrived and verified (BEP 9).
+    MetadataReceived {
+        /// The torrent.
+        id: TorrentId,
+    },
+    /// A `ut_pex` message brought peers (BEP 11).
+    PexPeers {
+        /// The torrent.
+        id: TorrentId,
+        /// The peer that sent it.
+        from: SocketAddr,
+        /// New addresses (after filtering).
+        added: usize,
+        /// Addresses dropped.
+        dropped: usize,
+    },
+    /// A Local Service Discovery announce for one of our torrents (BEP 14).
+    LsdPeer {
+        /// The torrent.
+        id: TorrentId,
+        /// The announcing peer.
+        addr: SocketAddr,
+    },
+    /// A web seed (BEP 19) request failed; the seed is retried later.
+    WebSeedError {
+        /// The torrent.
+        id: TorrentId,
+        /// The web seed URL.
+        url: String,
+        /// What went wrong.
+        error: String,
     },
     /// A tracker answered an announce.
     TrackerReply {
@@ -421,6 +493,20 @@ impl SessionBuilder {
         self
     }
 
+    /// Peer exchange (BEP 11), default on. Private torrents never use it
+    /// regardless.
+    pub fn pex(mut self, on: bool) -> Self {
+        self.cfg.pex = on;
+        self
+    }
+
+    /// Local Service Discovery (BEP 14), default on. Private torrents are
+    /// never announced regardless.
+    pub fn lsd(mut self, on: bool) -> Self {
+        self.cfg.lsd = on;
+        self
+    }
+
     /// Trust an additional CA (PEM bundle) for HTTPS trackers, on top of the
     /// Mozilla roots and `SSL_CERT_FILE`.
     pub fn root_certificate_pem(mut self, pem: Vec<u8>) -> Self {
@@ -535,6 +621,12 @@ impl Session {
     /// Write resume data now (fsyncs the content first).
     pub async fn save_resume_data(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::SaveResume(id, tx)).await?
+    }
+
+    /// Add a peer address to try (libtorrent `connect_peer`): a manual
+    /// source alongside trackers, PEX and LSD.
+    pub async fn add_peer(&self, id: TorrentId, addr: SocketAddr) -> Result<(), Error> {
+        self.send(|tx| Command::AddPeer(id, addr, tx)).await?
     }
 
     /// Re-announce as soon as each tracker's `min interval` allows.

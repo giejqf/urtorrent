@@ -20,3 +20,18 @@ logic carry the original copyright notice; the list is maintained here:
   crates/wire/src/fast.rs
       The unmasked-address allowed-fast set (Q7) follows
       bt_peer_connection::send_allowed_set.
+  crates/session/src/engine/pex.rs
+      PEX cadence, eligibility, flags and flood limits follow ut_pex.cpp.
+  crates/session/src/engine/metadata.rs
+      Metadata request scheduling, penalties and serving limits follow
+      ut_metadata.cpp.
+  crates/session/src/engine/lsd.rs, crates/tracker/src/lsd.rs
+      Datagram layout, multicast setup and retry schedule follow lsd.cpp;
+      the session round-robin follows session_impl.cpp (on_lsd_announce).
+  crates/wire/src/priority.rs
+      BEP 40 canonical priority masking follows torrent_peer.cpp
+      (peer_priority).
+  crates/wire/src/conn.rs
+      The deferred allowed-fast set (on `interested`, skipping the peer's
+      pieces) follows peer_connection.cpp (send_allowed_set) and the
+      have-state rules bt_peer_connection.cpp (write_bitfield, on_metadata).

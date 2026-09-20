@@ -23,6 +23,7 @@ use urtorrent::{AddTorrent, Event, Profile, Session, TorrentState};
 
 struct Args {
     torrent: PathBuf,
+    magnet: Option<String>,
     save: PathBuf,
     resume: Option<PathBuf>,
     status: Option<PathBuf>,
@@ -38,11 +39,15 @@ struct Args {
     upload_limit: u64,
     download_limit: u64,
     encryption: String,
+    lsd: bool,
+    pex: bool,
+    add_peers: Vec<std::net::SocketAddr>,
 }
 
 fn parse_args() -> Result<Args> {
     let mut a = Args {
         torrent: PathBuf::new(),
+        magnet: None,
         save: PathBuf::new(),
         resume: None,
         status: None,
@@ -58,12 +63,19 @@ fn parse_args() -> Result<Args> {
         upload_limit: 0,
         download_limit: 0,
         encryption: "enabled".into(),
+        lsd: true,
+        pex: true,
+        add_peers: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut val = || it.next().with_context(|| format!("{k} needs a value"));
         match k.as_str() {
             "--torrent" => a.torrent = PathBuf::from(val()?),
+            "--magnet" => a.magnet = Some(val()?),
+            "--no-lsd" => a.lsd = false,
+            "--no-pex" => a.pex = false,
+            "--add-peer" => a.add_peers.push(val()?.parse()?),
             "--save" => a.save = PathBuf::from(val()?),
             "--resume" => a.resume = Some(PathBuf::from(val()?)),
             "--status" => a.status = Some(PathBuf::from(val()?)),
@@ -82,9 +94,9 @@ fn parse_args() -> Result<Args> {
             other => bail!("unknown argument {other}"),
         }
     }
-    if a.torrent.as_os_str().is_empty() || a.save.as_os_str().is_empty() {
+    if (a.torrent.as_os_str().is_empty() && a.magnet.is_none()) || a.save.as_os_str().is_empty() {
         bail!(
-            "usage: urt-client --torrent <file> --save <dir> [--resume <dir>] [--status <file>] [--control <file>] [--listen-port N] [--profile native|qbt] [--v4 ip|--no-v4] [--v6 ip|--no-v6] [--exit-when-complete] [--sequential]"
+            "usage: urt-client (--torrent <file> | --magnet <uri>) --save <dir> [--resume <dir>] [--status <file>] [--control <file>] [--listen-port N] [--profile native|qbt] [--v4 ip|--no-v4] [--v6 ip|--no-v6] [--exit-when-complete] [--sequential] [--no-lsd] [--no-pex] [--add-peer ip:port]..."
         );
     }
     Ok(a)
@@ -96,6 +108,8 @@ fn peer_json(p: &urtorrent::PeerInfo) -> serde_json::Value {
         "downloaded": p.downloaded, "uploaded": p.uploaded, "is_seed": p.is_seed,
         "peer_id": p.peer_id.map(|id| String::from_utf8_lossy(&id).into_owned()),
         "encrypted": p.encrypted,
+        "source": format!("{:?}", p.source),
+        "upload_only": p.upload_only,
     })
 }
 
@@ -123,7 +137,9 @@ async fn main() -> Result<()> {
         .profile(profile)
         .encryption(encryption)
         .upload_limit(args.upload_limit)
-        .download_limit(args.download_limit);
+        .download_limit(args.download_limit)
+        .lsd(args.lsd)
+        .pex(args.pex);
     if args.no_v4 {
         builder = builder.listen_v4(None);
     } else if let Some(v4) = args.v4 {
@@ -137,12 +153,21 @@ async fn main() -> Result<()> {
     let session = builder.build().await.context("starting the engine")?;
     tracing::info!(port = session.listen_port(), "urt-client up");
     let mut events = session.events();
-    let bytes = std::fs::read(&args.torrent).context("reading torrent")?;
-    let mut add = AddTorrent::metainfo(bytes, &args.save).sequential(args.sequential);
+    let mut add = match &args.magnet {
+        Some(uri) => AddTorrent::magnet(uri.clone(), &args.save),
+        None => {
+            let bytes = std::fs::read(&args.torrent).context("reading torrent")?;
+            AddTorrent::metainfo(bytes, &args.save)
+        }
+    }
+    .sequential(args.sequential);
     if let Some(r) = &args.resume {
         add = add.resume_dir(r);
     }
     let id = session.add_torrent(add).await.context("adding torrent")?;
+    for p in &args.add_peers {
+        session.add_peer(id, *p).await?;
+    }
 
     let mut event_log: Vec<String> = Vec::new();
     let mut peers_seen: std::collections::BTreeMap<String, serde_json::Value> =
@@ -189,6 +214,10 @@ async fn main() -> Result<()> {
                 "peers": st.peers,
                 "seeds": st.seeds,
                 "complete": st.complete,
+                "has_metadata": st.has_metadata,
+                "private": st.private,
+                "name": st.name,
+                "web_seeds": st.web_seeds,
                 "listen_port": session.listen_port(),
                 "trackers": st.trackers.iter().map(|t| serde_json::json!({
                     "url": t.url, "working": t.working, "fails": t.fails,

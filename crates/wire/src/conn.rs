@@ -97,6 +97,8 @@ pub struct ConnectionParams {
     /// session computes this; `true` for a v4 connection with no known
     /// external address, `false` for v6 until one is known.
     pub advertise_port: bool,
+    /// BEP 27 private torrent: no PEX / metadata extensions (Q11).
+    pub private: bool,
 }
 
 /// Something that happened on the connection that the caller must act on.
@@ -195,6 +197,13 @@ pub struct Connection {
     incoming: Vec<Request>,
     allowed_fast_in: Vec<u32>,
     allowed_fast_out: Vec<u32>,
+    /// The allowed-fast set goes out once, on the peer's first `interested`
+    /// (libtorrent defers it to skip pieces the peer already has).
+    sent_allowed_fast: bool,
+    /// Set by [`Connection::set_metadata`]; the have-state is sent then.
+    metadata_known: bool,
+    /// The peer declared itself upload-only (BEP 21).
+    peer_upload_only: bool,
     payload_in: u64,
     payload_out: u64,
     wasted_in: u64,
@@ -222,6 +231,9 @@ impl Connection {
             incoming: Vec::new(),
             allowed_fast_in: Vec::new(),
             allowed_fast_out: Vec::new(),
+            sent_allowed_fast: false,
+            metadata_known: params.piece_count.is_some(),
+            peer_upload_only: false,
             payload_in: 0,
             payload_out: 0,
             wasted_in: 0,
@@ -452,6 +464,40 @@ impl Connection {
         }
     }
 
+    /// Record the peer's BEP 21 `upload_only` state (from its LTEP handshake
+    /// or an `upload_only` message).
+    pub fn set_peer_upload_only(&mut self, on: bool) {
+        self.peer_upload_only = on;
+    }
+
+    /// Whether the peer declared itself upload-only.
+    pub fn peer_upload_only(&self) -> bool {
+        self.peer_upload_only
+    }
+
+    /// Whether the piece count is known (metadata present).
+    pub fn has_metadata(&self) -> bool {
+        self.params.piece_count.is_some()
+    }
+
+    /// The id *we* assigned to extension `name` (what the peer sends us), per
+    /// the profile and the torrent's privacy.
+    pub fn our_ext_id(&self, name: &str) -> Option<u8> {
+        let m = if self.params.private {
+            self.params.profile.ltep.m_private
+        } else {
+            self.params.profile.ltep.m
+        };
+        m.iter().find(|e| e.name == name).map(|e| e.id)
+    }
+
+    /// Whether the peer advertised extension `name`.
+    pub fn peer_supports(&self, name: &str) -> bool {
+        self.peer_ext
+            .as_ref()
+            .is_some_and(|e| e.peer_id_for(name).is_some())
+    }
+
     /// Send an extended message under the id the *peer* assigned to `name`.
     /// Returns `false` if the peer did not advertise the extension.
     pub fn extended(&mut self, name: &str, payload: &[u8]) -> bool {
@@ -530,6 +576,7 @@ impl Connection {
                             self.params.peer_ip,
                             self.params.metadata_size,
                             seeding,
+                            self.params.private,
                         );
                         let payload = ext.encode();
                         self.push(&Message::Extended {
@@ -539,45 +586,108 @@ impl Connection {
                     }
                 }
                 profile::FirstMessage::HaveState => {
-                    let Some(n) = self.params.piece_count else {
-                        // No metadata yet: nothing to say about pieces. With
-                        // the fast extension, `have_none` is still valid.
-                        if self.fast {
-                            self.push(&Message::HaveNone);
-                        }
-                        continue;
-                    };
-                    let have = &self.params.our_have;
-                    if self.fast && n > 0 && have.is_complete() {
-                        self.push(&Message::HaveAll);
-                    } else if self.fast && have.count() == 0 {
-                        self.push(&Message::HaveNone);
-                    } else {
-                        let m = Message::Bitfield(have.as_bytes().to_vec());
-                        self.push(&m);
+                    // Without metadata nothing is said about pieces: libtorrent
+                    // sends neither a bitfield nor `have_none` until the
+                    // metadata is known (then `set_metadata` does).
+                    if self.params.piece_count.is_some() {
+                        self.send_have_state();
                     }
                 }
-                profile::FirstMessage::AllowedFast => {
-                    let k = self.params.profile.peer.allowed_fast_count;
-                    let (Some(n), Some(ip)) = (self.params.piece_count, self.params.peer_ip) else {
-                        continue;
-                    };
-                    if !self.fast || k == 0 || n == 0 || self.params.our_have.count() == 0 {
-                        continue;
-                    }
-                    let set = crate::fast::allowed_fast_set(
-                        ip,
-                        &self.params.info_hash,
-                        n.min(u32::MAX as usize) as u32,
-                        k,
-                        self.params.profile.peer.allowed_fast_addr,
-                    );
-                    for index in set {
-                        if self.params.our_have.get(index as usize) {
-                            self.allow_fast(index);
-                        }
-                    }
+            }
+        }
+    }
+
+    /// `bitfield` / `have_all` / `have_none` for our have-set, libtorrent's
+    /// `write_bitfield`: `have_all` for a seed and `have_none` for nothing
+    /// with the fast extension, nothing at all for nothing without it, a
+    /// `bitfield` otherwise.
+    fn send_have_state(&mut self) {
+        let Some(n) = self.params.piece_count else {
+            return;
+        };
+        let have = &self.params.our_have;
+        if self.fast && n > 0 && have.is_complete() {
+            self.push(&Message::HaveAll);
+        } else if self.fast && have.count() == 0 {
+            self.push(&Message::HaveNone);
+        } else if have.count() == 0 {
+            // Nothing to announce and no way to say so.
+        } else {
+            let m = Message::Bitfield(have.as_bytes().to_vec());
+            self.push(&m);
+        }
+    }
+
+    /// The metadata arrived (magnet link): apply the piece count, translate a
+    /// bitfield the peer sent before we could size it, and send our have-state
+    /// as libtorrent's `on_metadata` does. Returns `HaveChanged` when the
+    /// peer's have-set became known.
+    pub fn set_metadata(
+        &mut self,
+        piece_count: usize,
+        our_have: Bitfield,
+    ) -> Result<Option<Event>, Error> {
+        if self.params.piece_count.is_some() {
+            return Ok(None);
+        }
+        self.params.piece_count = Some(piece_count);
+        self.params.our_have = our_have;
+        self.metadata_known = true;
+        let mut ev = None;
+        if let PeerHave::Raw(raw) = &self.peer_have {
+            if raw.is_empty() {
+                self.peer_have = PeerHave::Pieces(Bitfield::new(piece_count));
+            } else {
+                let bf = Bitfield::from_bytes(raw, piece_count)
+                    .ok_or(Error::Protocol("bitfield length mismatch"))?;
+                self.peer_have = PeerHave::Pieces(bf);
+            }
+            ev = Some(Event::HaveChanged);
+        } else if matches!(self.peer_have, PeerHave::All) {
+            ev = Some(Event::HaveChanged);
+        }
+        if self.established {
+            self.send_have_state();
+            if self.peer_interested && !self.sent_allowed_fast {
+                self.send_allowed_set();
+            }
+        }
+        Ok(ev)
+    }
+
+    /// The BEP 6 allowed-fast grants for this peer (libtorrent
+    /// `send_allowed_set`): `allowed_fast_count` indices from the canonical
+    /// generator, skipping pieces the peer already has; every piece it lacks
+    /// when the torrent has no more pieces than that. Nothing without the
+    /// fast extension, without metadata, or for an upload-only peer.
+    fn send_allowed_set(&mut self) {
+        self.sent_allowed_fast = true;
+        let k = self.params.profile.peer.allowed_fast_count;
+        let (Some(n), Some(ip)) = (self.params.piece_count, self.params.peer_ip) else {
+            return;
+        };
+        if !self.fast || k == 0 || n == 0 || self.peer_upload_only {
+            return;
+        }
+        let peer_has = |c: &Connection, i: u32| c.peer_have.has(i as usize);
+        if (k as usize) >= n {
+            for i in 0..n as u32 {
+                if !peer_has(self, i) {
+                    self.allow_fast(i);
                 }
+            }
+            return;
+        }
+        let set = crate::fast::allowed_fast_set(
+            ip,
+            &self.params.info_hash,
+            n.min(u32::MAX as usize) as u32,
+            k,
+            self.params.profile.peer.allowed_fast_addr,
+        );
+        for index in set {
+            if !peer_has(self, index) {
+                self.allow_fast(index);
             }
         }
     }
@@ -640,6 +750,9 @@ impl Connection {
             }
             Message::Interested => {
                 self.peer_interested = true;
+                if !self.sent_allowed_fast && self.metadata_known {
+                    self.send_allowed_set();
+                }
                 events.push(Event::Interested);
             }
             Message::NotInterested => {
@@ -756,6 +869,9 @@ impl Connection {
                 }
                 if id == EXT_HANDSHAKE_ID {
                     let ext = ExtHandshake::parse(&payload)?;
+                    if ext.upload_only == Some(true) {
+                        self.peer_upload_only = true;
+                    }
                     self.peer_ext = Some(ext.clone());
                     events.push(Event::ExtHandshake(ext));
                 } else {
@@ -787,6 +903,7 @@ mod tests {
             peer_ip: Some("10.0.0.2".parse().unwrap()),
             metadata_size: Some(100),
             advertise_port: true,
+            private: false,
         }
     }
 
@@ -845,14 +962,17 @@ mod tests {
         let msgs = decode_all(&out, true);
         assert!(matches!(msgs[0], Message::Extended { id: 0, .. }));
         assert_eq!(msgs[1], Message::HaveAll);
-        // Seeding with fast: five allowed_fast grants follow (BEP 6 set).
-        assert_eq!(msgs.len(), 7);
-        assert!(
-            msgs[2..]
-                .iter()
-                .all(|m| matches!(m, Message::AllowedFast(_)))
-        );
+        // The allowed-fast set waits for the peer's `interested` (libtorrent).
+        assert_eq!(msgs.len(), 2);
+        assert!(c.allowed_fast_granted().is_empty());
+        c.receive(&Message::Interested.to_bytes()).unwrap();
+        let msgs = decode_all(&c.take_outbound(), false);
+        assert_eq!(msgs.len(), 5);
+        assert!(msgs.iter().all(|m| matches!(m, Message::AllowedFast(_))));
         assert_eq!(c.allowed_fast_granted().len(), 5);
+        // Once only.
+        c.receive(&Message::Interested.to_bytes()).unwrap();
+        assert!(c.take_outbound().is_empty());
         // Seeding: upload_only is not part of the native profile.
         if let Message::Extended { payload, .. } = &msgs[0] {
             let ext = ExtHandshake::parse(payload).unwrap();
@@ -868,10 +988,90 @@ mod tests {
         c.take_outbound();
         c.receive(&peer_hs(PLAIN)).unwrap();
         assert!(!c.ltep() && !c.fast());
-        let msgs = decode_all(&c.take_outbound(), false);
-        assert_eq!(msgs, vec![Message::Bitfield(vec![0, 0])]);
+        // No pieces and no fast extension: nothing to say (libtorrent skips
+        // the empty bitfield).
+        assert!(c.take_outbound().is_empty());
         // fast messages from a non-fast peer are violations
         assert!(c.receive(&Message::HaveAll.to_bytes()).is_err());
+        // With pieces, a bitfield.
+        let mut p = params(Role::Initiator, 12, false);
+        p.our_have.set(3);
+        let mut c = Connection::new(p);
+        c.take_outbound();
+        c.receive(&peer_hs(PLAIN)).unwrap();
+        let msgs = decode_all(&c.take_outbound(), false);
+        assert_eq!(msgs, vec![Message::Bitfield(vec![0x10, 0])]);
+    }
+
+    /// Allowed-fast skips pieces the peer has and covers every piece when
+    /// the torrent is small (libtorrent `send_allowed_set`).
+    #[test]
+    fn allowed_fast_skips_peer_pieces_and_covers_small_torrents() {
+        // 3 pieces < 5 grants: every piece the peer lacks, in index order.
+        let mut c = Connection::new(params(Role::Responder, 3, true));
+        c.receive(&peer_hs(FULL)).unwrap();
+        c.take_outbound();
+        c.receive(&Message::Bitfield(vec![0x40]).to_bytes())
+            .unwrap(); // peer has piece 1
+        c.receive(&Message::Interested.to_bytes()).unwrap();
+        let msgs = decode_all(&c.take_outbound(), false);
+        assert_eq!(msgs, vec![Message::AllowedFast(0), Message::AllowedFast(2)]);
+
+        // 64 pieces: the canonical set minus what the peer has.
+        let p = params(Role::Responder, 64, true);
+        let set = crate::fast::allowed_fast_set(
+            p.peer_ip.unwrap(),
+            &p.info_hash,
+            64,
+            5,
+            p.profile.peer.allowed_fast_addr,
+        );
+        let mut c = Connection::new(p);
+        c.receive(&peer_hs(FULL)).unwrap();
+        c.take_outbound();
+        c.receive(&Message::Have(set[0]).to_bytes()).unwrap();
+        c.receive(&Message::Interested.to_bytes()).unwrap();
+        let msgs = decode_all(&c.take_outbound(), false);
+        let expect: Vec<Message> = set[1..].iter().map(|&i| Message::AllowedFast(i)).collect();
+        assert_eq!(msgs, expect);
+    }
+
+    /// Magnet mode: no have-state until `set_metadata`, which also sizes a
+    /// bitfield the peer sent early.
+    #[test]
+    fn metadata_arrives_later() {
+        let mut p = params(Role::Initiator, 16, false);
+        p.piece_count = None;
+        p.our_have = Bitfield::new(0);
+        let mut c = Connection::new(p);
+        c.take_outbound();
+        c.receive(&peer_hs(FULL)).unwrap();
+        let msgs = decode_all(&c.take_outbound(), false);
+        assert_eq!(msgs.len(), 1, "only the LTEP handshake: {msgs:?}");
+        assert!(!c.has_metadata());
+        // Peer's bitfield is kept raw until we know the piece count.
+        c.receive(&Message::Bitfield(vec![0xff, 0x00]).to_bytes())
+            .unwrap();
+        assert!(matches!(c.peer_have(), PeerHave::Raw(_)));
+        c.receive(&Message::Interested.to_bytes()).unwrap();
+        assert!(
+            c.take_outbound().is_empty(),
+            "no allowed-fast without metadata"
+        );
+        let mut have = Bitfield::new(16);
+        have.set(9);
+        let ev = c.set_metadata(16, have).unwrap();
+        assert!(matches!(ev, Some(Event::HaveChanged)));
+        assert_eq!(c.peer_have().to_bitfield(16).count(), 8);
+        let msgs = decode_all(&c.take_outbound(), false);
+        assert_eq!(msgs[0], Message::Bitfield(vec![0x00, 0x40]));
+        // The interested peer now gets its allowed-fast set (pieces it lacks).
+        assert!(
+            msgs[1..]
+                .iter()
+                .all(|m| matches!(m, Message::AllowedFast(i) if *i >= 8))
+        );
+        assert!(c.has_metadata());
     }
 
     #[test]

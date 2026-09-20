@@ -45,6 +45,7 @@ pub struct ExtHandshake {
 impl ExtHandshake {
     /// Build the handshake we send, from the profile's LTEP shape and the
     /// per-connection facts it depends on.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         shape: &profile::LtepShape,
         version: &str,
@@ -53,9 +54,11 @@ impl ExtHandshake {
         yourip: Option<IpAddr>,
         metadata_size: Option<u32>,
         seeding: bool,
+        private: bool,
     ) -> ExtHandshake {
+        let m = if private { shape.m_private } else { shape.m };
         ExtHandshake {
-            m: shape.m.iter().map(|e| (e.name.to_string(), e.id)).collect(),
+            m: m.iter().map(|e| (e.name.to_string(), e.id)).collect(),
             v: Some(version.to_string()),
             // `listen_port` is `None` when the port is not advertisable to
             // this peer (docs/quirks.md Q6).
@@ -71,7 +74,8 @@ impl ExtHandshake {
             yourip: if shape.yourip { yourip } else { None },
             ipv4: None,
             ipv6: None,
-            metadata_size: if shape.metadata_size {
+            // Q11: no `metadata_size` on private torrents.
+            metadata_size: if shape.metadata_size && !private {
                 metadata_size
             } else {
                 None

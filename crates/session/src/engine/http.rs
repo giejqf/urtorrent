@@ -108,78 +108,142 @@ async fn fetch_once(
     url: &Url,
     request: Vec<u8>,
 ) -> Result<Response, String> {
-    let addrs = dns
-        .resolve(&url.host, url.effective_port())
-        .await
-        .map_err(|e| format!("resolve {}: {e}", url.host))?;
-    let candidates: Vec<SocketAddr> = addrs
-        .into_iter()
-        .filter(|a| families.allows(a.ip()))
-        .collect();
-    if candidates.is_empty() {
-        return Err(format!(
-            "no {} address for {}",
-            if families.v6 && !families.v4 {
-                "IPv6"
-            } else {
-                "IPv4"
-            },
-            url.host
-        ));
-    }
-    let mut last_err = String::new();
-    for addr in candidates {
-        match uring::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                let fut = async {
-                    if url.is_tls() {
-                        let mut s = TlsStream::connect(tls, stream, &url.host).await?;
-                        exchange_tls(&mut s, request).await
+    let mut conn = HttpConn::open(dns, tls, families, url).await?;
+    uring::timeout(
+        RESPONSE_TIMEOUT,
+        conn.request(request, tracker::http::MAX_BODY),
+    )
+    .await
+    .map_err(|_| "tracker response timed out".to_string())?
+}
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream>),
+}
+
+/// One HTTP/1.1 connection (plain or TLS) that can carry several requests
+/// in sequence (keep-alive), as web seeds use.
+pub struct HttpConn {
+    stream: Stream,
+    /// Bytes read past the last response (a pipelining server).
+    pending: Vec<u8>,
+    /// The server asked to close after the last response.
+    closed: bool,
+}
+
+impl HttpConn {
+    /// Resolve and connect (with TLS for `https`), trying each address of
+    /// the allowed families in turn.
+    pub async fn open(
+        dns: &Dns,
+        tls: &TlsClient,
+        families: Families,
+        url: &Url,
+    ) -> Result<HttpConn, String> {
+        let addrs = dns
+            .resolve(&url.host, url.effective_port())
+            .await
+            .map_err(|e| format!("resolve {}: {e}", url.host))?;
+        let candidates: Vec<SocketAddr> = addrs
+            .into_iter()
+            .filter(|a| families.allows(a.ip()))
+            .collect();
+        if candidates.is_empty() {
+            return Err(format!(
+                "no {} address for {}",
+                if families.v6 && !families.v4 {
+                    "IPv6"
+                } else {
+                    "IPv4"
+                },
+                url.host
+            ));
+        }
+        let mut last_err = String::new();
+        for addr in candidates {
+            match uring::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    let stream = if url.is_tls() {
+                        Stream::Tls(Box::new(
+                            uring::timeout(
+                                CONNECT_TIMEOUT,
+                                TlsStream::connect(tls, stream, &url.host),
+                            )
+                            .await
+                            .map_err(|_| "tls handshake timed out".to_string())??,
+                        ))
                     } else {
-                        exchange(&stream, request).await
-                    }
-                };
-                return uring::timeout(RESPONSE_TIMEOUT, fut)
-                    .await
-                    .map_err(|_| "tracker response timed out".to_string())?;
-            }
-            Ok(Err(e)) => last_err = format!("connect {addr}: {e}"),
-            Err(_) => last_err = format!("connect {addr}: timed out"),
-        }
-    }
-    Err(last_err)
-}
-
-async fn exchange(stream: &TcpStream, request: Vec<u8>) -> Result<Response, String> {
-    stream
-        .send_all(Buffer::from_vec(request))
-        .await
-        .map_err(|e| format!("send: {e}"))?;
-    let mut parser = ResponseParser::new();
-    loop {
-        let (r, buf) = stream.recv(Buffer::from_vec(vec![0u8; 16 * 1024])).await;
-        match r {
-            Ok(0) => return parser.finish().map_err(|e| e.to_string()),
-            Ok(_) => {
-                if let Some(resp) = parser.push(buf.as_slice()).map_err(|e| e.to_string())? {
-                    return Ok(resp);
+                        Stream::Plain(stream)
+                    };
+                    return Ok(HttpConn {
+                        stream,
+                        pending: Vec::new(),
+                        closed: false,
+                    });
                 }
+                Ok(Err(e)) => last_err = format!("connect {addr}: {e}"),
+                Err(_) => last_err = format!("connect {addr}: timed out"),
             }
-            Err(e) => return Err(format!("recv: {e}")),
+        }
+        Err(last_err)
+    }
+
+    /// Whether another request may be sent on this connection.
+    pub fn reusable(&self) -> bool {
+        !self.closed
+    }
+
+    /// Send `request` and read one response (body up to `max_body`).
+    pub async fn request(&mut self, request: Vec<u8>, max_body: usize) -> Result<Response, String> {
+        if self.closed {
+            return Err("connection closed by the server".into());
+        }
+        match &mut self.stream {
+            Stream::Plain(s) => {
+                s.send_all(Buffer::from_vec(request))
+                    .await
+                    .map_err(|e| format!("send: {e}"))?;
+            }
+            Stream::Tls(s) => s.send_all(&request).await?,
+        }
+        let mut parser = ResponseParser::with_max_body(max_body);
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            if let Some(resp) = parser.push(&pending).map_err(|e| e.to_string())? {
+                return Ok(self.finish_response(resp, &parser));
+            }
+        }
+        loop {
+            let chunk: Vec<u8> = match &mut self.stream {
+                Stream::Plain(s) => {
+                    let (r, buf) = s.recv(Buffer::from_vec(vec![0u8; 16 * 1024])).await;
+                    match r {
+                        Ok(0) => Vec::new(),
+                        Ok(n) => buf.as_slice()[..n as usize].to_vec(),
+                        Err(e) => return Err(format!("recv: {e}")),
+                    }
+                }
+                Stream::Tls(s) => s.recv(16 * 1024).await?,
+            };
+            if chunk.is_empty() {
+                self.closed = true;
+                return parser.finish().map_err(|e| e.to_string());
+            }
+            if let Some(resp) = parser.push(&chunk).map_err(|e| e.to_string())? {
+                return Ok(self.finish_response(resp, &parser));
+            }
         }
     }
-}
 
-async fn exchange_tls(stream: &mut TlsStream, request: Vec<u8>) -> Result<Response, String> {
-    stream.send_all(&request).await?;
-    let mut parser = ResponseParser::new();
-    loop {
-        let chunk = stream.recv(16 * 1024).await?;
-        if chunk.is_empty() {
-            return parser.finish().map_err(|e| e.to_string());
+    fn finish_response(&mut self, resp: Response, parser: &ResponseParser) -> Response {
+        self.pending = parser.leftover().to_vec();
+        if resp
+            .header("Connection")
+            .is_some_and(|c| c.eq_ignore_ascii_case("close"))
+        {
+            self.closed = true;
         }
-        if let Some(resp) = parser.push(&chunk).map_err(|e| e.to_string())? {
-            return Ok(resp);
-        }
+        resp
     }
 }

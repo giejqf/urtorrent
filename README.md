@@ -19,7 +19,8 @@ oracle-vs-BEP disagreements in [docs/quirks.md](docs/quirks.md).
 | M3 Seed | done: choker, upload path, allowed-fast, rate limits, force recheck, resume after `kill -9`, blame/bans; seeding to the oracle and to Transmission green in v4 / v6 / dual |
 | M4 Identity | done: HTTPS via rustls, profile facts pinned (per-torrent peer id / key, Q6-Q8), discriminator v1 + `xtask diff` (oracle ≡ us under the qbt profile; Transmission and `native` flagged) |
 | M5 Reach | done (PT-complete): UDP tracker, scrape, MSE (all modes vs the oracle), per-listen-socket dual-stack announces, tier failover/backoff, PT-style tracker, uTP-enabled oracle over TCP |
-| M6 Extensions | next |
+| M6 Extensions | done: PEX, `ut_metadata` / magnets, `upload_only`, LSD, web seeds, BEP 40; private torrents proven silent on the wire (Q11); scenarios green in v4 / v6 |
+| M7 Hardening | next |
 
 ## Developer commands
 

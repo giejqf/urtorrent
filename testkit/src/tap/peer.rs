@@ -274,7 +274,11 @@ impl PeerCapture {
 struct Shared {
     config: TapPeerConfig,
     start: Instant,
+    /// Finished connections.
     captures: Mutex<Vec<PeerCapture>>,
+    /// Snapshots of connections still open (so scenarios can observe a
+    /// lingering tap without waiting for it to close).
+    live: Mutex<std::collections::HashMap<u32, PeerCapture>>,
     next_id: AtomicU32,
     stop: AtomicBool,
 }
@@ -292,6 +296,7 @@ impl TapPeer {
             config: config.clone(),
             start: Instant::now(),
             captures: Mutex::new(Vec::new()),
+            live: Mutex::new(std::collections::HashMap::new()),
             next_id: AtomicU32::new(1),
             stop: AtomicBool::new(false),
         });
@@ -334,6 +339,13 @@ impl TapPeer {
         &self.listeners
     }
 
+    /// Ask every connection to end (they record their captures) and wait a
+    /// moment for them to do so. The tap can still be queried afterwards.
+    pub fn stop(&self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(600));
+    }
+
     fn dial(bind: Option<std::net::IpAddr>, addr: SocketAddr) -> Result<TcpStream> {
         let domain = if addr.is_ipv6() {
             socket2::Domain::IPV6
@@ -374,12 +386,20 @@ impl TapPeer {
             });
     }
 
+    /// Every connection so far: closed ones, then snapshots of open ones,
+    /// ordered by id.
     pub fn captures(&self) -> Vec<PeerCapture> {
-        self.shared
+        let mut v: Vec<PeerCapture> = self
+            .shared
             .captures
             .lock()
             .map(|c| c.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Ok(live) = self.shared.live.lock() {
+            v.extend(live.values().cloned());
+        }
+        v.sort_by_key(|c| c.id);
+        v
     }
 
     pub fn wait_for<F: Fn(&[PeerCapture]) -> bool>(&self, timeout: Duration, pred: F) -> bool {
@@ -524,6 +544,9 @@ impl Shared {
         conn.cap.close_reason = reason;
         conn.cap.closed_ms = Some(self.ms());
         let _ = conn.stream.inner().shutdown(std::net::Shutdown::Both);
+        if let Ok(mut l) = self.live.lock() {
+            l.remove(&id);
+        }
         if let Ok(mut c) = self.captures.lock() {
             c.push(conn.cap);
         }
@@ -532,6 +555,17 @@ impl Shared {
 }
 
 impl Conn<'_> {
+    /// Publish a snapshot of this open connection (cheap enough: bulk
+    /// messages only every 32nd event).
+    fn publish(&self, force: bool) {
+        if !force && !self.cap.events.len().is_multiple_of(32) {
+            return;
+        }
+        if let Ok(mut l) = self.sh.live.lock() {
+            l.insert(self.cap.id, self.cap.clone());
+        }
+    }
+
     fn log_send(&mut self, m: &Msg, raw: &[u8]) {
         let raw_hex = match m {
             Msg::Piece { .. } => None,
@@ -545,6 +579,7 @@ impl Conn<'_> {
             detail: m.detail(),
             raw_hex,
         });
+        self.publish(!matches!(m, Msg::Piece { .. } | Msg::Request { .. }));
     }
 
     fn log_recv(&mut self, m: &Msg, raw: &[u8]) {
@@ -560,6 +595,7 @@ impl Conn<'_> {
             detail: m.detail(),
             raw_hex,
         });
+        self.publish(!matches!(m, Msg::Piece { .. } | Msg::Request { .. }));
     }
 
     fn send(&mut self, m: Msg) -> io::Result<()> {
@@ -641,6 +677,7 @@ impl Conn<'_> {
         self.cap.first_bytes_hex = bencode::hex(&raw[..raw.len().min(68)]);
         self.cap.handshake = Some(HandshakeView::from(&hs, &raw));
         self.cap.events.push(PeerEvent { ts_ms: self.sh.ms(), dir: "recv".into(), kind: "handshake".into(), len: raw.len(), detail: serde_json::json!({ "reserved": reserved::describe(&hs.reserved), "peer_id": String::from_utf8_lossy(&hs.peer_id) }), raw_hex: Some(bencode::hex(&raw)) });
+        self.publish(true);
         self.their_hs = Some(hs);
         Ok(true)
     }
@@ -744,6 +781,7 @@ impl Conn<'_> {
             detail: serde_json::json!({ "reserved": reserved::describe(&hs.reserved), "peer_id": String::from_utf8_lossy(&hs.peer_id), "encrypted": true }),
             raw_hex: Some(bencode::hex(&raw)),
         });
+        self.publish(true);
         self.their_hs = Some(hs);
         Ok(true)
     }
@@ -825,6 +863,68 @@ impl Conn<'_> {
             .as_ref()
             .map(|f| f.piece_count())
             .unwrap_or(0)
+    }
+
+    /// The id we advertised for extension `name` in our LTEP handshake.
+    fn our_ext_id(&self, name: &str) -> Option<i64> {
+        self.sh
+            .config
+            .ext_handshake
+            .as_ref()?
+            .get("m")?
+            .get(name)?
+            .as_int()
+    }
+
+    /// The id the peer advertised for extension `name`.
+    fn their_ext_id(&self, name: &str) -> Option<i64> {
+        self.their_ext.as_ref()?.get("m")?.get(name)?.as_int()
+    }
+
+    /// Answer a `ut_metadata` message (BEP 9).
+    fn serve_metadata(&mut self, payload: &[u8]) -> io::Result<()> {
+        let Some(their_id) = self.their_ext_id("ut_metadata") else {
+            return Ok(());
+        };
+        let Ok((req, _)) = bencode::decode_prefix(payload) else {
+            return Ok(());
+        };
+        let msg_type = req.get("msg_type").and_then(|v| v.as_int()).unwrap_or(-1);
+        let piece = req.get("piece").and_then(|v| v.as_int()).unwrap_or(-1);
+        if msg_type != 0 || piece < 0 {
+            return Ok(());
+        }
+        let raw: Option<Vec<u8>> = self.sh.config.fixture.as_ref().and_then(|fx| {
+            bencode::value_span(&fx.torrent, b"info")
+                .ok()
+                .flatten()
+                .map(|sp| fx.torrent[sp].to_vec())
+        });
+        let mut reply = Value::dict();
+        let mut data = Vec::new();
+        match (&raw, self.sh.config.role) {
+            (Some(raw), Role::Seeder) if (piece as usize) * 16384 < raw.len() => {
+                let off = piece as usize * 16384;
+                let end = (off + 16384).min(raw.len());
+                reply.insert("msg_type", Value::Int(1));
+                reply.insert("piece", Value::Int(piece));
+                reply.insert("total_size", Value::Int(raw.len() as i64));
+                data.extend_from_slice(&raw[off..end]);
+            }
+            _ => {
+                reply.insert("msg_type", Value::Int(2));
+                reply.insert("piece", Value::Int(piece));
+                if let Some(raw) = &raw {
+                    reply.insert("total_size", Value::Int(raw.len() as i64));
+                }
+            }
+        }
+        let mut out = reply.encode();
+        out.extend_from_slice(&data);
+        self.send(Msg::Extended {
+            id: their_id as u8,
+            payload: out,
+        })
     }
 
     fn send_initial(&mut self) -> io::Result<()> {
@@ -1061,6 +1161,14 @@ impl Conn<'_> {
                 if let Ok(v) = bencode::decode(&payload) {
                     self.their_ext = Some(v);
                 }
+            }
+            // `ut_metadata` (BEP 9) requests under the id we advertised: a
+            // seeder with a fixture serves the raw info dictionary in 16 KiB
+            // pieces; anything else is rejected (`msg_type 2`).
+            Msg::Extended { id, payload }
+                if Some(i64::from(id)) == self.our_ext_id("ut_metadata") =>
+            {
+                self.serve_metadata(&payload)?;
             }
             Msg::HaveAll
             | Msg::Have(_)

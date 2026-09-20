@@ -26,6 +26,12 @@ pub struct ClientConfig {
     pub download_limit: u64,
     /// `disabled` / `enabled` / `forced`.
     pub encryption: String,
+    /// Local Service Discovery.
+    pub lsd: bool,
+    /// Peer exchange.
+    pub pex: bool,
+    /// Manually added peers (`Session::add_peer`).
+    pub add_peers: Vec<std::net::SocketAddr>,
     /// Extra environment (e.g. `RUST_LOG`).
     pub env: Vec<(String, String)>,
 }
@@ -41,6 +47,9 @@ impl Default for ClientConfig {
             upload_limit: 0,
             download_limit: 0,
             encryption: "enabled".into(),
+            lsd: true,
+            pex: true,
+            add_peers: Vec::new(),
             env: vec![("RUST_LOG".into(), "debug".into())],
         }
     }
@@ -49,6 +58,18 @@ impl Default for ClientConfig {
 impl ClientConfig {
     pub fn profile(mut self, p: &str) -> Self {
         self.profile = p.into();
+        self
+    }
+    pub fn lsd(mut self, on: bool) -> Self {
+        self.lsd = on;
+        self
+    }
+    pub fn pex(mut self, on: bool) -> Self {
+        self.pex = on;
+        self
+    }
+    pub fn add_peer(mut self, a: std::net::SocketAddr) -> Self {
+        self.add_peers.push(a);
         self
     }
     pub fn upload_limit(mut self, bytes_per_sec: u64) -> Self {
@@ -103,6 +124,14 @@ pub struct ClientStatus {
     #[serde(default)]
     pub complete: bool,
     #[serde(default)]
+    pub has_metadata: bool,
+    #[serde(default)]
+    pub private: bool,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub web_seeds: usize,
+    #[serde(default)]
     pub listen_port: u16,
     #[serde(default)]
     pub trackers: Vec<ClientTracker>,
@@ -145,6 +174,11 @@ pub struct ClientPeer {
     pub peer_id: Option<String>,
     #[serde(default)]
     pub encrypted: bool,
+    /// `Tracker` / `Manual` / `Pex` / `Lsd` / `Incoming`.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub upload_only: bool,
 }
 
 /// A running client.
@@ -173,9 +207,25 @@ pub fn client_binary() -> Result<PathBuf> {
     )
 }
 
+/// What the client downloads.
+#[derive(Clone, Debug)]
+pub enum Source {
+    Torrent(PathBuf),
+    Magnet(String),
+}
+
 impl UrtClient {
     /// Launch the client inside `actor` with `torrent` (a `.torrent` file).
     pub fn launch(actor: &Actor, config: ClientConfig, torrent: &Path) -> Result<UrtClient> {
+        UrtClient::launch_source(actor, config, &Source::Torrent(torrent.to_path_buf()))
+    }
+
+    /// Launch with a magnet link.
+    pub fn launch_magnet(actor: &Actor, config: ClientConfig, magnet: &str) -> Result<UrtClient> {
+        UrtClient::launch_source(actor, config, &Source::Magnet(magnet.to_string()))
+    }
+
+    fn launch_source(actor: &Actor, config: ClientConfig, source: &Source) -> Result<UrtClient> {
         let bin = client_binary()?;
         let save_path = actor.log_dir.join("data");
         let resume_dir = actor.log_dir.join("resume");
@@ -186,9 +236,11 @@ impl UrtClient {
         let _ = std::fs::remove_file(&status_path);
         let _ = std::fs::remove_file(&control_path);
         let mut cmd = actor.command_with_env(&bin, &config.env);
-        cmd.arg("--torrent")
-            .arg(torrent)
-            .arg("--save")
+        match source {
+            Source::Torrent(t) => cmd.arg("--torrent").arg(t),
+            Source::Magnet(m) => cmd.arg("--magnet").arg(m),
+        };
+        cmd.arg("--save")
             .arg(&save_path)
             .arg("--status")
             .arg(&status_path)
@@ -208,6 +260,15 @@ impl UrtClient {
             cmd.arg("--exit-when-complete");
         }
         cmd.arg("--encryption").arg(&config.encryption);
+        if !config.lsd {
+            cmd.arg("--no-lsd");
+        }
+        if !config.pex {
+            cmd.arg("--no-pex");
+        }
+        for p in &config.add_peers {
+            cmd.arg("--add-peer").arg(p.to_string());
+        }
         if config.upload_limit > 0 {
             cmd.arg("--upload-limit")
                 .arg(config.upload_limit.to_string());

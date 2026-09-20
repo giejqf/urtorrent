@@ -125,6 +125,21 @@ fn make_socket(addr: &SocketAddr, ty: libc::c_int) -> io::Result<RawFd> {
     Ok(fd)
 }
 
+/// `setsockopt` with a plain-old-data option value.
+fn setsockopt<T>(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &T) -> io::Result<()> {
+    // SAFETY: `value` is a live POD value of exactly `size_of::<T>()` bytes.
+    let r = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            value as *const T as *const libc::c_void,
+            mem::size_of::<T>() as libc::socklen_t,
+        )
+    };
+    if r < 0 { Err(last_os_error()) } else { Ok(()) }
+}
+
 fn bind_socket(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
     let raw = RawSockAddr::from(*addr);
     // SAFETY: `raw` outlives the call; ptr/len describe a valid sockaddr.
@@ -353,6 +368,69 @@ impl UdpSocket {
         let fd = make_socket(&addr, libc::SOCK_DGRAM)?;
         let owned = OwnedFd::new(fd);
         bind_socket(fd, &addr)?;
+        let local = local_addr_of(fd)?;
+        Ok(UdpSocket { fd: owned, local })
+    }
+
+    /// Bind a multicast receiver/sender for `group` on port `port` (BEP 14
+    /// LSD): `SO_REUSEADDR`, bound to the wildcard address of the group's
+    /// family, joined on `iface` (a local address for IPv4, ignored for IPv6
+    /// where the kernel's default interface is used), with `hops` as the
+    /// TTL / hop limit and multicast loopback on. One-time setup with
+    /// blocking `setsockopt` calls (AGENTS.md 5.3, non-critical); every
+    /// datagram afterwards moves over the ring.
+    pub fn bind_multicast(
+        group: IpAddr,
+        port: u16,
+        iface: Option<IpAddr>,
+        hops: u8,
+    ) -> Result<UdpSocket> {
+        let any = match group {
+            IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+        };
+        let fd = make_socket(&any, libc::SOCK_DGRAM)?;
+        let owned = OwnedFd::new(fd);
+        bind_socket(fd, &any)?;
+        let hops_i: libc::c_int = libc::c_int::from(hops);
+        let one: libc::c_int = 1;
+        match group {
+            IpAddr::V4(g) => {
+                let iface_v4 = match iface {
+                    Some(IpAddr::V4(a)) => a,
+                    _ => Ipv4Addr::UNSPECIFIED,
+                };
+                let mreq = libc::ip_mreqn {
+                    imr_multiaddr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(g.octets()),
+                    },
+                    imr_address: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(iface_v4.octets()),
+                    },
+                    imr_ifindex: 0,
+                };
+                setsockopt(fd, libc::IPPROTO_IP, libc::IP_ADD_MEMBERSHIP, &mreq)?;
+                setsockopt(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_TTL, &hops_i)?;
+                setsockopt(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_LOOP, &one)?;
+                if !iface_v4.is_unspecified() {
+                    let out = libc::in_addr {
+                        s_addr: u32::from_ne_bytes(iface_v4.octets()),
+                    };
+                    setsockopt(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_IF, &out)?;
+                }
+            }
+            IpAddr::V6(g) => {
+                let mreq = libc::ipv6_mreq {
+                    ipv6mr_multiaddr: libc::in6_addr {
+                        s6_addr: g.octets(),
+                    },
+                    ipv6mr_interface: 0,
+                };
+                setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_ADD_MEMBERSHIP, &mreq)?;
+                setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, &hops_i)?;
+                setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_LOOP, &one)?;
+            }
+        }
         let local = local_addr_of(fd)?;
         Ok(UdpSocket { fd: owned, local })
     }
