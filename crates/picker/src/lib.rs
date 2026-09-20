@@ -81,6 +81,9 @@ pub struct Picker {
     /// Wanted blocks not requested by anyone and not received.
     free_blocks: u64,
     have_count: usize,
+    /// Pieces only one peer may download (after a hash failure with several
+    /// suppliers, so the next failure has a single culprit).
+    exclusive: std::collections::HashMap<usize, PeerKey>,
 }
 
 /// Maximum distinct pieces one `pick` call opens (keeps a single call cheap).
@@ -107,6 +110,7 @@ impl Picker {
             sequential: false,
             free_blocks: 0,
             have_count: 0,
+            exclusive: std::collections::HashMap::new(),
         };
         p.recount_free();
         p
@@ -186,8 +190,22 @@ impl Picker {
         self.recount_free();
     }
 
+    /// Only `peer` may download piece `i` from now on (until the piece
+    /// verifies, fails again, or the peer leaves).
+    pub fn set_exclusive(&mut self, i: usize, peer: PeerKey) {
+        if i < self.pieces.len() {
+            self.exclusive.insert(i, peer);
+        }
+    }
+
+    /// The peer piece `i` is reserved for, if any.
+    pub fn exclusive(&self, i: usize) -> Option<PeerKey> {
+        self.exclusive.get(&i).copied()
+    }
+
     /// Piece `i` verified: we have it.
     pub fn piece_verified(&mut self, i: usize) {
+        self.exclusive.remove(&i);
         let Some(p) = self.pieces.get_mut(i) else {
             return;
         };
@@ -204,6 +222,7 @@ impl Picker {
     /// Piece `i` failed its hash: every block goes back to free (the caller
     /// attributes blame to the peers that supplied it).
     pub fn piece_failed(&mut self, i: usize) {
+        self.exclusive.remove(&i);
         let Some(p) = self.pieces.get_mut(i) else {
             return;
         };
@@ -373,6 +392,9 @@ impl Picker {
                 if p.have || p.priority == 0 || !has(i) || used.contains(&i) {
                     continue;
                 }
+                if self.exclusive.get(&i).is_some_and(|k| *k != peer) {
+                    continue;
+                }
                 if !self.pickable(i, peer, end_game) {
                     continue;
                 }
@@ -532,6 +554,7 @@ impl Picker {
     /// `peer` disconnected: release everything it had outstanding. Returns the
     /// released blocks.
     pub fn peer_gone(&mut self, peer: PeerKey) -> Vec<Block> {
+        self.exclusive.retain(|_, k| *k != peer);
         let mut released = Vec::new();
         for piece in 0..self.pieces.len() {
             let n = self.blocks_in(piece);
@@ -744,6 +767,24 @@ mod tests {
         p.peer_joined(&rare);
         let got = p.pick(6, &all, 1, &mut rng);
         assert_eq!(got[0].piece, 2);
+    }
+
+    #[test]
+    fn exclusive_piece_goes_to_one_peer_until_resolved() {
+        let mut p = Picker::new(2, BLOCK_SIZE, u64::from(BLOCK_SIZE) * 2);
+        let mut rng = Lcg(11);
+        p.peer_joined(&Bitfield::all_set(2));
+        p.set_exclusive(0, 7);
+        let got = p.pick(1, &all, 4, &mut rng);
+        assert_eq!(got.iter().map(|b| b.piece).collect::<Vec<_>>(), vec![1]);
+        let got7 = p.pick(7, &all, 4, &mut rng);
+        assert_eq!(got7.iter().map(|b| b.piece).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(p.exclusive(0), Some(7));
+        // The exclusive peer leaves: its block is free for anyone again.
+        p.peer_gone(7);
+        assert_eq!(p.exclusive(0), None);
+        let got = p.pick(1, &all, 4, &mut rng);
+        assert_eq!(got.iter().map(|b| b.piece).collect::<Vec<_>>(), vec![0]);
     }
 
     #[test]

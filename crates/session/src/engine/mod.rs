@@ -10,10 +10,12 @@
 //! that need the command loop's attention ring the same eventfd.
 
 mod bridge;
+mod choker;
 mod dns;
 mod http;
 mod local;
 mod peer;
+mod rate;
 mod rng;
 mod torrent;
 mod tracker_task;
@@ -47,6 +49,12 @@ pub struct EngineConfig {
     pub max_half_open: usize,
     pub hash_threads: usize,
     pub ring_entries: u32,
+    /// Session upload limit in bytes/s (0 = unlimited).
+    pub upload_rate: u64,
+    /// Session download limit in bytes/s (0 = unlimited).
+    pub download_rate: u64,
+    /// Session-wide unchoke slots.
+    pub unchoke_slots: usize,
 }
 
 impl Default for EngineConfig {
@@ -60,6 +68,9 @@ impl Default for EngineConfig {
             max_half_open: 10,
             hash_threads: 2,
             ring_entries: 1024,
+            upload_rate: 0,
+            download_rate: 0,
+            unchoke_slots: choker::DEFAULT_SLOTS,
         }
     }
 }
@@ -76,6 +87,9 @@ pub enum Command {
     Stats(oneshot::Sender<SessionStats>),
     SaveResume(TorrentId, oneshot::Sender<Result<(), Error>>),
     ForceReannounce(TorrentId, oneshot::Sender<Result<(), Error>>),
+    ForceRecheck(TorrentId, oneshot::Sender<Result<(), Error>>),
+    SetRateLimits(u64, u64, oneshot::Sender<()>),
+    SetTorrentRateLimits(TorrentId, u64, u64, oneshot::Sender<Result<(), Error>>),
     Subscribe(mpsc::Sender<Event>),
     Shutdown(oneshot::Sender<()>),
 }
@@ -103,6 +117,11 @@ pub struct Ctx {
     pub kick: NotifyHandle,
     pub recv_pool: BufferPool,
     pub closing: Rc<Flag>,
+    /// Session-wide rate limits.
+    pub up_limit: Rc<rate::Limiter>,
+    pub down_limit: Rc<rate::Limiter>,
+    slots: Cell<usize>,
+    optimistic: Cell<Option<u64>>,
     subscribers: RefCell<Vec<Subscriber>>,
     torrents: RefCell<HashMap<TorrentId, Rc<RefCell<Torrent>>>>,
     by_hash: RefCell<HashMap<InfoHash, TorrentId>>,
@@ -258,8 +277,13 @@ pub fn run(
         };
         let pool = Rc::new(HashPool::new(cfg.hash_threads));
         pool.attach_notifier(kick.clone());
+        let now = Instant::now();
         let ctx = Rc::new(Ctx {
             dns: Dns::new(kick.clone()),
+            up_limit: rate::Limiter::new(cfg.upload_rate, now),
+            down_limit: rate::Limiter::new(cfg.download_rate, now),
+            slots: Cell::new(cfg.unchoke_slots),
+            optimistic: Cell::new(None),
             peer_id,
             listen_port: port,
             families,
@@ -292,6 +316,7 @@ pub fn run(
         for l in listeners {
             uring::spawn(accept_loop(ctx.clone(), l));
         }
+        uring::spawn(ticker(ctx.clone()));
 
         // Command loop. The eventfd read is always in flight, so the runtime
         // never observes a stall.
@@ -331,6 +356,121 @@ async fn accept_loop(ctx: Rc<Ctx>, listener: TcpListener) {
             }
             Either::Right(()) => break,
         }
+    }
+}
+
+/// The session's 100 ms heartbeat: refills the rate limiters and runs the
+/// choker every `UNCHOKE_INTERVAL` (rotating the optimistic slot every
+/// `OPTIMISTIC_INTERVAL`).
+async fn ticker(ctx: Rc<Ctx>) {
+    let mut last_choke = Instant::now();
+    let mut last_optimistic = Instant::now();
+    loop {
+        match select2(
+            uring::sleep(std::time::Duration::from_millis(100)),
+            ctx.closing.wait(),
+        )
+        .await
+        {
+            Either::Left(()) => {}
+            Either::Right(()) => break,
+        }
+        let now = Instant::now();
+        ctx.up_limit.tick(now);
+        ctx.down_limit.tick(now);
+        let torrents: Vec<Rc<RefCell<torrent::Torrent>>> =
+            ctx.torrents.borrow().values().cloned().collect();
+        for t in &torrents {
+            let t = t.borrow();
+            t.up_limit.tick(now);
+            t.down_limit.tick(now);
+        }
+        if now.duration_since(last_choke) >= choker::UNCHOKE_INTERVAL {
+            last_choke = now;
+            let rotate = now.duration_since(last_optimistic) >= choker::OPTIMISTIC_INTERVAL;
+            if rotate {
+                last_optimistic = now;
+            }
+            choke_round(&ctx, &torrents, rotate, now);
+        }
+    }
+}
+
+fn peer_choke_key(torrent: TorrentId, peer: u32) -> u64 {
+    (torrent.0 << 32) | u64::from(peer)
+}
+
+/// One choking round across every torrent (session-wide slot budget).
+fn choke_round(ctx: &Ctx, torrents: &[Rc<RefCell<torrent::Torrent>>], rotate: bool, now: Instant) {
+    let mut cands = Vec::new();
+    let mut handles: HashMap<u64, Rc<peer::PeerHandle>> = HashMap::new();
+    for t in torrents {
+        let t = t.borrow();
+        if !t.is_running() {
+            continue;
+        }
+        let seeding = t.picker.is_complete();
+        let n = t.info.piece_count();
+        for p in t.peers.values() {
+            let (established, interested, choked) = p.choke_state();
+            if !established {
+                continue;
+            }
+            let key = peer_choke_key(t.id, p.key);
+            cands.push(choker::Candidate {
+                key,
+                interested,
+                choked,
+                last_unchoke: p.last_unchoke.get(),
+                download_rate: p.download_rate(),
+                seeding,
+                peer_is_seed: p.is_seed(n),
+            });
+            handles.insert(key, p.clone());
+        }
+    }
+    let d = choker::round(&cands, ctx.slots.get(), ctx.optimistic.get(), rotate);
+    for k in &d.choke {
+        if let Some(p) = handles.get(k) {
+            p.set_choked(true, now);
+        }
+    }
+    for k in &d.unchoke {
+        if let Some(p) = handles.get(k) {
+            p.set_choked(false, now);
+        }
+    }
+    ctx.optimistic.set(d.optimistic);
+}
+
+/// A peer just became interested: unchoke it now if a slot is free (the next
+/// round may still rearrange).
+pub fn maybe_unchoke_now(
+    ctx: &Ctx,
+    torrent: &Rc<RefCell<torrent::Torrent>>,
+    handle: &peer::PeerHandle,
+) {
+    let unchoked: usize = ctx
+        .torrents
+        .borrow()
+        .values()
+        .map(|t| {
+            t.borrow()
+                .peers
+                .values()
+                .filter(|p| {
+                    let (est, _, choked) = p.choke_state();
+                    est && !choked
+                })
+                .count()
+        })
+        .sum();
+    let (running, n) = {
+        let t = torrent.borrow();
+        (t.is_running(), t.info.piece_count())
+    };
+    if running && unchoked < ctx.slots.get() && !handle.is_seed(n) {
+        handle.set_choked(false, Instant::now());
     }
 }
 
@@ -436,6 +576,36 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         Command::ForceReannounce(id, reply) => match ctx.torrent(id) {
             Some(t) => {
                 t.borrow_mut().force_reannounce(Instant::now());
+                let _ = reply.send(Ok(()));
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::ForceRecheck(id, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let ctx2 = ctx.clone();
+                uring::spawn(async move {
+                    torrent::recheck(ctx2, t).await;
+                    let _ = reply.send(Ok(()));
+                });
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::SetRateLimits(up, down, reply) => {
+            let now = Instant::now();
+            ctx.up_limit.set_rate(up, now);
+            ctx.down_limit.set_rate(down, now);
+            let _ = reply.send(());
+        }
+        Command::SetTorrentRateLimits(id, up, down, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let now = Instant::now();
+                let t = t.borrow();
+                t.up_limit.set_rate(up, now);
+                t.down_limit.set_rate(down, now);
                 let _ = reply.send(Ok(()));
             }
             None => {

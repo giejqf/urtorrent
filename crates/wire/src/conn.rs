@@ -322,6 +322,16 @@ impl Connection {
         !self.outbound.is_empty()
     }
 
+    /// Bytes queued for sending.
+    pub fn outbound_len(&self) -> usize {
+        self.outbound.len()
+    }
+
+    /// Pieces we granted the peer allowed-fast for.
+    pub fn allowed_fast_granted(&self) -> &[u32] {
+        &self.allowed_fast_out
+    }
+
     // --- outgoing actions ---
 
     fn push(&mut self, m: &Message) {
@@ -536,6 +546,27 @@ impl Connection {
                     } else {
                         let m = Message::Bitfield(have.as_bytes().to_vec());
                         self.push(&m);
+                    }
+                }
+                profile::FirstMessage::AllowedFast => {
+                    let k = self.params.profile.peer.allowed_fast_count;
+                    let (Some(n), Some(ip)) = (self.params.piece_count, self.params.peer_ip) else {
+                        continue;
+                    };
+                    if !self.fast || k == 0 || n == 0 || self.params.our_have.count() == 0 {
+                        continue;
+                    }
+                    let set = crate::fast::allowed_fast_set(
+                        ip,
+                        &self.params.info_hash,
+                        n.min(u32::MAX as usize) as u32,
+                        k,
+                        self.params.profile.peer.allowed_fast_addr,
+                    );
+                    for index in set {
+                        if self.params.our_have.get(index as usize) {
+                            self.allow_fast(index);
+                        }
                     }
                 }
             }
@@ -804,6 +835,14 @@ mod tests {
         let msgs = decode_all(&out, true);
         assert!(matches!(msgs[0], Message::Extended { id: 0, .. }));
         assert_eq!(msgs[1], Message::HaveAll);
+        // Seeding with fast: five allowed_fast grants follow (BEP 6 set).
+        assert_eq!(msgs.len(), 7);
+        assert!(
+            msgs[2..]
+                .iter()
+                .all(|m| matches!(m, Message::AllowedFast(_)))
+        );
+        assert_eq!(c.allowed_fast_granted().len(), 5);
         // Seeding: upload_only is not part of the native profile.
         if let Message::Extended { payload, .. } = &msgs[0] {
             let ext = ExtHandshake::parse(payload).unwrap();

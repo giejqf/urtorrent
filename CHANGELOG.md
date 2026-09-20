@@ -61,3 +61,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fuzz targets: `wire_message`, `wire_connection`, `ltep_handshake`,
     `announce_response`, `http_response`.
   - `docs/quirks.md` Q6: LTEP `p` omitted on non-routable listen sockets.
+- M3 seed:
+  - Upload path: per-peer request queue served from disk with outbound
+    backpressure; truthful `uploaded`; seed-to-seed connections closed.
+  - Choker (session-wide slots, libtorrent-style: rate-ranked with an
+    optimistic slot when leeching, round-robin when seeding, immediate unchoke
+    on interest while a slot is free).
+  - BEP 6 allowed-fast grants as a profile-driven first message; the set is
+    seeded the way the oracle does it (`docs/quirks.md` Q7, pinned by a golden
+    replay test) or per the BEP for `native`.
+  - Rate limits: session and per-torrent token buckets on both directions,
+    applied in the reader/writer; `Session::set_rate_limits`,
+    `set_torrent_rate_limits`, builder `upload_limit`/`download_limit`.
+  - `Session::force_recheck`; asynchronous initial check (`add_torrent` returns
+    immediately, `Checking` state); resume data trusted only while every
+    content file exists.
+  - Blame: trust points per address, immediate ban for a sole supplier of a
+    bad piece, exclusive re-download of a shared bad piece to pin the culprit.
+  - Announcer: `start()` after `stop()` re-announces at once; in-flight
+    announces land before `stopped` is decided.
+  - testkit: Transmission driver (RPC), default route per actor plus a FORWARD
+    drop rule (Transmission needs a route; the lab still cannot reach the
+    internet), `xtask doctor` AppArmor check; scenarios `seed_to_oracle`,
+    `seed_to_transmission` (v4/v6/dual), `pause_resume`, `kill9_resume`,
+    `recheck_corrupted`, `hash_fail_ban`, `rate_limits`.

@@ -19,12 +19,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod conn;
+mod fast;
 mod framer;
 mod handshake;
 mod ltep;
 mod message;
 
 pub use conn::{Connection, ConnectionParams, Event, PeerHave, Role};
+pub use fast::allowed_fast_set;
 pub use framer::{Framer, MAX_FRAME};
 pub use handshake::{HANDSHAKE_LEN, Handshake};
 pub use ltep::{EXT_HANDSHAKE_ID, ExtHandshake, MAX_EXT_PAYLOAD};

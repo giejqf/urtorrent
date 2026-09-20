@@ -27,6 +27,14 @@ several times a second and takes commands from a control file (`shutdown`,
 `pause`, `resume`, `reannounce`, `save-resume`), so scenarios need no signals
 for a graceful stop. `testkit::client::UrtClient` wraps both.
 
+`transmission-daemon` (Transmission 4) is the second independent peer. Two
+things about it are non-obvious: it refuses to open any peer connection
+unless the namespace has a default route (it derives its source address from
+a route to a public IP), so every actor gets one through the harness bridge
+while a `FORWARD ... -j DROP` rule keeps the lab offline; and Ubuntu's
+AppArmor profile confines it to `/var/lib/transmission-daemon`, so a local
+override for `testkit/runs` is needed (`cargo xtask doctor` prints it).
+
 Run artifacts land in `testkit/runs/<stamp>-<scenario>-<shape>/` (gitignored):
 actor stdout/stderr, oracle profiles and logs, tap logs (`*.jsonl`), pcaps.
 Pass `--keep` to leave the namespaces up after a run; `testkit lab clean`

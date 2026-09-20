@@ -26,6 +26,7 @@ pub mod peerwire;
 pub mod scenario;
 pub mod tap;
 pub mod trackers;
+pub mod transmission;
 pub mod webapi;
 
 /// Initialise tracing from `RUST_LOG` (default `info`).

@@ -15,6 +15,7 @@ workspace = true
 bencode = { path = "../bencode", version = "0.1.0" }
 metainfo = { path = "../metainfo", version = "0.1.0" }
 profile = { path = "../profile", version = "0.1.0" }
+sha1.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

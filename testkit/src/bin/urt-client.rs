@@ -35,6 +35,8 @@ struct Args {
     no_v6: bool,
     exit_when_complete: bool,
     sequential: bool,
+    upload_limit: u64,
+    download_limit: u64,
 }
 
 fn parse_args() -> Result<Args> {
@@ -52,6 +54,8 @@ fn parse_args() -> Result<Args> {
         no_v6: false,
         exit_when_complete: false,
         sequential: false,
+        upload_limit: 0,
+        download_limit: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -70,6 +74,8 @@ fn parse_args() -> Result<Args> {
             "--no-v6" => a.no_v6 = true,
             "--exit-when-complete" => a.exit_when_complete = true,
             "--sequential" => a.sequential = true,
+            "--upload-limit" => a.upload_limit = val()?.parse()?,
+            "--download-limit" => a.download_limit = val()?.parse()?,
             other => bail!("unknown argument {other}"),
         }
     }
@@ -104,7 +110,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("unknown profile {}", args.profile))?;
     let mut builder = Session::builder()
         .listen_port(args.listen_port)
-        .profile(profile);
+        .profile(profile)
+        .upload_limit(args.upload_limit)
+        .download_limit(args.download_limit);
     if args.no_v4 {
         builder = builder.listen_v4(None);
     } else if let Some(v4) = args.v4 {
@@ -166,6 +174,7 @@ async fn main() -> Result<()> {
                 "corrupt": st.corrupt,
                 "redundant": st.redundant,
                 "download_rate": st.download_rate,
+                "upload_rate": st.upload_rate,
                 "peers": st.peers,
                 "seeds": st.seeds,
                 "complete": st.complete,
@@ -193,6 +202,7 @@ async fn main() -> Result<()> {
                     "resume" => session.resume(id).await?,
                     "reannounce" => session.force_reannounce(id).await?,
                     "save-resume" => session.save_resume_data(id).await?,
+                    "recheck" => session.force_recheck(id).await?,
                     other => tracing::warn!("unknown control command {other}"),
                 }
             }

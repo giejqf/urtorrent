@@ -298,6 +298,33 @@ impl Lab {
             ])?;
         }
         ip(&["-n", &ns, "link", "set", "eth0", "up"])?;
+        // A default route through the harness: Transmission 4 refuses to open
+        // peer connections without a route to a public address (it picks its
+        // source address that way). Nothing is forwarded (see
+        // `firewall_allow`), so the lab still cannot reach the internet.
+        if v4.is_some() {
+            let _ = ip(&[
+                "-n",
+                &ns,
+                "route",
+                "add",
+                "default",
+                "via",
+                &self.host_v4().to_string(),
+            ]);
+        }
+        if v6.is_some() {
+            let _ = ip(&[
+                "-n",
+                &ns,
+                "-6",
+                "route",
+                "add",
+                "default",
+                "via",
+                &self.host_v6().to_string(),
+            ]);
+        }
         // Wait until the interface is fully up (carrier on both ends of the veth).
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
@@ -333,8 +360,13 @@ impl Drop for Lab {
     }
 }
 
-/// Insert (or delete) an INPUT accept rule for traffic arriving on `bridge`,
-/// for both address families. Best effort: hosts without iptables are fine.
+/// Insert (or delete) the lab's firewall rules for `bridge`, both address
+/// families: accept its traffic on INPUT (the harness listens there), and
+/// **drop anything forwarded from it**. Actors get a default route through
+/// the bridge (some clients refuse to work without one), and this rule is
+/// what keeps the lab off the public internet even on a host with
+/// `ip_forward=1` (AGENTS.md rule 3). Best effort: hosts without iptables are
+/// fine.
 fn firewall_allow(bridge: &str, add: bool) {
     for tool in ["iptables", "ip6tables"] {
         if Command::new("which")
@@ -346,10 +378,15 @@ fn firewall_allow(bridge: &str, add: bool) {
             continue;
         }
         let op = if add { "-I" } else { "-D" };
-        let mut c = sudo();
-        c.args([tool, "-w", "5", op, "INPUT", "-i", bridge, "-j", "ACCEPT"]);
-        if let Err(e) = run(&mut c) {
-            tracing::debug!("{tool} {op} rule for {bridge}: {e}");
+        for rule in [
+            ["INPUT", "-i", bridge, "-j", "ACCEPT"],
+            ["FORWARD", "-i", bridge, "-j", "DROP"],
+        ] {
+            let mut c = sudo();
+            c.args([tool, "-w", "5", op]).args(rule);
+            if let Err(e) = run(&mut c) {
+                tracing::debug!("{tool} {op} {rule:?}: {e}");
+            }
         }
     }
 }
@@ -378,17 +415,20 @@ pub fn clean_all() -> Result<Vec<String>> {
     }
     // Stale firewall rules from crashed runs.
     for tool in ["iptables", "ip6tables"] {
-        let mut c = sudo();
-        c.args([tool, "-w", "5", "-S", "INPUT"]);
-        let Ok(rules) = run(&mut c) else { continue };
-        for r in rules.lines() {
-            if let Some(rest) = r.strip_prefix("-A INPUT -i ") {
-                let dev = rest.split_whitespace().next().unwrap_or("");
-                if dev.starts_with(BRIDGE_PREFIX)
-                    && dev[BRIDGE_PREFIX.len()..].parse::<u8>().is_ok()
-                {
-                    firewall_allow(dev, false);
-                    removed.push(format!("{tool} rule {dev}"));
+        for chain in ["INPUT", "FORWARD"] {
+            let mut c = sudo();
+            c.args([tool, "-w", "5", "-S", chain]);
+            let Ok(rules) = run(&mut c) else { continue };
+            let prefix = format!("-A {chain} -i ");
+            for r in rules.lines() {
+                if let Some(rest) = r.strip_prefix(prefix.as_str()) {
+                    let dev = rest.split_whitespace().next().unwrap_or("");
+                    if dev.starts_with(BRIDGE_PREFIX)
+                        && dev[BRIDGE_PREFIX.len()..].parse::<u8>().is_ok()
+                    {
+                        firewall_allow(dev, false);
+                        removed.push(format!("{tool} rule {dev}"));
+                    }
                 }
             }
         }

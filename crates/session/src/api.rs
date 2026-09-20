@@ -367,6 +367,24 @@ impl SessionBuilder {
         self
     }
 
+    /// Session upload limit in bytes per second (0 = unlimited).
+    pub fn upload_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.cfg.upload_rate = bytes_per_sec;
+        self
+    }
+
+    /// Session download limit in bytes per second (0 = unlimited).
+    pub fn download_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.cfg.download_rate = bytes_per_sec;
+        self
+    }
+
+    /// Session-wide number of unchoke slots.
+    pub fn unchoke_slots(mut self, n: usize) -> Self {
+        self.cfg.unchoke_slots = n;
+        self
+    }
+
     /// Start the engine threads. Fails hard if io_uring is unavailable.
     pub async fn build(self) -> Result<Session, Error> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -479,6 +497,31 @@ impl Session {
     /// Re-announce as soon as each tracker's `min interval` allows.
     pub async fn force_reannounce(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::ForceReannounce(id, tx)).await?
+    }
+
+    /// Drop peers and re-hash everything on disk; the have-set is rebuilt from
+    /// what verifies. Resolves when the check is done.
+    pub async fn force_recheck(&self, id: TorrentId) -> Result<(), Error> {
+        self.send(|tx| Command::ForceRecheck(id, tx)).await?
+    }
+
+    /// Set the session-wide upload / download limits in bytes per second
+    /// (0 = unlimited).
+    pub async fn set_rate_limits(&self, upload: u64, download: u64) -> Result<(), Error> {
+        self.send(|tx| Command::SetRateLimits(upload, download, tx))
+            .await
+    }
+
+    /// Set one torrent's upload / download limits in bytes per second
+    /// (0 = unlimited); the session limits still apply.
+    pub async fn set_torrent_rate_limits(
+        &self,
+        id: TorrentId,
+        upload: u64,
+        download: u64,
+    ) -> Result<(), Error> {
+        self.send(|tx| Command::SetTorrentRateLimits(id, upload, download, tx))
+            .await?
     }
 
     /// Subscribe to events. Events emitted before the engine processes the

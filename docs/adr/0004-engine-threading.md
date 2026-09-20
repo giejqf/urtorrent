@@ -42,6 +42,13 @@ another thread would be unsound, and the runtime's park step is
    reactor until their CQE lands (leaked, never freed, if the kernel never
    answers).
 
+6. **Choking and rate limiting live in a 100 ms session ticker.** The
+   choker is a pure function over peer snapshots (`engine/choker.rs`) run
+   every 15 s with a session-wide slot budget; token-bucket limiters
+   (`engine/rate.rs`) are refilled by the same ticker and consulted by each
+   peer's reader (before posting a receive, sizing the buffer to the grant)
+   and writer (chunking sends to grants).
+
 ## Consequences
 
 - `Session` handles are `Arc` around the command sender and a `NotifyHandle`;

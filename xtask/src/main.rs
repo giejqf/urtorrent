@@ -534,6 +534,27 @@ fn doctor() -> Result<()> {
             r.warn(bin, &format!("missing: {why}"));
         }
     }
+    // Ubuntu confines transmission-daemon with AppArmor to /var/lib; the lab
+    // runs it from testkit/runs, which needs a local override.
+    if have("transmission-daemon") && std::path::Path::new("/etc/apparmor.d/transmission").exists()
+    {
+        let local = read("/etc/apparmor.d/local/transmission-daemon");
+        let runs = root().join("testkit/runs");
+        if local.contains(&runs.to_string_lossy().to_string()) {
+            r.ok(
+                "transmission apparmor",
+                "local override allows testkit/runs",
+            );
+        } else {
+            r.warn(
+                "transmission apparmor",
+                &format!(
+                    "profile confines transmission-daemon to /var/lib; add to /etc/apparmor.d/local/transmission-daemon:\n           owner {0}/** rw,\n           owner {0}/ r,\n           owner {0}/*/ r,\n           owner {0}/*/*/ r,\n         then `sudo apparmor_parser -r /etc/apparmor.d/transmission`",
+                    runs.display()
+                ),
+            );
+        }
+    }
     if read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") == "1" {
         r.warn(
             "userns",

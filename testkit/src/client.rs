@@ -21,6 +21,9 @@ pub struct ClientConfig {
     pub sequential: bool,
     pub resume: bool,
     pub exit_when_complete: bool,
+    /// Bytes per second, 0 = unlimited.
+    pub upload_limit: u64,
+    pub download_limit: u64,
     /// Extra environment (e.g. `RUST_LOG`).
     pub env: Vec<(String, String)>,
 }
@@ -33,6 +36,8 @@ impl Default for ClientConfig {
             sequential: false,
             resume: true,
             exit_when_complete: false,
+            upload_limit: 0,
+            download_limit: 0,
             env: vec![("RUST_LOG".into(), "debug".into())],
         }
     }
@@ -41,6 +46,14 @@ impl Default for ClientConfig {
 impl ClientConfig {
     pub fn profile(mut self, p: &str) -> Self {
         self.profile = p.into();
+        self
+    }
+    pub fn upload_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.upload_limit = bytes_per_sec;
+        self
+    }
+    pub fn download_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.download_limit = bytes_per_sec;
         self
     }
 }
@@ -68,6 +81,10 @@ pub struct ClientStatus {
     pub corrupt: u64,
     #[serde(default)]
     pub redundant: u64,
+    #[serde(default)]
+    pub download_rate: u64,
+    #[serde(default)]
+    pub upload_rate: u64,
     #[serde(default)]
     pub peers: usize,
     #[serde(default)]
@@ -177,6 +194,14 @@ impl UrtClient {
         if config.exit_when_complete {
             cmd.arg("--exit-when-complete");
         }
+        if config.upload_limit > 0 {
+            cmd.arg("--upload-limit")
+                .arg(config.upload_limit.to_string());
+        }
+        if config.download_limit > 0 {
+            cmd.arg("--download-limit")
+                .arg(config.download_limit.to_string());
+        }
         // Bind only the families the actor has (v6-only namespaces have no
         // IPv4 address to announce anyway).
         if actor.v4.is_none() {
@@ -235,7 +260,7 @@ impl UrtClient {
     }
 
     /// Send a control command (`shutdown`, `pause`, `resume`, `reannounce`,
-    /// `save-resume`).
+    /// `save-resume`, `recheck`).
     pub fn command(&self, cmd: &str) -> Result<()> {
         let tmp = self.control_path.with_extension("tmp");
         std::fs::write(&tmp, cmd)?;
@@ -266,6 +291,14 @@ impl UrtClient {
         if let Some(mut p) = self.proc.take() {
             p.kill9()?;
         }
+        Ok(())
+    }
+
+    /// Start again in the same namespace with the same save / resume dirs
+    /// (after `kill9` or `shutdown`).
+    pub fn relaunch(&mut self, torrent: &Path) -> Result<()> {
+        let fresh = UrtClient::launch(&self.actor, self.config.clone(), torrent)?;
+        self.proc = fresh.proc;
         Ok(())
     }
 

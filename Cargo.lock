@@ -1223,6 +1223,7 @@ dependencies = [
  "profile",
  "proptest",
  "serde_json",
+ "sha1",
  "thiserror",
  "tracing",
 ]

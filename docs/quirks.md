@@ -69,3 +69,18 @@ Consequence: the `p` key depends on the *routability of our listen socket*,
 not just on the connection direction. `profile` records `p_on_outgoing`; the
 session decides routability per listen socket (M5, full dual-stack matrix).
 `crates/wire/tests/replay.rs` pins the v6 difference so it stays visible.
+
+## Q7. Allowed-fast set is seeded with the full peer address, not the BEP 6 /24
+
+Capture: `capture_peer_plain/v4/tap-peer-plain-oracle-responder.jsonl` (oracle
+seeding to tap-peer at 10.77.142.3, 16 pieces) shows `allowed_fast` for
+`[7, 12, 5, 3, 11]`; the v6 capture (tap-peer at fd77:8e::3) shows
+`[6, 9, 13, 11, 1]`. BEP 6 says to hash `(ip & 0xffffff00) || info_hash`, which
+gives `[9, 13, 0, 6, 11]` for the v4 case. Hashing the **unmasked** 4 / 16
+address bytes reproduces both captures exactly (libtorrent
+`bt_peer_connection::send_allowed_set` uses `address::to_bytes()`).
+
+Consequence: `profile::PeerShape::allowed_fast_addr` — `LibtorrentFull` for the
+qbt profile (L2), `Bep6Masked` for `native`. Interop is unaffected either way
+(the receiver only records the indices it is told). Pinned in
+`crates/wire/tests/replay.rs`.

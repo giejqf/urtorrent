@@ -157,9 +157,14 @@ impl Announcer {
         self.running
     }
 
-    /// Begin announcing. Every tracker becomes due; `poll` hands out jobs.
+    /// Begin (or resume) announcing. Every tracker becomes due immediately,
+    /// whatever schedule an earlier `stopped` reply left behind.
     pub fn start(&mut self) {
         self.running = true;
+        for t in self.tiers.iter_mut().flatten() {
+            t.next_announce = None;
+            t.updating = false;
+        }
     }
 
     /// Stop announcing. Returns the `stopped` announces to perform: one per
@@ -529,6 +534,25 @@ mod tests {
         );
         let job = a.poll(t0 + MIN_ANNOUNCE_INTERVAL).remove(0);
         assert_eq!(job.tracker_id, Some(b"tid".to_vec()));
+    }
+
+    #[test]
+    fn restart_after_stop_announces_started_again() {
+        let t0 = Instant::now();
+        let mut a = Announcer::new(urls(&[&["http://a/"]]));
+        a.start();
+        let job = a.poll(t0).remove(0);
+        a.on_success(&job, &resp(1800), t0);
+        let stopped = a.stop().remove(0);
+        assert_eq!(stopped.event, AnnounceEvent::Stopped);
+        a.on_success(&stopped, &resp(1800), t0);
+        // Resume a second later: due now, and `started` again.
+        a.start();
+        let t1 = t0 + Duration::from_secs(1);
+        let job = a.poll(t1).remove(0);
+        assert_eq!(job.event, AnnounceEvent::Started);
+        a.on_success(&job, &resp(1800), t1);
+        assert_eq!(a.stop().len(), 1);
     }
 
     #[test]

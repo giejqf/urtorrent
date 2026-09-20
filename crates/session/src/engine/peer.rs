@@ -2,11 +2,14 @@
 // Copyright (c) 2026 urtorrent contributors
 
 //! One task per peer connection. The task owns the socket, feeds received
-//! bytes into the sans-IO [`wire::Connection`], acts on the events it returns,
-//! and a companion writer task flushes whatever the connection queued. Both
-//! end when the peer's [`Flag`] is set.
+//! bytes into the sans-IO [`wire::Connection`], acts on the events it returns;
+//! a companion writer task flushes whatever the connection queued (through
+//! the session and torrent upload limiters), and an uploader task serves the
+//! peer's requests from disk with backpressure on the outbound queue. All end
+//! when the peer's [`Flag`] is set.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -18,6 +21,7 @@ use wire::{Connection, ConnectionParams, Event as WireEvent, Handshake, PeerHave
 
 use super::Ctx;
 use super::local::{Either, Flag, Notify, select2};
+use super::rate::Limiter;
 use super::torrent::{self, INACTIVITY_TIMEOUT, KEEPALIVE_AFTER, REQUEST_TIMEOUT, Torrent};
 use crate::api::{Event, PeerInfo};
 
@@ -48,7 +52,19 @@ pub struct PeerHandle {
     last_have: RefCell<Bitfield>,
     rate: Cell<u64>,
     rate_mark: Cell<u64>,
+    /// Requests from the peer waiting to be read from disk and sent.
+    upload_queue: RefCell<VecDeque<Request>>,
+    upload_notify: Rc<Notify>,
+    /// Signalled by the writer after each send (uploader backpressure).
+    drained: Rc<Notify>,
+    /// When we last unchoked this peer (choker rotation).
+    pub last_unchoke: Cell<Option<Instant>>,
 }
+
+/// Outbound bytes queued beyond which the uploader waits for the writer.
+const UPLOAD_BACKLOG: usize = 256 * 1024;
+/// Receive buffer size (and the largest download-limiter grant per read).
+const RECV_SIZE: u64 = 64 * 1024;
 
 impl PeerHandle {
     fn new(
@@ -77,7 +93,39 @@ impl PeerHandle {
             last_have: RefCell::new(Bitfield::new(pieces)),
             rate: Cell::new(0),
             rate_mark: Cell::new(0),
+            upload_queue: RefCell::new(VecDeque::new()),
+            upload_notify: Notify::new(),
+            drained: Notify::new(),
+            last_unchoke: Cell::new(None),
         }
+    }
+
+    /// Choke or unchoke (choker decision). Choking drops the upload queue;
+    /// `wire` rejects the peer's queued requests when the fast extension is on.
+    pub fn set_choked(&self, choke: bool, now: Instant) {
+        let mut conn = self.conn.borrow_mut();
+        if conn.am_choking() == choke {
+            return;
+        }
+        conn.choke(choke);
+        drop(conn);
+        if choke {
+            self.upload_queue.borrow_mut().clear();
+        } else {
+            self.last_unchoke.set(Some(now));
+        }
+        self.out.notify();
+    }
+
+    /// Bytes per second we receive from this peer (smoothed).
+    pub fn download_rate(&self) -> u64 {
+        self.rate.get()
+    }
+
+    /// Whether the peer is interested and we choke it (choker input).
+    pub fn choke_state(&self) -> (bool, bool, bool) {
+        let c = self.conn.borrow();
+        (c.is_established(), c.peer_interested(), c.am_choking())
     }
 
     /// Ask the tasks to end.
@@ -339,15 +387,36 @@ async fn run_connection(
     let handle = Rc::new(PeerHandle::new(key, addr, incoming, conn, pieces));
     torrent.borrow_mut().peers.insert(key, handle.clone());
     let stream = Rc::new(stream);
-    uring::spawn(writer(stream.clone(), handle.clone()));
+    uring::spawn(writer(
+        ctx.clone(),
+        torrent.clone(),
+        stream.clone(),
+        handle.clone(),
+    ));
+    uring::spawn(uploader(ctx.clone(), torrent.clone(), handle.clone()));
 
     let mut reason: Option<String> = None;
     if !initial.is_empty() {
         reason = process_bytes(&ctx, &torrent, &handle, &initial).await.err();
     }
     handle.out.notify();
+    let down_limit = torrent.borrow().down_limit.clone();
     while reason.is_none() {
-        let buf = ctx.recv_pool.take_sized();
+        // Download limits: take a grant before posting the receive and size
+        // the buffer to it; refund what the read did not use.
+        let grant = match select2(
+            acquire_pair(&ctx.down_limit, &down_limit, RECV_SIZE),
+            handle.close.wait(),
+        )
+        .await
+        {
+            Either::Left(g) => g,
+            Either::Right(()) => break,
+        };
+        let mut buf = ctx.recv_pool.take_sized();
+        if (grant as usize) < buf.len() {
+            buf.truncate(grant as usize);
+        }
         match select2(
             uring::timeout(INACTIVITY_TIMEOUT, stream.recv(buf)),
             handle.close.wait(),
@@ -355,7 +424,12 @@ async fn run_connection(
         .await
         {
             Either::Left(Ok((Ok(0), _))) => reason = Some("peer closed the connection".into()),
-            Either::Left(Ok((Ok(_), buf))) => {
+            Either::Left(Ok((Ok(n), buf))) => {
+                refund_pair(
+                    &ctx.down_limit,
+                    &down_limit,
+                    grant.saturating_sub(u64::from(n)),
+                );
                 handle.last_recv.set(Instant::now());
                 if let Err(e) = process_bytes(&ctx, &torrent, &handle, buf.as_slice()).await {
                     reason = Some(e);
@@ -363,18 +437,16 @@ async fn run_connection(
             }
             Either::Left(Ok((Err(e), _))) => reason = Some(format!("recv: {e}")),
             Either::Left(Err(_)) => reason = Some("inactive".into()),
-            Either::Right(()) => {
-                reason = Some(
-                    handle
-                        .close_reason
-                        .borrow()
-                        .clone()
-                        .unwrap_or_else(|| "closed".into()),
-                );
-            }
+            Either::Right(()) => break,
         }
     }
-    let reason = reason.unwrap_or_default();
+    let reason = reason.unwrap_or_else(|| {
+        handle
+            .close_reason
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "closed".into())
+    });
     handle.close(&reason);
     // Cleanup: bookkeeping in the torrent, then the socket closes through the
     // ring when the last `Rc<TcpStream>` drops.
@@ -477,6 +549,9 @@ async fn handle_event(
             let mut t = torrent.borrow_mut();
             let pieces = t.info.piece_count();
             handle.sync_availability(&mut t.picker, pieces);
+            if t.picker.is_complete() && handle.is_seed(pieces) {
+                return Err("both seeds".into());
+            }
             handle.update_interest(&t.picker);
             handle.fill_requests_locked(&mut t, ctx);
         }
@@ -519,13 +594,18 @@ async fn handle_event(
             );
         }
         WireEvent::Request(r) => {
-            // Leech-only in M2: never unchoked anyone, so this only arrives
-            // through allowed-fast (which we do not grant). Decline politely.
-            handle.conn.borrow_mut().reject(r);
+            // `wire` already checked choke state / allowed-fast and bounds.
+            handle.upload_queue.borrow_mut().push_back(r);
+            handle.upload_notify.notify();
         }
-        WireEvent::Interested
-        | WireEvent::NotInterested
-        | WireEvent::Cancel(_)
+        WireEvent::Cancel(r) => {
+            handle.upload_queue.borrow_mut().retain(|x| *x != r);
+        }
+        WireEvent::Interested => {
+            // Free slot: unchoke right away rather than at the next round.
+            super::maybe_unchoke_now(ctx, torrent, handle);
+        }
+        WireEvent::NotInterested
         | WireEvent::Port(_)
         | WireEvent::KeepAlive
         | WireEvent::Extended { .. } => {}
@@ -533,8 +613,33 @@ async fn handle_event(
     Ok(())
 }
 
-/// Flush the connection's outbound bytes as they appear.
-async fn writer(stream: Rc<TcpStream>, handle: Rc<PeerHandle>) {
+/// Take a grant from the session limiter, then narrow it through the
+/// torrent's; unused session tokens go back.
+async fn acquire_pair(session: &Limiter, torrent: &Limiter, want: u64) -> u64 {
+    let g1 = session.acquire(want).await;
+    let g2 = torrent.acquire(g1).await;
+    if g2 < g1 {
+        session.refund(g1 - g2);
+    }
+    g2
+}
+
+fn refund_pair(session: &Limiter, torrent: &Limiter, n: u64) {
+    if n > 0 {
+        session.refund(n);
+        torrent.refund(n);
+    }
+}
+
+/// Flush the connection's outbound bytes as they appear, within the upload
+/// limits.
+async fn writer(
+    ctx: Rc<Ctx>,
+    torrent: Rc<RefCell<Torrent>>,
+    stream: Rc<TcpStream>,
+    handle: Rc<PeerHandle>,
+) {
+    let up_limit = torrent.borrow().up_limit.clone();
     loop {
         let out = handle.conn.borrow_mut().take_outbound();
         if out.is_empty() {
@@ -543,13 +648,96 @@ async fn writer(stream: Rc<TcpStream>, handle: Rc<PeerHandle>) {
                 Either::Right(()) => break,
             }
         }
-        match select2(stream.send_all(Buffer::from_vec(out)), handle.close.wait()).await {
-            Either::Left(Ok(_)) => handle.last_send.set(Instant::now()),
-            Either::Left(Err(e)) => {
-                handle.close(&format!("send: {e}"));
-                break;
+        let total = out.len();
+        let mut offset = 0usize;
+        while offset < total {
+            let remaining = (total - offset) as u64;
+            let grant = if ctx.up_limit.is_unlimited() && up_limit.is_unlimited() {
+                remaining
+            } else {
+                match select2(
+                    acquire_pair(&ctx.up_limit, &up_limit, remaining.min(RECV_SIZE)),
+                    handle.close.wait(),
+                )
+                .await
+                {
+                    Either::Left(g) => g,
+                    Either::Right(()) => return,
+                }
+            } as usize;
+            let chunk = if offset == 0 && grant == total {
+                Buffer::from_vec(out.clone())
+            } else {
+                Buffer::from_vec(out[offset..offset + grant].to_vec())
+            };
+            match select2(stream.send_all(chunk), handle.close.wait()).await {
+                Either::Left(Ok(_)) => {
+                    handle.last_send.set(Instant::now());
+                    offset += grant;
+                }
+                Either::Left(Err(e)) => {
+                    handle.close(&format!("send: {e}"));
+                    return;
+                }
+                Either::Right(()) => return,
             }
-            Either::Right(()) => break,
+        }
+        handle.drained.notify();
+    }
+}
+
+/// Serve the peer's requests: read from disk, hand to the connection. Waits
+/// when the outbound queue is deep so a slow peer cannot make us buffer a
+/// whole torrent.
+async fn uploader(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, handle: Rc<PeerHandle>) {
+    loop {
+        let next = handle.upload_queue.borrow_mut().pop_front();
+        let Some(r) = next else {
+            match select2(handle.upload_notify.wait(), handle.close.wait()).await {
+                Either::Left(()) => continue,
+                Either::Right(()) => break,
+            }
+        };
+        while handle.conn.borrow().outbound_len() > UPLOAD_BACKLOG {
+            match select2(handle.drained.wait(), handle.close.wait()).await {
+                Either::Left(()) => {}
+                Either::Right(()) => return,
+            }
+        }
+        if handle.close.is_set() {
+            break;
+        }
+        // Cancelled or choked meanwhile? `wire` dropped it from its queue.
+        if !handle.conn.borrow().incoming_requests().contains(&r) {
+            continue;
+        }
+        let storage = torrent.borrow().storage.clone();
+        if !storage.has_piece(r.index as usize) {
+            handle.conn.borrow_mut().reject(r);
+            handle.out.notify();
+            continue;
+        }
+        match storage
+            .read_block(r.index as usize, r.begin, r.length)
+            .await
+        {
+            Ok(data) => {
+                let mut conn = handle.conn.borrow_mut();
+                if conn.incoming_requests().contains(&r) {
+                    conn.piece(r, data.as_slice());
+                    drop(conn);
+                    let n = u64::from(r.length);
+                    handle.uploaded.set(handle.uploaded.get() + n);
+                    torrent.borrow_mut().stats.uploaded += n;
+                    handle.out.notify();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(addr = %handle.addr, "read for upload failed: {e}");
+                handle.conn.borrow_mut().reject(r);
+                handle.out.notify();
+            }
         }
     }
+    let _ = &ctx;
 }

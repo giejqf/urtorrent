@@ -16,7 +16,8 @@ oracle-vs-BEP disagreements in [docs/quirks.md](docs/quirks.md).
 | M0 Harness | done: netns lab, pinned oracle, opentracker, tap-tracker, tap-peer, first golden captures |
 | M1 Foundations | done: `bencode`, `metainfo`, `uring` (reactor + probe + enforcement), `storage` (hashing + resume), fuzz targets |
 | M2 Leech | done: `profile`, `wire`, `tracker`, `picker`, `session` engine + `urtorrent` facade; `leech_from_oracle` green in v4 / v6 / dual |
-| M3 Seed | next |
+| M3 Seed | done: choker, upload path, allowed-fast, rate limits, force recheck, resume after `kill -9`, blame/bans; seeding to the oracle and to Transmission green in v4 / v6 / dual |
+| M4 Identity | next |
 
 ## Developer commands
 

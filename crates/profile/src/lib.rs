@@ -266,6 +266,22 @@ pub enum FirstMessage {
     /// fast is off, matching BEP 3's "may be omitted" allowance is *not*
     /// used: libtorrent always sends it).
     HaveState,
+    /// `allowed_fast` for the peer's BEP 6 set (fast extension only), for
+    /// the pieces we have. Nothing is sent when we have no pieces (the oracle
+    /// as a leecher sent none; as a seed it sent `allowed_fast_count`).
+    /// UNVERIFIED for a partial seed: whether pieces we lack are announced.
+    AllowedFast,
+}
+
+/// Which address bytes seed the BEP 6 allowed-fast set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowedFastAddr {
+    /// As BEP 6 specifies: IPv4 masked to the /24 (`ip & 0xffffff00`); for
+    /// IPv6 (unspecified by the BEP) the /64 prefix.
+    Bep6Masked,
+    /// As libtorrent does: the full address bytes (4 or 16), no masking
+    /// (docs/quirks.md Q7).
+    LibtorrentFull,
 }
 
 /// Peer-wire shape.
@@ -273,6 +289,8 @@ pub enum FirstMessage {
 pub struct PeerShape {
     /// Reserved bytes in the handshake.
     pub reserved: [u8; 8],
+    /// How the allowed-fast set is seeded.
+    pub allowed_fast_addr: AllowedFastAddr,
     /// Messages sent immediately after the handshake, in order.
     pub first_messages: &'static [FirstMessage],
     /// Number of `allowed_fast` pieces we grant (BEP 6); 0 disables.
@@ -381,7 +399,11 @@ const QBT_LTEP_M: &[LtepExtension] = &[
 /// `upload_only`).
 const NATIVE_LTEP_M: &[LtepExtension] = &[];
 
-const FIRST_MESSAGES: &[FirstMessage] = &[FirstMessage::ExtendedHandshake, FirstMessage::HaveState];
+const FIRST_MESSAGES: &[FirstMessage] = &[
+    FirstMessage::ExtendedHandshake,
+    FirstMessage::HaveState,
+    FirstMessage::AllowedFast,
+];
 
 /// The characters libtorrent draws the peer-id tail from: alphanumerics plus
 /// `- _ . ! ~ * ( )`. Consistent with every captured peer id
@@ -431,6 +453,7 @@ impl Profile {
             peer: PeerShape {
                 // LTEP + fast; no DHT bit: we do not implement DHT.
                 reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+                allowed_fast_addr: AllowedFastAddr::Bep6Masked,
                 first_messages: FIRST_MESSAGES,
                 allowed_fast_count: 5,
                 max_incoming_requests: 250,
@@ -487,6 +510,9 @@ impl Profile {
             peer: PeerShape {
                 // `0000000000100005` = LTEP + fast + DHT (docs/quirks.md Q1).
                 reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x05],
+                // The captured grants only reproduce with the unmasked
+                // address (docs/quirks.md Q7).
+                allowed_fast_addr: AllowedFastAddr::LibtorrentFull,
                 first_messages: FIRST_MESSAGES,
                 // Five `allowed_fast` messages in the seeding capture.
                 allowed_fast_count: 5,

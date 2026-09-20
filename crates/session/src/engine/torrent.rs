@@ -26,6 +26,7 @@ use wire::Request;
 use super::Ctx;
 use super::local::{Flag, Notify};
 use super::peer::PeerHandle;
+use super::rate::Limiter;
 use super::rng::RngRef;
 use crate::Error;
 use crate::api::{
@@ -41,8 +42,12 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub const KEEPALIVE_AFTER: Duration = Duration::from_secs(100);
 /// Drop a peer after this much inbound silence.
 pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(180);
-/// Hash failures from one IP before it is banned for this torrent.
-const BAN_AFTER_HASH_FAILS: u32 = 3;
+/// Trust points: a peer is banned when its score drops to this. A failed
+/// piece it supplied alone costs `SOLE_FAIL_COST`; a failed piece shared with
+/// others costs 1; a verified piece earns 1 (capped at `TRUST_CAP`).
+const BAN_AT: i32 = -3;
+const SOLE_FAIL_COST: i32 = 3;
+const TRUST_CAP: i32 = 8;
 /// Periodic resume save cadence.
 const RESUME_SAVE_EVERY: Duration = Duration::from_secs(60);
 /// Do not reconnect to an address that failed for this long.
@@ -69,9 +74,15 @@ pub struct Torrent {
     pub picker: Picker,
     pub announcer: Announcer,
     pub announce_key: u32,
-    pub state: TorrentState,
+    /// Stopped by the caller.
+    pub paused: bool,
+    /// A check (initial or forced) is running.
+    pub checking: bool,
     pub error: Option<String>,
     pub stats: Stats,
+    /// Per-torrent rate limits (0 = unlimited; the session limits apply too).
+    pub up_limit: Rc<Limiter>,
+    pub down_limit: Rc<Limiter>,
     pub peers: HashMap<u32, Rc<PeerHandle>>,
     /// Addresses learned from trackers, not yet tried.
     candidates: VecDeque<SocketAddr>,
@@ -84,9 +95,10 @@ pub struct Torrent {
     pub closing: Rc<Flag>,
     /// Wakes the tracker task (completed / forced / paused).
     pub tracker_kick: Rc<Notify>,
-    /// Peers that supplied blocks of a piece, for blame on hash failure.
-    suppliers: HashMap<u32, Vec<IpAddr>>,
-    hash_fails: HashMap<IpAddr, u32>,
+    /// Peers that supplied blocks of a piece (key, address), for blame.
+    suppliers: HashMap<u32, Vec<(u32, IpAddr)>>,
+    /// Trust points per address (see `BAN_AT`).
+    trust: HashMap<IpAddr, i32>,
     banned: HashSet<IpAddr>,
     resume_path: Option<PathBuf>,
     resume_dirty: bool,
@@ -109,11 +121,29 @@ impl Torrent {
         self.peers.len()
     }
 
+    /// The lifecycle state as reported to callers.
+    pub fn state(&self) -> TorrentState {
+        if self.error.is_some() {
+            TorrentState::Error
+        } else if self.checking {
+            TorrentState::Checking
+        } else if self.paused {
+            TorrentState::Paused
+        } else if self.picker.is_complete() {
+            TorrentState::Seeding
+        } else {
+            TorrentState::Downloading
+        }
+    }
+
+    /// Peers may be connected and served.
     pub fn is_running(&self) -> bool {
-        matches!(
-            self.state,
-            TorrentState::Downloading | TorrentState::Seeding
-        )
+        !self.paused && !self.checking && self.error.is_none()
+    }
+
+    /// The tick / tracker tasks keep running (checking included).
+    pub fn is_active(&self) -> bool {
+        !self.paused && self.error.is_none()
     }
 
     /// Bytes still needed (from the verified have-set).
@@ -146,7 +176,7 @@ impl Torrent {
             id: self.id,
             info_hash: self.info.info_hash,
             name: self.info.name.clone(),
-            state: self.state,
+            state: self.state(),
             error: self.error.clone(),
             pieces_have: self.picker.have_count(),
             pieces_total: self.info.piece_count(),
@@ -207,18 +237,38 @@ impl Torrent {
     }
 
     /// Record who supplied a block (for blame).
-    pub fn note_supplier(&mut self, piece: u32, ip: IpAddr) {
+    pub fn note_supplier(&mut self, piece: u32, key: u32, ip: IpAddr) {
         let v = self.suppliers.entry(piece).or_default();
-        if !v.contains(&ip) && v.len() < 64 {
-            v.push(ip);
+        if !v.iter().any(|(k, _)| *k == key) && v.len() < 64 {
+            v.push((key, ip));
         }
     }
 
-    /// Everyone we are interested in must know when we gain a piece.
+    /// Adjust a peer's trust; ban (and drop) it when it falls to `BAN_AT`.
+    fn adjust_trust(&mut self, ip: IpAddr, delta: i32) {
+        let t = self.trust.entry(ip).or_insert(0);
+        *t = (*t + delta).min(TRUST_CAP);
+        if *t <= BAN_AT {
+            self.banned.insert(ip);
+            for p in self.peers.values() {
+                if p.addr.ip() == ip {
+                    p.close("banned: repeated hash failures");
+                }
+            }
+        }
+    }
+
+    /// Everyone must know when we gain a piece; once complete, connections to
+    /// other seeds are pointless on both sides and are closed.
     fn broadcast_have(&self, piece: u32) {
+        let complete = self.picker.is_complete();
+        let n = self.info.piece_count();
         for p in self.peers.values() {
             p.conn.borrow_mut().have(piece);
             p.out.notify();
+            if complete && p.is_seed(n) {
+                p.close("both seeds");
+            }
         }
     }
 
@@ -308,42 +358,6 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
 
     let mut picker = Picker::new(info.piece_count(), info.piece_length, info.total_length);
     picker.set_sequential(params.sequential);
-    let mut stats = Stats::default();
-
-    // Resume data or recheck. A resume file only ever records pieces that were
-    // verified and fsynced, so it can be trusted when it matches the torrent;
-    // otherwise, if any content exists on disk, recheck it.
-    let mut have = Bitfield::new(info.piece_count());
-    let resume = match &resume_path {
-        Some(p) => ResumeData::load(p).unwrap_or_else(|e| {
-            tracing::warn!("ignoring unreadable resume data {}: {e}", p.display());
-            None
-        }),
-        None => None,
-    };
-    // Resume data is trusted only while every content file it refers to is
-    // still there; a missing file means "recheck" (AGENTS.md 5.4).
-    let checked = match resume {
-        Some(r) if r.matches(&info) && files_present => {
-            have = r.have.clone();
-            stats.downloaded = r.downloaded;
-            stats.uploaded = r.uploaded;
-            true
-        }
-        _ => {
-            let any_data = info.content_files().any(|f| {
-                std::fs::metadata(f.path.to_path(&params.save_path)).is_ok_and(|m| m.len() > 0)
-            });
-            if any_data {
-                have = storage.check_all().await?;
-            }
-            true
-        }
-    };
-    storage.set_have(have.clone());
-    picker.set_have(&have);
-    let complete = picker.is_complete();
-
     let now = Instant::now();
     let announcer = Announcer::new(meta.tiers());
     let torrent = Rc::new(RefCell::new(Torrent {
@@ -353,15 +367,12 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         picker,
         announcer,
         announce_key: ctx.new_announce_key(),
-        state: if params.paused {
-            TorrentState::Paused
-        } else if complete {
-            TorrentState::Seeding
-        } else {
-            TorrentState::Downloading
-        },
+        paused: params.paused,
+        checking: true,
         error: None,
-        stats,
+        stats: Stats::default(),
+        up_limit: Limiter::new(0, now),
+        down_limit: Limiter::new(0, now),
         peers: HashMap::new(),
         candidates: VecDeque::new(),
         known: HashSet::new(),
@@ -371,29 +382,157 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         closing: Flag::new(),
         tracker_kick: Notify::new(),
         suppliers: HashMap::new(),
-        hash_fails: HashMap::new(),
+        trust: HashMap::new(),
         banned: HashSet::new(),
         resume_path,
         resume_dirty: false,
         last_resume_save: now,
         verifying: HashSet::new(),
-        finished_emitted: complete,
+        finished_emitted: false,
         announces_in_flight: 0,
         metadata_size,
     }));
     ctx.torrents.borrow_mut().insert(id, torrent.clone());
     ctx.by_hash.borrow_mut().insert(info.info_hash, id);
     ctx.emit(Event::TorrentAdded { id });
-    if checked {
-        ctx.emit(Event::Checked {
-            id,
-            pieces_have: have.count(),
-        });
-    }
-    if !params.paused {
-        start_tasks(&ctx, &torrent);
-    }
+    uring::spawn(initial_check(
+        ctx.clone(),
+        torrent.clone(),
+        files_present,
+        params.save_path,
+    ));
     Ok(id)
+}
+
+/// Resume data or recheck, then start. A resume file only ever records pieces
+/// that were verified and fsynced, so it is trusted when it matches the
+/// torrent and every content file is still present; otherwise, if any content
+/// exists on disk, it is rechecked (AGENTS.md 5.4: when unsure, recheck).
+async fn initial_check(
+    ctx: Rc<Ctx>,
+    torrent: Rc<RefCell<Torrent>>,
+    files_present: bool,
+    save_path: PathBuf,
+) {
+    let (storage, info, resume_path) = {
+        let t = torrent.borrow();
+        (t.storage.clone(), t.info.clone(), t.resume_path.clone())
+    };
+    let resume = match &resume_path {
+        Some(p) => ResumeData::load(p).unwrap_or_else(|e| {
+            tracing::warn!("ignoring unreadable resume data {}: {e}", p.display());
+            None
+        }),
+        None => None,
+    };
+    let mut have = Bitfield::new(info.piece_count());
+    let mut carried: Option<(u64, u64)> = None;
+    match resume {
+        Some(r) if r.matches(&info) && files_present => {
+            have = r.have.clone();
+            carried = Some((r.downloaded, r.uploaded));
+        }
+        _ => {
+            let any_data = info
+                .content_files()
+                .any(|f| std::fs::metadata(f.path.to_path(&save_path)).is_ok_and(|m| m.len() > 0));
+            if any_data {
+                match storage.check_all().await {
+                    Ok(h) => have = h,
+                    Err(e) => {
+                        fail_torrent(&ctx, &torrent, format!("check failed: {e}"));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    finish_check(&ctx, &torrent, have, carried);
+}
+
+/// Apply a check result and start (unless paused).
+fn finish_check(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    have: Bitfield,
+    carried: Option<(u64, u64)>,
+) {
+    let (id, start) = {
+        let mut t = torrent.borrow_mut();
+        t.storage.set_have(have.clone());
+        t.picker.set_have(&have);
+        if let Some((d, u)) = carried {
+            t.stats.downloaded = d;
+            t.stats.uploaded = u;
+        }
+        t.checking = false;
+        t.finished_emitted = t.picker.is_complete();
+        // Addresses backed off during the check may be dialled again.
+        t.failed.clear();
+        (t.id, !t.paused && t.error.is_none())
+    };
+    ctx.emit(Event::Checked {
+        id,
+        pieces_have: have.count(),
+    });
+    if start {
+        start_tasks(ctx, torrent);
+    }
+}
+
+/// `Session::force_recheck`: drop peers, re-hash everything on disk, rebuild
+/// the have-set from what verifies.
+pub async fn recheck(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
+    let storage = {
+        let mut t = torrent.borrow_mut();
+        if t.checking || t.error.is_some() {
+            return;
+        }
+        t.checking = true;
+        for p in t.peers.values() {
+            p.close("rechecking");
+        }
+        t.storage.clone()
+    };
+    match storage.check_all().await {
+        Ok(have) => {
+            let mut t = torrent.borrow_mut();
+            t.resume_dirty = true;
+            drop(t);
+            finish_check_after_recheck(&ctx, &torrent, have);
+        }
+        Err(e) => {
+            torrent.borrow_mut().checking = false;
+            fail_torrent(&ctx, &torrent, format!("recheck failed: {e}"));
+        }
+    }
+}
+
+fn finish_check_after_recheck(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, have: Bitfield) {
+    let tasks_running = {
+        let t = torrent.borrow();
+        !t.closing.is_set() && !t.paused
+    };
+    let (id, kick) = {
+        let mut t = torrent.borrow_mut();
+        t.storage.set_have(have.clone());
+        t.picker.set_have(&have);
+        t.checking = false;
+        t.finished_emitted = t.picker.is_complete();
+        t.failed.clear();
+        (t.id, t.tracker_kick.clone())
+    };
+    ctx.emit(Event::Checked {
+        id,
+        pieces_have: have.count(),
+    });
+    if tasks_running {
+        // Tasks kept running through the check; just refresh.
+        kick.notify();
+        on_new_candidates(ctx, torrent);
+    } else if !torrent.borrow().paused {
+        start_tasks(ctx, torrent);
+    }
 }
 
 /// Start the tracker and tick tasks (after add / resume).
@@ -401,12 +540,8 @@ fn start_tasks(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
     {
         let mut t = torrent.borrow_mut();
         t.closing = Flag::new();
+        t.paused = false;
         t.announcer.start();
-        if t.picker.is_complete() {
-            t.state = TorrentState::Seeding;
-        } else {
-            t.state = TorrentState::Downloading;
-        }
     }
     uring::spawn(super::tracker_task::run(ctx.clone(), torrent.clone()));
     uring::spawn(tick(ctx.clone(), torrent.clone()));
@@ -414,28 +549,50 @@ fn start_tasks(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
 
 /// `Session::resume`.
 pub fn resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
-    if torrent.borrow().state != TorrentState::Paused {
-        return;
+    {
+        let mut t = torrent.borrow_mut();
+        if !t.paused || t.error.is_some() {
+            return;
+        }
+        if t.checking {
+            // `finish_check` starts the tasks once the check completes.
+            t.paused = false;
+            return;
+        }
     }
     start_tasks(ctx, torrent);
 }
 
 /// `Session::pause`: stop announcing (with `stopped`), drop peers, keep state.
 pub async fn pause(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
-    if !torrent.borrow().is_running() {
-        return;
+    {
+        let mut t = torrent.borrow_mut();
+        if t.paused {
+            return;
+        }
+        t.paused = true;
     }
     stop(ctx, torrent, false).await;
-    torrent.borrow_mut().state = TorrentState::Paused;
 }
 
 /// Wind a torrent down: send `stopped` to every started tracker, close every
 /// peer, save resume data. Used by pause, remove and shutdown.
 pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, _final: bool) {
-    let (closing, jobs, peers) = {
-        let mut t = torrent.borrow_mut();
+    {
+        let t = torrent.borrow();
         t.closing.set();
         t.tracker_kick.notify();
+    }
+    // An announce in flight (typically `started`) must land before we decide
+    // which trackers get `stopped`, or a tracker would be left with a ghost.
+    for _ in 0..100 {
+        if torrent.borrow().announces_in_flight == 0 {
+            break;
+        }
+        uring::sleep(Duration::from_millis(50)).await;
+    }
+    let (closing, jobs, peers) = {
+        let mut t = torrent.borrow_mut();
         let jobs = t.announcer.stop();
         let peers: Vec<Rc<PeerHandle>> = t.peers.values().cloned().collect();
         (t.closing.clone(), jobs, peers)
@@ -517,7 +674,7 @@ async fn tick(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
         let now = Instant::now();
         let save = {
             let mut t = torrent.borrow_mut();
-            if !t.is_running() {
+            if !t.is_active() {
                 break;
             }
             // Rates: exponential moving average over 1 s samples.
@@ -545,9 +702,7 @@ async fn tick(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
 /// Open connections up to the limits. Candidates rotate through the queue so
 /// an address that is busy, backed off or connected now is retried later.
 fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, now: Instant) {
-    if t.picker.is_complete() {
-        // Leech-only (M2): with nothing to download and no upload path yet,
-        // dialling out only wastes the swarm's time. M3 lifts this.
+    if !t.is_running() {
         return;
     }
     let max_peers = ctx.cfg.max_peers;
@@ -614,7 +769,7 @@ pub async fn on_block(
                     other.out.notify();
                 }
             }
-            t.note_supplier(request.index, peer.addr.ip());
+            t.note_supplier(request.index, peer.key, peer.addr.ip());
         } else {
             t.stats.redundant += u64::from(request.length);
         }
@@ -655,14 +810,15 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
         match result {
             Ok(true) => {
                 t.picker.piece_verified(piece as usize);
-                t.suppliers.remove(&piece);
+                for (_, ip) in t.suppliers.remove(&piece).unwrap_or_default() {
+                    t.adjust_trust(ip, 1);
+                }
                 t.resume_dirty = true;
                 t.broadcast_have(piece);
                 t.refresh_interest();
                 ctx.emit(Event::PieceFinished { id, piece });
                 if t.picker.is_complete() && !t.finished_emitted {
                     t.finished_emitted = true;
-                    t.state = TorrentState::Seeding;
                     t.announcer.completed(now);
                     t.tracker_kick.notify();
                     tracing::info!(torrent = id.0, "download complete");
@@ -678,16 +834,23 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
                 t.picker.piece_failed(piece as usize);
                 let blamed = t.suppliers.remove(&piece).unwrap_or_default();
                 tracing::warn!(torrent = id.0, piece, ?blamed, "hash check failed");
-                for ip in blamed {
-                    let n = t.hash_fails.entry(ip).or_insert(0);
-                    *n += 1;
-                    if *n >= BAN_AFTER_HASH_FAILS {
-                        t.banned.insert(ip);
-                        for p in t.peers.values() {
-                            if p.addr.ip() == ip {
-                                p.close("banned: repeated hash failures");
-                            }
-                        }
+                if blamed.len() == 1 {
+                    // One supplier: it is the culprit.
+                    t.adjust_trust(blamed[0].1, -SOLE_FAIL_COST);
+                } else if !blamed.is_empty() {
+                    // Several suppliers: everyone loses a little trust, and the
+                    // piece is re-downloaded from the least trusted one that
+                    // is still connected, so the next verdict is unambiguous.
+                    for (_, ip) in &blamed {
+                        t.adjust_trust(*ip, -1);
+                    }
+                    let suspect = blamed
+                        .iter()
+                        .filter(|(k, ip)| t.peers.contains_key(k) && !t.banned.contains(ip))
+                        .min_by_key(|(_, ip)| t.trust.get(ip).copied().unwrap_or(0))
+                        .map(|(k, _)| *k);
+                    if let Some(k) = suspect {
+                        t.picker.set_exclusive(piece as usize, k);
                     }
                 }
                 ctx.emit(Event::HashFailed { id, piece });
@@ -713,11 +876,10 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
 pub fn fail_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, error: String) {
     let id = {
         let mut t = torrent.borrow_mut();
-        if t.state == TorrentState::Error {
+        if t.error.is_some() {
             return;
         }
         tracing::error!(torrent = t.id.0, "{error}");
-        t.state = TorrentState::Error;
         t.error = Some(error.clone());
         t.id
     };
@@ -726,7 +888,6 @@ pub fn fail_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, error: String
     let t2 = torrent.clone();
     uring::spawn(async move {
         stop(&ctx2, &t2, false).await;
-        t2.borrow_mut().state = TorrentState::Error;
     });
 }
 

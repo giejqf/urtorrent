@@ -257,3 +257,52 @@ fn qbt_reserved_bits_match_capture() {
     );
     assert!(hs.peer_id.starts_with(b"-qB5230-"));
 }
+
+/// The oracle's `allowed_fast` grants to tap-peer equal our BEP 6 set for the
+/// same address, info-hash and piece count, in the same order.
+#[test]
+fn allowed_fast_set_matches_oracle() {
+    let mut checked = 0;
+    for file in [
+        "capture_peer_plain/v4/tap-peer-plain-oracle-responder.jsonl",
+        "capture_peer_plain/v6/tap-peer-plain-oracle-responder.jsonl",
+    ] {
+        let Some(conns) = golden(file) else { continue };
+        for c in conns.iter().filter(|c| c["handshake"].is_object()) {
+            let hs = hs_from_hex(c["handshake"]["raw_hex"].as_str().unwrap());
+            let local: std::net::SocketAddr = c["local"].as_str().unwrap().parse().unwrap();
+            let granted: Vec<u32> = c["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["dir"] == "recv" && e["kind"] == "allowed_fast")
+                .map(|e| e["detail"]["index"].as_u64().unwrap() as u32)
+                .collect();
+            if granted.is_empty() {
+                continue;
+            }
+            // Fixture B: 1 MiB / 64 KiB = 16 pieces. Q7: the oracle seeds the
+            // set with the full address, not the BEP 6 /24.
+            let ours = wire::allowed_fast_set(
+                local.ip(),
+                &hs.info_hash,
+                16,
+                granted.len() as u32,
+                profile::Profile::qbt_5_2_3_lt2_0_14()
+                    .peer
+                    .allowed_fast_addr,
+            );
+            assert_eq!(ours, granted, "{file}: allowed-fast set differs");
+            let bep = wire::allowed_fast_set(
+                local.ip(),
+                &hs.info_hash,
+                16,
+                granted.len() as u32,
+                profile::AllowedFastAddr::Bep6Masked,
+            );
+            assert_ne!(bep, granted, "{file}: Q7 no longer holds");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 1, "no capture with allowed_fast grants");
+}
