@@ -28,9 +28,13 @@ another thread would be unsound, and the runtime's park step is
    the ring thread*. Local tasks that need the command loop use the same
    eventfd (a `write(2)` on the same thread), so the loop never drops its
    notifier future mid-flight and no wakeup can be lost.
-3. **Hashing overlaps I/O.** `HashPool::verify_async` hands the bytes to a
-   worker and resolves through the eventfd; the blocking `verify` remains for
-   callers without a reactor. The worker never touches a waker.
+3. **Hashing overlaps I/O.** `HashPool::verify_async` / `update_async` hand
+   bytes to a worker and resolve through the eventfd; the blocking `verify`
+   remains for callers without a reactor. The worker never touches a waker.
+   Since 2026-09-20 pieces are hashed as they are written (a per-piece
+   cursor advanced with `update_async` over each contiguous run) rather than
+   read back once complete; the have-bit is still set only after every write
+   of the piece completed.
 4. **Disk I/O runs on its own ring (`urt-disk`), through a job queue.**
    (Amended 2026-09-20; M2–0.1.0 ran torrent file I/O on the network ring.)
    `storage::DiskRing` owns a second `uring::Runtime` thread that hosts every

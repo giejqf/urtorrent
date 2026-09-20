@@ -6,6 +6,17 @@
 //! spans and BEP 47 padding files are handled here; padding bytes are synthetic
 //! zeros for hashing and are never written to disk.
 //!
+//! Hashing happens as blocks are written ("hash cursor"): each piece being
+//! downloaded carries a running SHA-1 that advances over the contiguous
+//! prefix written so far; blocks that land ahead of the cursor are kept in a
+//! small in-memory stash (bounded per piece) or, past that bound, read back
+//! from the page cache when the cursor reaches them. When the cursor reaches
+//! the end the digest is compared and the have-bit set — after every write
+//! of the piece completed, so resume data never claims unwritten bytes.
+//! `verify_piece` returns that verdict; pieces without a cursor (rechecks,
+//! data found on disk) are read back and hashed whole, through a pool of
+//! piece-sized buffers rather than a fresh allocation per piece.
+//!
 //! File priorities (selective download): a file with priority 0 is not
 //! downloaded for its own sake, but a piece that straddles it and a wanted
 //! file is. The bytes of such a piece that fall into a skipped file go to the
@@ -16,17 +27,88 @@
 //! parts already held for it are exported into the real file.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Waker;
 
 use metainfo::{FileSlice, Info};
-use uring::{Buffer, File};
+use uring::{Buffer, BufferPool, File};
 
 use crate::Error;
-use crate::hash::HashPool;
+use crate::hash::{HashPool, HashState};
 use metainfo::Bitfield;
+
+/// Bytes of not-yet-hashed blocks kept in memory per in-progress piece;
+/// beyond this, blocks ahead of the cursor are read back when reached.
+const STASH_CAP: usize = 1024 * 1024;
+/// Largest read-back run per hash job.
+const MAX_RUN: u32 = 1024 * 1024;
+
+/// Hash-as-you-write state of one piece being downloaded.
+struct PieceHash {
+    /// The running digest (`None` while a pool job holds it).
+    state: Option<HashState>,
+    /// Bytes hashed so far (contiguous from the piece start).
+    cursor: u32,
+    /// Written ranges `[start, end)`, sorted and merged.
+    written: Vec<(u32, u32)>,
+    /// Written-but-unhashed block data, by offset.
+    stash: BTreeMap<u32, Vec<u8>>,
+    stash_bytes: usize,
+    /// An advancer is running for this piece.
+    hashing: bool,
+    /// The verdict once the cursor reached the end (taken by `verify_piece`).
+    verdict: Option<bool>,
+    /// Tasks waiting for the verdict.
+    waiters: Vec<Waker>,
+}
+
+impl PieceHash {
+    fn new() -> PieceHash {
+        PieceHash {
+            state: Some(HashState::new()),
+            cursor: 0,
+            written: Vec::new(),
+            stash: BTreeMap::new(),
+            stash_bytes: 0,
+            hashing: false,
+            verdict: None,
+            waiters: Vec::new(),
+        }
+    }
+
+    /// Record `[start, end)` as written.
+    fn mark(&mut self, start: u32, end: u32) {
+        self.written.push((start, end));
+        self.written.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.written.len());
+        for (s, e) in self.written.drain(..) {
+            match merged.last_mut() {
+                Some((_, le)) if s <= *le => *le = (*le).max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        self.written = merged;
+    }
+
+    /// End of the written run that contains `pos`, if any.
+    fn run_end(&self, pos: u32) -> Option<u32> {
+        self.written
+            .iter()
+            .find(|(s, e)| *s <= pos && pos < *e)
+            .map(|(_, e)| *e)
+    }
+
+    /// Start over (a failed hash): the bytes on disk are wrong and will be
+    /// overwritten by the re-download.
+    fn reset(&mut self) {
+        let waiters = std::mem::take(&mut self.waiters);
+        *self = PieceHash::new();
+        self.waiters = waiters;
+    }
+}
 
 /// Default file priority (libtorrent's `default_priority`).
 pub const DEFAULT_PRIORITY: u8 = 4;
@@ -46,6 +128,13 @@ pub struct Storage {
     /// created on disk).
     use_parts: RefCell<Vec<bool>>,
     parts: RefCell<Option<Rc<File>>>,
+    /// Pieces being downloaded, hashed as they are written.
+    progress: RefCell<HashMap<usize, PieceHash>>,
+    /// Piece-sized buffers for read-back hashing (recheck, fallback).
+    piece_bufs: BufferPool,
+    /// Bytes the hash cursor had to read back (diagnostics: zero when blocks
+    /// arrive in order).
+    readback_bytes: std::cell::Cell<u64>,
 }
 
 impl Storage {
@@ -53,6 +142,7 @@ impl Storage {
     /// Every content file starts at [`DEFAULT_PRIORITY`].
     pub fn new(info: Arc<Info>, root: PathBuf, pool: Rc<HashPool>) -> Storage {
         let pieces = info.piece_count();
+        let piece_len = info.piece_length as usize;
         let priorities = info
             .files
             .iter()
@@ -68,7 +158,16 @@ impl Storage {
             priorities: RefCell::new(priorities),
             use_parts: RefCell::new(vec![false; n]),
             parts: RefCell::new(None),
+            progress: RefCell::new(HashMap::new()),
+            piece_bufs: BufferPool::new(piece_len, 2),
+            readback_bytes: std::cell::Cell::new(0),
         }
+    }
+
+    /// Bytes the hash cursor read back from disk because blocks arrived ahead
+    /// of it beyond the in-memory stash (0 for in-order downloads).
+    pub fn hash_readback_bytes(&self) -> u64 {
+        self.readback_bytes.get()
     }
 
     /// Path of the parts file.
@@ -331,31 +430,201 @@ impl Storage {
         Ok(f)
     }
 
-    /// Write a block (`data`) at `offset` within `piece`. Returns the buffer.
-    /// Padding regions in the span are skipped (never written).
-    pub async fn write_block(
-        &self,
-        piece: usize,
-        offset: u32,
-        data: Buffer,
-    ) -> Result<Buffer, Error> {
+    /// Write a block (`data`) at `offset` within `piece`, then advance the
+    /// piece's hash cursor (see the module docs). Padding regions in the span
+    /// are skipped on disk and hashed as zeros, as BEP 47 defines them.
+    pub async fn write_block(&self, piece: usize, offset: u32, data: Buffer) -> Result<(), Error> {
         let torrent_off = self.torrent_offset(piece, offset)?;
         let len = data.len() as u64;
         let slices = self.info.slices_for(torrent_off, len);
-        let bytes = data.into_vec();
+        let mut bytes = data.into_vec();
         let mut pos = 0usize;
         for s in slices {
             let take = s.length as usize;
+            if s.padding {
+                // Synthetic zeros: not stored, and hashed as zeros whatever
+                // the peer sent.
+                bytes[pos..pos + take].fill(0);
+                pos += take;
+                continue;
+            }
             let chunk = &bytes[pos..pos + take];
             pos += take;
-            if s.padding {
-                continue; // synthetic zeros, not stored
-            }
             let (file, off) = self.target(&s).await?;
             let buf = Buffer::from_vec(chunk.to_vec());
             file.write_all_at(off, buf).await?;
         }
-        Ok(Buffer::from_vec(bytes))
+        self.on_written(piece, offset, bytes).await
+    }
+
+    /// A block of `piece` is on disk: record it and advance the hash cursor as
+    /// far as the contiguous written prefix goes.
+    async fn on_written(&self, piece: usize, offset: u32, data: Vec<u8>) -> Result<(), Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let piece_len = self.piece_len(piece)?;
+        let end = offset.saturating_add(data.len() as u32).min(piece_len);
+        {
+            let mut prog = self.progress.borrow_mut();
+            let p = prog.entry(piece).or_insert_with(PieceHash::new);
+            if p.verdict.is_some() {
+                // A verdict is pending collection; this write belongs to a
+                // re-download after a failure that was not collected yet.
+                p.reset();
+            }
+            p.mark(offset, end);
+            if offset >= p.cursor && (offset == p.cursor || p.stash_bytes + data.len() <= STASH_CAP)
+            {
+                p.stash_bytes += data.len();
+                p.stash.insert(offset, data);
+            }
+            if p.hashing {
+                return Ok(());
+            }
+            p.hashing = true;
+        }
+        self.advance(piece, piece_len).await;
+        Ok(())
+    }
+
+    /// Run the hash cursor of `piece` forward until it hits an unwritten byte
+    /// (or the end), one pool job per contiguous run.
+    async fn advance(&self, piece: usize, piece_len: u32) {
+        loop {
+            // Plan the next run: stash entries first, read-back for the rest.
+            let (chunks, readback, next, state) = {
+                let mut prog = self.progress.borrow_mut();
+                let Some(p) = prog.get_mut(&piece) else {
+                    return;
+                };
+                let mut pos = p.cursor;
+                let mut chunks: Vec<Vec<u8>> = Vec::new();
+                let mut readback: Vec<(u32, u32)> = Vec::new();
+                let mut budget = MAX_RUN;
+                while pos < piece_len && budget > 0 {
+                    if let Some(d) = p.stash.remove(&pos) {
+                        p.stash_bytes -= d.len();
+                        let l = d.len() as u32;
+                        chunks.push(d);
+                        pos += l;
+                        budget = budget.saturating_sub(l);
+                    } else if let Some(run_end) = p.run_end(pos) {
+                        // Written earlier, not stashed: read it back, but only
+                        // up to the next stashed block so that one is used.
+                        let mut e = run_end.min(pos.saturating_add(budget));
+                        if let Some((&next_stash, _)) = p.stash.range(pos + 1..).next() {
+                            e = e.min(next_stash);
+                        }
+                        readback.push((pos, e));
+                        chunks.push(Vec::new()); // placeholder, filled below
+                        budget = budget.saturating_sub(e - pos);
+                        pos = e;
+                    } else {
+                        break;
+                    }
+                }
+                if chunks.is_empty() {
+                    p.hashing = false;
+                    return;
+                }
+                (chunks, readback, pos, p.state.take())
+            };
+            let mut chunks = chunks;
+            // Fill the read-back placeholders through the ring.
+            let mut rb = readback.iter();
+            let mut pooled_idx = Vec::new();
+            for (i, c) in chunks.iter_mut().enumerate() {
+                if !c.is_empty() {
+                    continue;
+                }
+                let Some(&(s, e)) = rb.next() else { break };
+                let mut buf = self.piece_bufs.take();
+                buf.resize((e - s) as usize);
+                match self.read_exact_piece_range(piece, s, buf).await {
+                    Ok(b) => {
+                        self.readback_bytes
+                            .set(self.readback_bytes.get() + u64::from(e - s));
+                        *c = b.into_vec();
+                        pooled_idx.push(i);
+                    }
+                    Err(err) => {
+                        // Cannot hash what cannot be read: leave the cursor
+                        // where it is; `verify_piece` falls back to a full
+                        // read-back and reports the truth.
+                        tracing::warn!(piece, "hash read-back failed: {err}");
+                        let mut prog = self.progress.borrow_mut();
+                        if let Some(p) = prog.get_mut(&piece) {
+                            p.state = state;
+                            p.hashing = false;
+                        }
+                        return;
+                    }
+                }
+            }
+            let finish = next == piece_len;
+            let state = state.unwrap_or_default();
+            let (state, chunks, digest) = self.pool.update_async(state, chunks, finish).await;
+            for (i, c) in chunks.into_iter().enumerate() {
+                if pooled_idx.contains(&i) {
+                    self.piece_bufs.put(c);
+                }
+            }
+            let mut prog = self.progress.borrow_mut();
+            let Some(p) = prog.get_mut(&piece) else {
+                return;
+            };
+            p.state = Some(state);
+            p.cursor = next;
+            if finish {
+                let ok = digest.is_some_and(|d| Some(&d) == self.info.piece_hash(piece));
+                if ok {
+                    self.have.borrow_mut().set(piece);
+                } else {
+                    self.have.borrow_mut().clear(piece);
+                }
+                p.verdict = Some(ok);
+                p.hashing = false;
+                for w in p.waiters.drain(..) {
+                    w.wake();
+                }
+                return;
+            }
+        }
+    }
+
+    /// Read exactly `[start, start + buf.len())` of `piece` (padding regions
+    /// zero-filled) into `buf`.
+    async fn read_exact_piece_range(
+        &self,
+        piece: usize,
+        start: u32,
+        buf: Buffer,
+    ) -> Result<Buffer, Error> {
+        let len = buf.len() as u32;
+        let torrent_off = self.torrent_offset(piece, start)?;
+        let slices = self.info.slices_for(torrent_off, u64::from(len));
+        let mut out = buf.into_vec();
+        let mut pos = 0usize;
+        for s in slices {
+            let take = s.length as usize;
+            if s.padding {
+                out[pos..pos + take].fill(0);
+                pos += take;
+                continue;
+            }
+            let (file, off) = self.target(&s).await?;
+            let got = file
+                .read_exact_at(off, Buffer::from_vec(vec![0u8; take]))
+                .await?;
+            out[pos..pos + take].copy_from_slice(got.as_slice());
+            pos += take;
+        }
+        Ok(Buffer::from_vec(out))
+    }
+
+    fn piece_len(&self, piece: usize) -> Result<u32, Error> {
+        self.info.piece_size(piece).ok_or(Error::OutOfRange)
     }
 
     /// Read the full contents of `piece` into a buffer. Returns `(data,
@@ -364,7 +633,9 @@ impl Storage {
     /// bytes are zero-filled so hashing is deterministic.
     pub async fn read_piece(&self, piece: usize) -> Result<(Vec<u8>, bool), Error> {
         let loc = self.info.piece_location(piece).ok_or(Error::OutOfRange)?;
-        let mut out = vec![0u8; loc.length as usize];
+        let mut buf = self.piece_bufs.take();
+        buf.resize(loc.length as usize);
+        let mut out = buf.into_vec();
         let mut pos = 0usize;
         let mut complete = true;
         for s in &loc.slices {
@@ -418,12 +689,45 @@ impl Storage {
     /// Returns whether it verified.
     pub async fn verify_piece(&self, piece: usize) -> Result<bool, Error> {
         let expected = *self.info.piece_hash(piece).ok_or(Error::OutOfRange)?;
+        // Hash-as-you-write verdict, waiting for a cursor still running.
+        loop {
+            let waiting = {
+                let mut prog = self.progress.borrow_mut();
+                match prog.get_mut(&piece) {
+                    Some(p) => {
+                        if let Some(v) = p.verdict.take() {
+                            if v {
+                                prog.remove(&piece);
+                            } else {
+                                p.reset();
+                            }
+                            return Ok(v);
+                        }
+                        p.hashing
+                    }
+                    None => false,
+                }
+            };
+            if !waiting {
+                break;
+            }
+            VerdictWait {
+                storage: self,
+                piece,
+            }
+            .await;
+        }
+        // No cursor (data found on disk, recheck, or an incomplete cursor):
+        // read the piece back and hash it whole.
+        self.progress.borrow_mut().remove(&piece);
         let (data, complete) = self.read_piece(piece).await?;
         if !complete {
+            self.piece_bufs.put(data);
             self.have.borrow_mut().clear(piece);
             return Ok(false);
         }
-        let (ok, _buf) = self.pool.verify_async(data, expected).await;
+        let (ok, buf) = self.pool.verify_async(data, expected).await;
+        self.piece_bufs.put(buf);
         if ok {
             self.have.borrow_mut().set(piece);
         } else {
@@ -443,16 +747,17 @@ impl Storage {
         data: Buffer,
     ) -> Result<Option<bool>, Error> {
         self.write_block(piece, offset, data).await?;
-        let (bytes, complete) = self.read_piece(piece).await?;
+        let complete = {
+            let prog = self.progress.borrow();
+            match prog.get(&piece) {
+                Some(p) => p.verdict.is_some() || p.hashing,
+                None => false,
+            }
+        };
         if !complete {
             return Ok(None);
         }
-        let expected = *self.info.piece_hash(piece).ok_or(Error::OutOfRange)?;
-        let (ok, _) = self.pool.verify_async(bytes, expected).await;
-        if ok {
-            self.have.borrow_mut().set(piece);
-        }
-        Ok(Some(ok))
+        Ok(Some(self.verify_piece(piece).await?))
     }
 
     /// Recheck every piece against the data on disk, rebuilding the have set
@@ -460,6 +765,7 @@ impl Storage {
     pub async fn check_all(&self) -> Result<Bitfield, Error> {
         let pieces = self.info.piece_count();
         let mut have = Bitfield::new(pieces);
+        self.progress.borrow_mut().clear();
         for p in 0..pieces {
             let expected = match self.info.piece_hash(p) {
                 Some(h) => *h,
@@ -467,10 +773,13 @@ impl Storage {
             };
             let (data, complete) = self.read_piece(p).await?;
             if complete {
-                let (ok, _) = self.pool.verify_async(data, expected).await;
+                let (ok, buf) = self.pool.verify_async(data, expected).await;
+                self.piece_bufs.put(buf);
                 if ok {
                     have.set(p);
                 }
+            } else {
+                self.piece_bufs.put(data);
             }
         }
         *self.have.borrow_mut() = have.clone();
@@ -517,6 +826,29 @@ impl Storage {
     ) -> Result<Vec<FileSlice>, Error> {
         let torrent_off = self.torrent_offset(piece, offset)?;
         Ok(self.info.slices_for(torrent_off, u64::from(length)))
+    }
+}
+
+/// Resolves when the piece's hash cursor finishes (or is no longer running).
+struct VerdictWait<'a> {
+    storage: &'a Storage,
+    piece: usize,
+}
+
+impl std::future::Future for VerdictWait<'_> {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let mut prog = self.storage.progress.borrow_mut();
+        match prog.get_mut(&self.piece) {
+            Some(p) if p.verdict.is_none() && p.hashing => {
+                p.waiters.push(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+            _ => std::task::Poll::Ready(()),
+        }
     }
 }
 

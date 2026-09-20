@@ -26,6 +26,20 @@ bottleneck (both engines, both disk rings and four SHA-1 workers share two
 cores). A first version with one global barrier per verify cost ~35%: a
 verify must only wait for earlier writes to *its* piece (ADR 0004 §4).
 
+### Hash-as-you-write (2026-09-20)
+
+Pieces are hashed as their blocks are written (a per-piece SHA-1 cursor over
+the contiguous prefix; blocks ahead of the cursor sit in a ≤1 MiB stash or
+are read back from the page cache when reached) instead of being read back
+whole and re-hashed once complete; recheck and fallback verification use a
+pool of piece-sized buffers instead of a fresh allocation per piece. Three
+interleaved `soak transfer --size 2G` rounds against the previous binary:
+user CPU 14.2 → 13.4 s (−6%; the memcpy of every piece and its allocation),
+sys CPU 7.7 → 8.5 s (more, smaller hash jobs), wall time within noise
+(12.6–20.4 s both), peak RSS 13 → 11 MiB (thread) / 13 → 9 MiB (inline).
+`Storage::hash_readback_bytes` is 0 for an in-order download. The saving
+grows with piece size (a 16 MiB piece is a 16 MiB copy avoided per piece).
+
 Known limits:
 
 - On a two-core host the extra thread buys nothing measurable; it matters

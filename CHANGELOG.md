@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network ring. `uring::Bridge` is the shared cross-thread completion path.
 - `xtask syscalls` judges the `urt-disk` thread too; `urt-soak
   --inline-disk` for A/B runs.
+- Hash-as-you-write: `Storage` keeps a SHA-1 cursor per piece being
+  downloaded and hashes blocks as they land (stash ≤1 MiB per piece for
+  blocks ahead of the cursor, page-cache read-back beyond it; padding hashed
+  as zeros whatever a peer sent), so a completed piece is no longer read
+  back and re-hashed; `verify_piece` returns the cursor's verdict and falls
+  back to a read-back for pieces found on disk. `HashPool::update_async`
+  (incremental updates, no more buffer clone per job), `HashState`,
+  `Storage::hash_readback_bytes`; recheck / fallback hashing uses a pool of
+  piece-sized buffers (`BufferPool::put`).
 
 ## [0.1.0] - 2026-09-20
 

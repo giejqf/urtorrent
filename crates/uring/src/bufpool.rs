@@ -179,6 +179,14 @@ impl BufferPool {
     pub fn idle(&self) -> usize {
         self.inner.free.borrow().len()
     }
+
+    /// Return an allocation that left the pool through [`Buffer::into_vec`]
+    /// (e.g. after a round trip to a worker thread) so it can be reused.
+    pub fn put(&self, data: Vec<u8>) {
+        let mut data = data;
+        data.clear();
+        self.inner.recycle(data);
+    }
 }
 
 #[cfg(test)]

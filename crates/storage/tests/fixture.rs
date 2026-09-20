@@ -112,3 +112,64 @@ pub fn multi(name: &str, files: &[(&str, usize)], piece_length: u32, seed: u64) 
         piece_length,
     }
 }
+
+/// A multi-file torrent with a BEP 47 padding file after every file but the
+/// last, so each real file starts on a piece boundary. Padding bytes in the
+/// content stream are zeros.
+pub fn multi_padded(name: &str, files: &[(&str, usize)], piece_length: u32, seed: u64) -> Fixture {
+    let pl = piece_length as usize;
+    // Build the stream: file, pad to boundary, file, ...
+    let mut content = Vec::new();
+    let mut entries: Vec<(Vec<u8>, usize, bool)> = Vec::new(); // (path components joined, len, padding)
+    for (i, (path, len)) in files.iter().enumerate() {
+        let data = gen_content(*len, seed.wrapping_add(i as u64));
+        content.extend_from_slice(&data);
+        entries.push((path.as_bytes().to_vec(), *len, false));
+        if i + 1 < files.len() {
+            let pad = (pl - (content.len() % pl)) % pl;
+            if pad > 0 {
+                content.extend(std::iter::repeat_n(0u8, pad));
+                entries.push((format!(".pad/{pad}").into_bytes(), pad, true));
+            }
+        }
+    }
+    let pieces = pieces_hashes(&content, pl);
+    let mut info = Vec::new();
+    info.push(b'd');
+    benc_bytes(&mut info, b"files");
+    info.push(b'l');
+    for (path, len, padding) in &entries {
+        info.push(b'd');
+        if *padding {
+            benc_bytes(&mut info, b"attr");
+            benc_bytes(&mut info, b"p");
+        }
+        benc_bytes(&mut info, b"length");
+        benc_int(&mut info, *len as i64);
+        benc_bytes(&mut info, b"path");
+        info.push(b'l');
+        for comp in path.split(|b| *b == b'/') {
+            benc_bytes(&mut info, comp);
+        }
+        info.push(b'e');
+        info.push(b'e');
+    }
+    info.push(b'e');
+    benc_bytes(&mut info, b"name");
+    benc_bytes(&mut info, name.as_bytes());
+    benc_bytes(&mut info, b"piece length");
+    benc_int(&mut info, i64::from(piece_length));
+    benc_bytes(&mut info, b"pieces");
+    benc_bytes(&mut info, &pieces);
+    info.push(b'e');
+    let mut torrent = Vec::new();
+    torrent.push(b'd');
+    benc_bytes(&mut torrent, b"info");
+    torrent.extend_from_slice(&info);
+    torrent.push(b'e');
+    Fixture {
+        torrent,
+        content,
+        piece_length,
+    }
+}

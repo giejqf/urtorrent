@@ -9,12 +9,17 @@
 //!
 //! - [`HashPool::hash`] / [`HashPool::verify`] block the caller until a worker
 //!   finishes (simple; used by tests and by callers without a reactor).
-//! - [`HashPool::verify_async`] returns a future. Workers push the result into a
-//!   shared queue and ring the attached [`uring::NotifyHandle`]; the ring
-//!   thread calls [`HashPool::drain`] when its notifier fires, which completes
-//!   the futures and wakes their (thread-local) wakers. Without an attached
-//!   notifier the future resolves synchronously, so behaviour is always
-//!   correct and never deadlocks — only the overlap with disk I/O is lost.
+//! - [`HashPool::verify_async`] and [`HashPool::update_async`] return futures.
+//!   Workers push the result into a shared queue and ring the attached
+//!   [`uring::NotifyHandle`]; the ring thread calls [`HashPool::drain`] when
+//!   its notifier fires, which completes the futures and wakes their
+//!   (thread-local) wakers. Without an attached notifier the future resolves
+//!   synchronously, so behaviour is always correct and never deadlocks — only
+//!   the overlap with disk I/O is lost.
+//!
+//! `update_async` feeds a running [`HashState`] with a batch of chunks (and
+//! optionally finalises it): the piece store hashes blocks as they are
+//! written instead of reading the piece back afterwards.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -29,8 +34,28 @@ use std::thread::JoinHandle;
 use sha1::{Digest, Sha1};
 use uring::NotifyHandle;
 
-/// `(job id, digest, buffer)` returned from a worker.
-type HashReply = (u64, [u8; 20], Vec<u8>);
+/// A running SHA-1 (opaque; created by [`HashState::new`], advanced on the
+/// pool by [`HashPool::update_async`]).
+#[derive(Clone, Debug, Default)]
+pub struct HashState(Sha1);
+
+impl HashState {
+    /// A fresh state.
+    pub fn new() -> HashState {
+        HashState(Sha1::new())
+    }
+}
+
+/// What a worker computed for one job.
+enum Outcome {
+    /// Whole-buffer digest and the buffer back.
+    Digest([u8; 20], Vec<u8>),
+    /// Advanced state, the chunks back, and the digest when finalised.
+    Update(HashState, Vec<Vec<u8>>, Option<[u8; 20]>),
+}
+
+/// `(job id, outcome)` returned from a worker.
+type HashReply = (u64, Outcome);
 
 /// Compute the SHA-1 of `data` (used directly for one-off hashing).
 pub fn sha1(data: &[u8]) -> [u8; 20] {
@@ -46,10 +71,39 @@ enum Reply {
     Async,
 }
 
+enum Work {
+    Digest(Vec<u8>),
+    Update {
+        state: HashState,
+        chunks: Vec<Vec<u8>>,
+        finish: bool,
+    },
+}
+
 struct Job {
     id: u64,
-    data: Vec<u8>,
+    work: Work,
     reply: Reply,
+}
+
+fn run_work(work: Work) -> Outcome {
+    match work {
+        Work::Digest(data) => {
+            let digest = sha1(&data);
+            Outcome::Digest(digest, data)
+        }
+        Work::Update {
+            mut state,
+            chunks,
+            finish,
+        } => {
+            for c in &chunks {
+                state.0.update(c);
+            }
+            let digest = finish.then(|| state.0.clone().finalize().into());
+            Outcome::Update(state, chunks, digest)
+        }
+    }
 }
 
 /// State shared between workers and the ring thread.
@@ -58,9 +112,9 @@ struct Shared {
     notify: Mutex<Option<NotifyHandle>>,
 }
 
-/// Ring-thread side of one in-flight async verification.
+/// Ring-thread side of one in-flight async job.
 struct Slot {
-    result: Option<([u8; 20], Vec<u8>)>,
+    result: Option<Outcome>,
     waker: Option<Waker>,
 }
 
@@ -98,10 +152,10 @@ impl HashPool {
                             Err(_) => break,
                         };
                         let Ok(job) = job else { break };
-                        let digest = sha1(&job.data);
+                        let outcome = run_work(job.work);
                         match job.reply {
                             Reply::Sync(tx) => {
-                                let _ = tx.send((job.id, digest, job.data));
+                                let _ = tx.send((job.id, outcome));
                             }
                             Reply::Async => {
                                 // Ring the eventfd only when the queue was
@@ -110,7 +164,7 @@ impl HashPool {
                                 let was_empty = match shared.completions.lock() {
                                     Ok(mut q) => {
                                         let e = q.is_empty();
-                                        q.push((job.id, digest, job.data));
+                                        q.push((job.id, outcome));
                                         e
                                     }
                                     Err(_) => true,
@@ -168,21 +222,36 @@ impl HashPool {
     /// back for reuse). Blocks the caller until the worker finishes.
     pub fn hash(&self, data: Vec<u8>) -> ([u8; 20], Vec<u8>) {
         let (reply, rx) = channel::<HashReply>();
-        if let Some(tx) = &self.tx
-            && tx
-                .send(Job {
-                    id: self.alloc_id(),
-                    data: data.clone(),
-                    reply: Reply::Sync(reply),
-                })
-                .is_ok()
-            && let Ok((_, digest, buf)) = rx.recv()
-        {
-            return (digest, buf);
-        }
-        // Pool gone (shutting down) or worker exited: hash inline so the result
-        // is still correct (accounting must be truthful, AGENTS.md rule 1) and
-        // callers never deadlock.
+        let data = match &self.tx {
+            Some(tx) => match tx.send(Job {
+                id: self.alloc_id(),
+                work: Work::Digest(data),
+                reply: Reply::Sync(reply),
+            }) {
+                Ok(()) => match rx.recv() {
+                    Ok((_, Outcome::Digest(digest, buf))) => return (digest, buf),
+                    Ok((_, Outcome::Update(_, mut chunks, digest))) => {
+                        // Not what was asked; cannot happen, but stay truthful.
+                        let buf = chunks.pop().unwrap_or_default();
+                        return (digest.unwrap_or_else(|| sha1(&buf)), buf);
+                    }
+                    Err(_) => {
+                        // Worker gone with the buffer: impossible while the
+                        // pool owns its workers (they exit only on drop).
+                        unreachable_worker();
+                        Vec::new()
+                    }
+                },
+                // Pool gone (shutting down): take the buffer back.
+                Err(std::sync::mpsc::SendError(job)) => match job.work {
+                    Work::Digest(d) => d,
+                    Work::Update { mut chunks, .. } => chunks.pop().unwrap_or_default(),
+                },
+            },
+            None => data,
+        };
+        // Hash inline so the result is still correct (accounting must be
+        // truthful, AGENTS.md rule 1) and callers never deadlock.
         let digest = sha1(&data);
         (digest, data)
     }
@@ -194,38 +263,64 @@ impl HashPool {
         (&digest == expected, buf)
     }
 
-    /// Verify asynchronously (see the module docs). The future resolves to
-    /// `(matches, data)`.
-    pub fn verify_async(&self, data: Vec<u8>, expected: [u8; 20]) -> VerifyFuture {
-        let attached = self
-            .shared
+    fn attached(&self) -> bool {
+        self.shared
             .notify
             .lock()
             .map(|n| n.is_some())
-            .unwrap_or(false);
+            .unwrap_or(false)
+    }
+
+    /// Submit `work` asynchronously; on any failure (no notifier, pool gone)
+    /// the work is done inline and the slot is filled at once.
+    fn submit(&self, work: Work) -> Rc<RefCell<Slot>> {
         let slot = Rc::new(RefCell::new(Slot {
             result: None,
             waker: None,
         }));
-        if attached && let Some(tx) = &self.tx {
+        let mut work = work;
+        if self.attached()
+            && let Some(tx) = &self.tx
+        {
             let id = self.alloc_id();
             self.pending.borrow_mut().insert(id, slot.clone());
-            if tx
-                .send(Job {
-                    id,
-                    data: data.clone(),
-                    reply: Reply::Async,
-                })
-                .is_ok()
-            {
-                return VerifyFuture { slot, expected };
+            match tx.send(Job {
+                id,
+                work,
+                reply: Reply::Async,
+            }) {
+                Ok(()) => return slot,
+                Err(std::sync::mpsc::SendError(job)) => {
+                    self.pending.borrow_mut().remove(&id);
+                    work = job.work;
+                }
             }
-            self.pending.borrow_mut().remove(&id);
         }
-        // No notifier (or pool gone): resolve now.
-        let (digest, buf) = self.hash(data);
-        slot.borrow_mut().result = Some((digest, buf));
+        slot.borrow_mut().result = Some(run_work(work));
+        slot
+    }
+
+    /// Verify asynchronously (see the module docs). The future resolves to
+    /// `(matches, data)`.
+    pub fn verify_async(&self, data: Vec<u8>, expected: [u8; 20]) -> VerifyFuture {
+        let slot = self.submit(Work::Digest(data));
         VerifyFuture { slot, expected }
+    }
+
+    /// Advance `state` with `chunks` (in order) on the pool; with `finish`
+    /// the digest is produced too. Resolves to `(state, chunks, digest)`.
+    pub fn update_async(
+        &self,
+        state: HashState,
+        chunks: Vec<Vec<u8>>,
+        finish: bool,
+    ) -> UpdateFuture {
+        let slot = self.submit(Work::Update {
+            state,
+            chunks,
+            finish,
+        });
+        UpdateFuture { slot }
     }
 
     /// Complete every finished async job. Call from the ring thread when the
@@ -236,11 +331,11 @@ impl HashPool {
             Err(_) => Vec::new(),
         };
         let mut n = 0;
-        for (id, digest, data) in done {
+        for (id, outcome) in done {
             if let Some(slot) = self.pending.borrow_mut().remove(&id) {
                 let waker = {
                     let mut s = slot.borrow_mut();
-                    s.result = Some((digest, data));
+                    s.result = Some(outcome);
                     s.waker.take()
                 };
                 if let Some(w) = waker {
@@ -270,13 +365,50 @@ impl Future for VerifyFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut s = self.slot.borrow_mut();
         match s.result.take() {
-            Some((digest, data)) => Poll::Ready((digest == self.expected, data)),
+            Some(Outcome::Digest(digest, data)) => Poll::Ready((digest == self.expected, data)),
+            Some(Outcome::Update(_, mut chunks, digest)) => {
+                // Not expected for this future; stay truthful anyway.
+                let data = chunks.pop().unwrap_or_default();
+                Poll::Ready((digest == Some(self.expected), data))
+            }
             None => {
                 s.waker = Some(cx.waker().clone());
                 Poll::Pending
             }
         }
     }
+}
+
+/// The result of [`HashPool::update_async`].
+pub struct UpdateFuture {
+    slot: Rc<RefCell<Slot>>,
+}
+
+impl Future for UpdateFuture {
+    type Output = (HashState, Vec<Vec<u8>>, Option<[u8; 20]>);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut s = self.slot.borrow_mut();
+        match s.result.take() {
+            Some(Outcome::Update(state, chunks, digest)) => Poll::Ready((state, chunks, digest)),
+            Some(Outcome::Digest(digest, data)) => {
+                // Not expected for this future.
+                Poll::Ready((HashState::new(), vec![data], Some(digest)))
+            }
+            None => {
+                s.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// A worker vanished while holding a job: impossible while the pool owns its
+/// workers (they only exit when the channel closes on drop). Logged, not
+/// panicked, so a caller never dies on a hashing hiccup; the caller hashes
+/// inline instead.
+fn unreachable_worker() {
+    tracing::error!("hash worker exited while holding a job");
 }
 
 impl Drop for HashPool {

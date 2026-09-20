@@ -216,8 +216,12 @@ Only `uring`, `storage` and `session` may perform I/O.
 - Sparse files by default, optional `fallocate` preallocation. Correct handling of
   multi-file piece spans, zero-length files, padding files, file priorities (pieces that
   straddle an unwanted file go to a parts file).
-- Write path: block arrives -> pooled buffer -> uring write; piece complete -> hash job ->
-  on pass, mark + `have`; on fail, discard, attribute blame, ban repeat offenders.
+- Write path: block arrives -> pooled buffer -> uring write -> the piece's SHA-1 cursor
+  advances over the contiguous prefix written (hash jobs on the pool; blocks ahead of the
+  cursor are stashed, bounded, or read back from the page cache); cursor at the end ->
+  on pass, mark + `have` (only after every write of the piece completed); on fail,
+  discard, attribute blame, ban repeat offenders. The kernel page cache is the only
+  cache; no user-space block cache (libtorrent 2.0 made the same call).
 - Resume data: own versioned format, written atomically (tmp + fsync + renameat + dir
   fsync). `kill -9` at any moment must never yield a torrent that claims pieces it does not
   have. When unsure, recheck.

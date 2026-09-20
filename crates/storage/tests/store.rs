@@ -147,6 +147,11 @@ fn multi_file_spans_and_write_verify() {
             for p in 0..info.piece_count() {
                 assert!(store.verify_piece(p).await.unwrap(), "piece {p}");
             }
+            assert_eq!(
+                store.hash_readback_bytes(),
+                0,
+                "in-order writes never read back"
+            );
             // Files exist on disk at the mapped paths.
             assert!(root.join("bundle/a.txt").exists());
             assert!(root.join("bundle/dir/b.bin").exists());
@@ -329,4 +334,133 @@ fn file_priorities_parts_file_and_move() {
     });
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&root2).ok();
+}
+
+/// Hash-as-you-write: blocks landing in any order, beyond the in-memory
+/// stash, a bad block detected and the piece re-downloaded, padding hashed as
+/// zeros whatever a peer sent.
+#[test]
+fn hash_cursor_handles_out_of_order_blocks_and_failures() {
+    // 2 MiB pieces: writing one in reverse fills the 1 MiB stash and forces
+    // read-back for the rest.
+    let fx = fixture::single("cursor.bin", 3 * 1024 * 1024 + 5000, 2 * 1024 * 1024, 21);
+    let torrent = Torrent::parse(&fx.torrent).unwrap();
+    let info = Arc::new(torrent.info);
+    let root = tmpdir("cursor");
+    let pool = Rc::new(HashPool::new(2));
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on({
+        let info = info.clone();
+        let content = fx.content.clone();
+        let root = root.clone();
+        async move {
+            let store = Storage::new(info.clone(), root.clone(), pool);
+            store.create_files().await.unwrap();
+            let pl = 2 * 1024 * 1024usize;
+            let block = 16384usize;
+            // Piece 0 in reverse block order.
+            let mut offs: Vec<usize> = (0..pl).step_by(block).collect();
+            offs.reverse();
+            for o in offs {
+                let buf = Buffer::from_vec(content[o..o + block].to_vec());
+                store.write_block(0, o as u32, buf).await.unwrap();
+            }
+            assert!(
+                store.verify_piece(0).await.unwrap(),
+                "reverse-order piece verifies"
+            );
+            assert!(store.has_piece(0));
+            let rb = store.hash_readback_bytes();
+            assert!(
+                rb > 0 && rb <= (pl - 1024 * 1024) as u64,
+                "read-back only past the stash: {rb}"
+            );
+            // Piece 1 (the short last piece) with one corrupted block, then fixed.
+            let last_len = content.len() - pl;
+            let mut off = 0usize;
+            while off < last_len {
+                let end = (off + block).min(last_len);
+                let mut data = content[pl + off..pl + end].to_vec();
+                if off == block * 3 {
+                    data[7] ^= 0xff;
+                }
+                store
+                    .write_block(1, off as u32, Buffer::from_vec(data))
+                    .await
+                    .unwrap();
+                off = end;
+            }
+            assert!(
+                !store.verify_piece(1).await.unwrap(),
+                "corrupt block is caught"
+            );
+            assert!(!store.has_piece(1));
+            // Re-download the whole piece (as the picker would).
+            let mut off = 0usize;
+            while off < last_len {
+                let end = (off + block).min(last_len);
+                store
+                    .write_block(
+                        1,
+                        off as u32,
+                        Buffer::from_vec(content[pl + off..pl + end].to_vec()),
+                    )
+                    .await
+                    .unwrap();
+                off = end;
+            }
+            assert!(store.verify_piece(1).await.unwrap());
+            assert!(store.has_piece(1));
+            // A full recheck agrees with the cursors.
+            let have = store.check_all().await.unwrap();
+            assert_eq!(have.count(), 2);
+        }
+    });
+    std::fs::remove_dir_all(&root).ok();
+
+    // Padding (BEP 47): the peer's bytes in a padding region do not matter.
+    let fx = fixture::multi_padded("padded", &[("a", 40_000), ("b", 30_000)], 16384, 8);
+    let torrent = Torrent::parse(&fx.torrent).unwrap();
+    let info = Arc::new(torrent.info);
+    assert!(
+        info.files.iter().any(|f| f.is_padding()),
+        "fixture has padding"
+    );
+    let root = tmpdir("padded");
+    let pool = Rc::new(HashPool::new(1));
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on({
+        let info = info.clone();
+        let content = fx.content.clone();
+        let root = root.clone();
+        async move {
+            let store = Storage::new(info.clone(), root.clone(), pool);
+            store.create_files().await.unwrap();
+            let pl = 16384usize;
+            for p in 0..info.piece_count() {
+                let start = p * pl;
+                let end = (start + pl).min(content.len());
+                let mut data = content[start..end].to_vec();
+                // Scribble over padding bytes as a rogue peer might.
+                for s in info.piece_location(p).unwrap().slices {
+                    if s.padding {
+                        let rel = (s.file_offset + info.files[s.file_index].offset - start as u64)
+                            as usize;
+                        for b in &mut data[rel..rel + s.length as usize] {
+                            *b = 0xee;
+                        }
+                    }
+                }
+                store
+                    .write_block(p, 0, Buffer::from_vec(data))
+                    .await
+                    .unwrap();
+                assert!(
+                    store.verify_piece(p).await.unwrap(),
+                    "piece {p} with padding"
+                );
+            }
+        }
+    });
+    std::fs::remove_dir_all(&root).ok();
 }
