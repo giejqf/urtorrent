@@ -38,6 +38,23 @@ impl Families {
             IpAddr::V6(_) => self.v6,
         }
     }
+
+    /// Restrict to one family (one listen endpoint's announce).
+    pub fn only(v6: bool) -> Families {
+        Families { v4: !v6, v6 }
+    }
+
+    /// The listen endpoints, in `Announcer` order: v4 first (if any), then v6.
+    pub fn endpoints(&self) -> Vec<bool> {
+        let mut v = Vec::new();
+        if self.v4 {
+            v.push(false);
+        }
+        if self.v6 {
+            v.push(true);
+        }
+        v
+    }
 }
 
 /// Perform a GET for `url`, building the request bytes with `build` (so
@@ -100,7 +117,15 @@ async fn fetch_once(
         .filter(|a| families.allows(a.ip()))
         .collect();
     if candidates.is_empty() {
-        return Err(format!("no usable address for {}", url.host));
+        return Err(format!(
+            "no {} address for {}",
+            if families.v6 && !families.v4 {
+                "IPv6"
+            } else {
+                "IPv4"
+            },
+            url.host
+        ));
     }
     let mut last_err = String::new();
     for addr in candidates {

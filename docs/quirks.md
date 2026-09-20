@@ -106,3 +106,33 @@ libtorrent emits `supportcrypto=1` when encryption is allowed and
 capture). Consequence: the parameter is a function of the MSE mode, not a
 constant of the profile; `profile` will model it when MSE lands (M5). Until
 then the qbt profile announces `supportcrypto=1`, the oracle's default.
+
+## Q9. One announce per listen socket
+
+Capture: `testkit/golden/capture_tracker_dual` (a hostname tracker resolving
+to both families, dual-stack oracle): every announce is sent twice, once from
+the IPv4 listen socket and once from the IPv6 one, with the same `peer_id`,
+`key` and parameters, and each socket runs its own `started` -> `completed` ->
+`stopped` sequence. For an IP-literal tracker only the matching family's
+socket announces (the dual-stack golden of `capture_tracker_http` shows a
+single v4 sequence and no errors). BEP 3 has no such notion; libtorrent's
+`announce_endpoint` per listen socket does. `tracker::Announcer` keeps one
+state per endpoint and the session routes each endpoint's announce through
+its family; mismatching IP-literal endpoints are disabled silently.
+
+`ipv4=` / `ipv6=` announce parameters are sent by libtorrent only for
+**private** torrents and only for globally routable listen addresses
+(torrent.cpp, `announce_with_tracker`); the lab's addresses are private, so
+this is not yet capturable here (open item for a public-address test).
+
+## Q10. UDP tracker: one attempt per request, BEP 41 URL data
+
+Capture: `capture_tracker_udp`. The oracle retransmits nothing within a
+request: a `connect` that gets no reply fails after the receive timeout and
+the tracker enters the ordinary announce backoff (attempts at +39 s and
++65 s in the capture), instead of BEP 15's 15·2ⁿ retransmits. Every announce
+carries option 2 (URL data) with the URL's path and query (`\x02\x09/announce`),
+`ip = 0`, `num_want` = the profile's `numwant` (0 on `stopped`), and the same
+`key` as the HTTP announces. Connection ids are reused for 60 s. The UDP
+source port is the listen port. `tracker::udp` reproduces all of it; the
+`udp_tracker` scenario shows no UDP-side tells vs the oracle.

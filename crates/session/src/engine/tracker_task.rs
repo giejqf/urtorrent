@@ -92,13 +92,33 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
         let t = torrent.borrow();
         (build_request(ctx, &t, &job), t.id)
     };
+    // This job belongs to one listen endpoint (address family). An IP-literal
+    // tracker of the other family can never be reached from it: disable that
+    // endpoint silently, as the oracle does (no error, no retries).
+    let v6 = ctx
+        .families
+        .endpoints()
+        .get(job.endpoint)
+        .copied()
+        .unwrap_or(false);
+    if let Ok(url) = Url::parse(&job.url)
+        && let Some(ip) = url.host_ip()
+        && ip.is_ipv6() != v6
+    {
+        torrent
+            .borrow_mut()
+            .announcer
+            .disable_endpoint(job.tier, job.index, job.endpoint);
+        return;
+    }
+    let family = http::Families::only(v6);
     let result: Result<AnnounceResponse, String> = async {
         let url = Url::parse(&job.url).map_err(|e| e.to_string())?;
         let profile = &ctx.cfg.profile;
         if url.scheme == "udp" {
-            return announce_udp(ctx, &url, &request).await;
+            return announce_udp(ctx, &url, &request, v6).await;
         }
-        let resp = http::get(&ctx.dns, &ctx.tls, ctx.families, &url, &|u| {
+        let resp = http::get(&ctx.dns, &ctx.tls, family, &url, &|u| {
             request.http_request(u, profile)
         })
         .await?;
@@ -122,6 +142,7 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
             tracing::debug!(
                 url = %job.url,
                 event = ?job.event,
+                endpoint = job.endpoint,
                 peers = resp.peers.len(),
                 new = added,
                 interval = resp.interval,
@@ -157,6 +178,7 @@ async fn announce_udp(
     ctx: &Rc<Ctx>,
     url: &Url,
     request: &AnnounceRequest,
+    v6: bool,
 ) -> Result<AnnounceResponse, String> {
     let addrs = ctx
         .dns
@@ -165,7 +187,7 @@ async fn announce_udp(
         .map_err(|e| format!("resolve {}: {e}", url.host))?;
     let to = addrs
         .into_iter()
-        .find(|a| ctx.udp.supports(a.ip()))
+        .find(|a| a.ip().is_ipv6() == v6 && ctx.udp.supports(a.ip()))
         .ok_or_else(|| format!("no usable address for {}", url.host))?;
     let shape = &ctx.cfg.profile.http;
     let numwant = if request.event == tracker::AnnounceEvent::Stopped {

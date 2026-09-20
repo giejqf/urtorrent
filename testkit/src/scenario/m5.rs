@@ -45,6 +45,12 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             run: capture_peer_allow_mse,
         },
         ScenarioDef {
+            name: "capture_tracker_dual",
+            shapes: &[Shape::Dual],
+            tags: &[Tag::Capture],
+            run: capture_tracker_dual,
+        },
+        ScenarioDef {
             name: "udp_tracker",
             shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It],
@@ -55,6 +61,30 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             shapes: &[Shape::V4],
             tags: &[Tag::It],
             run: http_scrape,
+        },
+        ScenarioDef {
+            name: "dual_stack_announce",
+            shapes: &[Shape::Dual],
+            tags: &[Tag::It, Tag::Diff],
+            run: dual_stack_announce,
+        },
+        ScenarioDef {
+            name: "tracker_failover",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It],
+            run: tracker_failover,
+        },
+        ScenarioDef {
+            name: "pt_tracker",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It],
+            run: pt_tracker,
+        },
+        ScenarioDef {
+            name: "oracle_utp_tcp_fallback",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It],
+            run: oracle_utp_tcp_fallback,
         },
         ScenarioDef {
             name: "encryption_matrix",
@@ -693,6 +723,15 @@ fn mse_shape(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
+fn query<'a>(e: &'a crate::tap::tracker::TapEvent, key: &str) -> Option<&'a str> {
+    e.http
+        .as_ref()?
+        .query
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
 fn tap_tracker_http(ctx: &Ctx) -> Result<TapTracker> {
     let http: Vec<SocketAddr> = ctx
         .host_addrs()
@@ -704,4 +743,459 @@ fn tap_tracker_http(ctx: &Ctx) -> Result<TapTracker> {
         interval: 30,
         ..Default::default()
     })
+}
+
+/// Dual-stack announce semantics: a tracker *hostname* resolving to both
+/// families. Does the oracle announce once per listen socket (v4 and v6)?
+fn capture_tracker_dual(ctx: &mut Ctx) -> Result<()> {
+    let http: Vec<SocketAddr> = ctx
+        .host_addrs()
+        .into_iter()
+        .map(|a| SocketAddr::new(a, 7070))
+        .collect();
+    let tracker = TapTracker::start(TapTrackerConfig {
+        http,
+        interval: 30,
+        min_interval: Some(10),
+        ..Default::default()
+    })?;
+    let url = format!("http://{}:7070/announce", ctx.lab.tracker_host());
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("dual.bin")
+            .with_size(1 << 20)
+            .with_piece_length(64 << 10)
+            .with_tracker(&url),
+    ));
+    let h = fx.info_hash_hex();
+    let seeder = ctx.oracle("seeder", OracleConfig::primary().lsd(false))?;
+    let mut leecher = ctx.oracle("leecher", OracleConfig::primary().lsd(false))?;
+    fx.write_data(&seeder.save_path)?;
+    seeder.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&seeder.save_path.to_string_lossy()),
+        &h,
+    )?;
+    seeder
+        .api
+        .wait_for(&h, Duration::from_secs(60), "seeder checked", |t| {
+            t.is_seeding()
+        })?;
+    ensure!(
+        tracker.wait_for(Duration::from_secs(30), |ev| ev
+            .iter()
+            .any(|e| e.kind == "announce")),
+        "seeder never announced to {url}"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    leecher.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&leecher.save_path.to_string_lossy()),
+        &h,
+    )?;
+    leecher
+        .api
+        .wait_for(&h, Duration::from_secs(120), "leecher complete", |t| {
+            t.is_complete()
+        })?;
+    std::thread::sleep(Duration::from_secs(3));
+    leecher.shutdown()?;
+    std::thread::sleep(Duration::from_secs(3));
+    let events = tracker.events();
+    for e in &events {
+        if let Some(hv) = &e.http {
+            ctx.note(format!(
+                "{} {} -> {} : {}",
+                e.ts_ms, e.from, e.to, hv.request_line
+            ));
+        }
+    }
+    let p = ctx.file("tap-tracker-dual.jsonl");
+    tracker.save_jsonl(&p)?;
+    ctx.artifact("tap-tracker-dual.jsonl", &p);
+    Ok(())
+}
+
+/// Dual-stack: a hostname tracker; we must announce once per listen socket
+/// (v4 and v6), each with its own started / completed / stopped, exactly as
+/// the oracle does (golden `capture_tracker_dual`).
+fn dual_stack_announce(ctx: &mut Ctx) -> Result<()> {
+    let http: Vec<SocketAddr> = ctx
+        .host_addrs()
+        .into_iter()
+        .map(|a| SocketAddr::new(a, 7070))
+        .collect();
+    let tracker = TapTracker::start(TapTrackerConfig {
+        http,
+        interval: 30,
+        min_interval: Some(10),
+        ..Default::default()
+    })?;
+    let url = format!("http://{}:7070/announce", ctx.lab.tracker_host());
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("dual.bin")
+            .with_size(1 << 20)
+            .with_piece_length(64 << 10)
+            .with_tracker(&url),
+    ));
+    let h = fx.info_hash_hex();
+    let seeder = ctx.oracle("seeder", OracleConfig::primary().lsd(false))?;
+    fx.write_data(&seeder.save_path)?;
+    seeder.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&seeder.save_path.to_string_lossy()),
+        &h,
+    )?;
+    seeder
+        .api
+        .wait_for(&h, Duration::from_secs(60), "seeder checked", |t| {
+            t.is_seeding()
+        })?;
+    ensure!(
+        tracker.wait_for(Duration::from_secs(30), |ev| ev
+            .iter()
+            .filter(|e| e.kind == "announce")
+            .count()
+            >= 2),
+        "seeder did not announce over both families"
+    );
+    let torrent_path = ctx.file("dual.torrent");
+    std::fs::write(&torrent_path, &fx.torrent)?;
+    let mut client = ctx.client(
+        "urt",
+        crate::client::ClientConfig::default().profile("qbt"),
+        &torrent_path,
+    )?;
+    let our_ips = client.actor.addrs();
+    client.wait_for(Duration::from_secs(120), "download", |s| s.complete)?;
+    fx.verify_data(&client.save_path)?
+        .map_err(|e| anyhow::anyhow!("data mismatch: {e}"))?;
+    ensure!(
+        tracker.wait_for(Duration::from_secs(20), |ev| ev
+            .iter()
+            .filter(|e| our_ips.contains(&e.from.ip()) && query(e, "event") == Some("completed"))
+            .count()
+            >= 2),
+        "completed not announced on both families"
+    );
+    client.shutdown()?;
+    ensure!(
+        tracker.wait_for(Duration::from_secs(20), |ev| ev
+            .iter()
+            .filter(|e| our_ips.contains(&e.from.ip()) && query(e, "event") == Some("stopped"))
+            .count()
+            >= 2),
+        "stopped not announced on both families"
+    );
+    let events = tracker.events();
+    for family_v6 in [false, true] {
+        let ours: Vec<Option<&str>> = events
+            .iter()
+            .filter(|e| our_ips.contains(&e.from.ip()) && e.from.ip().is_ipv6() == family_v6)
+            .map(|e| query(e, "event"))
+            .collect();
+        ctx.note(format!(
+            "our v{} announces: {ours:?}",
+            if family_v6 { 6 } else { 4 }
+        ));
+        ensure!(
+            ours == vec![Some("started"), Some("completed"), Some("stopped")],
+            "v{} sequence: {ours:?}",
+            if family_v6 { 6 } else { 4 }
+        );
+        // Same identity on both families, indistinguishable from the oracle's.
+        let oracle_ips: Vec<std::net::IpAddr> = seeder
+            .actor
+            .addrs()
+            .into_iter()
+            .filter(|a| a.is_ipv6() == family_v6)
+            .collect();
+        let ours_ips: Vec<std::net::IpAddr> = our_ips
+            .iter()
+            .copied()
+            .filter(|a| a.is_ipv6() == family_v6)
+            .collect();
+        let d = crate::discriminator::diff(
+            &Fingerprint {
+                tracker: crate::discriminator::tracker_fingerprint(&events, &oracle_ips),
+                ..Default::default()
+            },
+            &Fingerprint {
+                tracker: crate::discriminator::tracker_fingerprint(&events, &ours_ips),
+                ..Default::default()
+            },
+        );
+        ensure!(
+            d.is_empty(),
+            "tells on v{}: {d:?}",
+            if family_v6 { 6 } else { 4 }
+        );
+    }
+    // The same peer id and key on both families (one torrent).
+    let ids: std::collections::HashSet<&str> = events
+        .iter()
+        .filter(|e| our_ips.contains(&e.from.ip()))
+        .filter_map(|e| query(e, "peer_id"))
+        .collect();
+    ensure!(ids.len() == 1, "peer id differs across families: {ids:?}");
+    let p = ctx.file("tap-tracker-dual.jsonl");
+    tracker.save_jsonl(&p)?;
+    ctx.artifact("tap-tracker-dual.jsonl", &p);
+    Ok(())
+}
+
+/// Tier failover and backoff: tier 0 is down, tier 1 works. We must announce
+/// to tier 1, keep retrying tier 0 with growing gaps, and finish.
+fn tracker_failover(ctx: &mut Ctx) -> Result<()> {
+    let down = TapTracker::start(TapTrackerConfig {
+        http: ctx
+            .host_addrs()
+            .into_iter()
+            .map(|a| SocketAddr::new(a, 7071))
+            .collect(),
+        behaviour: crate::tap::tracker::Behaviour::HttpStatus(503),
+        interval: 30,
+        ..Default::default()
+    })?;
+    let up = TapTracker::start(TapTrackerConfig {
+        http: ctx
+            .host_addrs()
+            .into_iter()
+            .map(|a| SocketAddr::new(a, 7072))
+            .collect(),
+        interval: 30,
+        ..Default::default()
+    })?;
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("failover.bin")
+            .with_size(1 << 20)
+            .with_piece_length(64 << 10)
+            .with_trackers(vec![vec![down.http_url(0)], vec![up.http_url(0)]]),
+    ));
+    let h = fx.info_hash_hex();
+    let seeder = ctx.oracle("seeder", OracleConfig::primary().lsd(false))?;
+    fx.write_data(&seeder.save_path)?;
+    seeder.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&seeder.save_path.to_string_lossy()),
+        &h,
+    )?;
+    seeder
+        .api
+        .wait_for(&h, Duration::from_secs(60), "seeder checked", |t| {
+            t.is_seeding()
+        })?;
+    ensure!(
+        up.wait_for(Duration::from_secs(30), |ev| ev
+            .iter()
+            .any(|e| e.kind == "announce")),
+        "seeder never reached the working tier"
+    );
+    let torrent_path = ctx.file("failover.torrent");
+    std::fs::write(&torrent_path, &fx.torrent)?;
+    let mut client = ctx.client(
+        "urt",
+        crate::client::ClientConfig::default().profile("qbt"),
+        &torrent_path,
+    )?;
+    let our_ips = client.actor.addrs();
+    let st = client.wait_for(Duration::from_secs(120), "download via tier 1", |s| {
+        s.complete
+    })?;
+    fx.verify_data(&client.save_path)?
+        .map_err(|e| anyhow::anyhow!("data mismatch: {e}"))?;
+    let tr: Vec<String> = st
+        .trackers
+        .iter()
+        .map(|t| {
+            format!(
+                "{} working={} fails={} err={:?}",
+                t.url, t.working, t.fails, t.last_error
+            )
+        })
+        .collect();
+    ctx.note(format!("tracker status: {tr:?}"));
+    ensure!(st.trackers.len() == 2);
+    ensure!(
+        !st.trackers[0].working && st.trackers[0].fails >= 1,
+        "tier 0 not failed: {tr:?}"
+    );
+    ensure!(st.trackers[1].working, "tier 1 not working: {tr:?}");
+    // Watch the retries against the down tracker: 5+12=17 s then 5+50=55 s.
+    std::thread::sleep(Duration::from_secs(75));
+    let attempts: Vec<u64> = down
+        .events()
+        .iter()
+        .filter(|e| our_ips.contains(&e.from.ip()))
+        .map(|e| e.ts_ms)
+        .collect();
+    ctx.note(format!("attempts at tier 0 (ms): {attempts:?}"));
+    ensure!(
+        attempts.len() >= 3,
+        "expected retries with backoff, saw {attempts:?}"
+    );
+    let gap1 = attempts[1] - attempts[0];
+    let gap2 = attempts[2] - attempts[1];
+    ensure!(
+        (14_000..=22_000).contains(&gap1) && (50_000..=62_000).contains(&gap2),
+        "backoff gaps {gap1} ms / {gap2} ms (expected ~17 s / ~55 s)"
+    );
+    // Recovery: tier 0 comes back and gets our next retry as `started`.
+    down.set_behaviour(crate::tap::tracker::Behaviour::Normal);
+    client.shutdown()?;
+    let up_events = up.events();
+    let seq: Vec<Option<&str>> = up_events
+        .iter()
+        .filter(|e| our_ips.contains(&e.from.ip()))
+        .map(|e| query(e, "event"))
+        .collect();
+    ctx.note(format!("tier 1 sequence: {seq:?}"));
+    ensure!(
+        seq.first() == Some(&Some("started")) && seq.last() == Some(&Some("stopped")),
+        "tier 1 sequence: {seq:?}"
+    );
+    // The down tracker never got `started` (every attempt failed), so no
+    // `stopped` goes there either.
+    ensure!(
+        !down
+            .events()
+            .iter()
+            .any(|e| our_ips.contains(&e.from.ip()) && query(e, "event") == Some("stopped")),
+        "stopped sent to a tracker that never accepted started"
+    );
+    Ok(())
+}
+
+/// A private-tracker-style tracker: passkey in the URL, a client whitelist
+/// with the oracle's identity, a private torrent. The qbt profile is
+/// accepted and downloads; the native profile is refused (the whitelist has
+/// teeth).
+fn pt_tracker(ctx: &mut Ctx) -> Result<()> {
+    let http: Vec<SocketAddr> = ctx
+        .host_addrs()
+        .into_iter()
+        .map(|a| SocketAddr::new(a, 7070))
+        .collect();
+    let tracker = TapTracker::start(TapTrackerConfig {
+        http,
+        interval: 30,
+        passkey: Some("s3cretpasskey0123456789abcdef".into()),
+        peer_id_whitelist: Some(vec!["-qB5230-".into()]),
+        ..Default::default()
+    })?;
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("pt.bin")
+            .with_size(1 << 20)
+            .with_piece_length(64 << 10)
+            .private(true)
+            .with_tracker(&tracker.http_url(0)),
+    ));
+    let h = fx.info_hash_hex();
+    let seeder = ctx.oracle("seeder", OracleConfig::primary())?;
+    fx.write_data(&seeder.save_path)?;
+    seeder.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&seeder.save_path.to_string_lossy()),
+        &h,
+    )?;
+    seeder
+        .api
+        .wait_for(&h, Duration::from_secs(60), "seeder checked", |t| {
+            t.is_seeding()
+        })?;
+    ensure!(
+        tracker.wait_for(Duration::from_secs(30), |ev| ev
+            .iter()
+            .any(|e| e.kind == "announce")),
+        "seeder never announced"
+    );
+    let torrent_path = ctx.file("pt.torrent");
+    std::fs::write(&torrent_path, &fx.torrent)?;
+    // native first: refused.
+    let mut native = ctx.client(
+        "urt-native",
+        crate::client::ClientConfig::default().profile("native"),
+        &torrent_path,
+    )?;
+    let st = native.wait_for(Duration::from_secs(30), "native tracker error", |s| {
+        s.trackers.iter().any(|t| t.last_error.is_some())
+    })?;
+    ctx.note(format!(
+        "native profile: {:?}",
+        st.trackers
+            .iter()
+            .map(|t| t.last_error.clone())
+            .collect::<Vec<_>>()
+    ));
+    ensure!(
+        !st.complete && st.peers == 0,
+        "native profile got through a PT whitelist"
+    );
+    native.shutdown()?;
+    // qbt: accepted, downloads.
+    let mut client = ctx.client(
+        "urt",
+        crate::client::ClientConfig::default().profile("qbt"),
+        &torrent_path,
+    )?;
+    let st = client.wait_for(Duration::from_secs(120), "download via PT tracker", |s| {
+        s.complete
+    })?;
+    fx.verify_data(&client.save_path)?
+        .map_err(|e| anyhow::anyhow!("data mismatch: {e}"))?;
+    ensure!(
+        st.trackers.iter().all(|t| t.working),
+        "tracker not working: {:?}",
+        st.trackers
+    );
+    client.shutdown()?;
+    let p = ctx.file("tap-tracker-pt.jsonl");
+    tracker.save_jsonl(&p)?;
+    ctx.artifact("tap-tracker-pt.jsonl", &p);
+    Ok(())
+}
+
+/// The oracle with uTP enabled (its default) leeches from us: it may try uTP
+/// first, but must end up transferring over TCP.
+fn oracle_utp_tcp_fallback(ctx: &mut Ctx) -> Result<()> {
+    let tracker = tap_tracker_http(ctx)?;
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("utp.bin")
+            .with_size(2 << 20)
+            .with_piece_length(64 << 10)
+            .with_tracker(&tracker.http_url(0)),
+    ));
+    let h = fx.info_hash_hex();
+    let torrent_path = ctx.file("utp.torrent");
+    std::fs::write(&torrent_path, &fx.torrent)?;
+    let actor = ctx.actor("urt")?;
+    fx.write_data(&actor.log_dir.join("data"))?;
+    let mut client = crate::client::UrtClient::launch(
+        &actor,
+        crate::client::ClientConfig::default().profile("qbt"),
+        &torrent_path,
+    )?;
+    client.wait_for(Duration::from_secs(60), "seeding", |s| s.complete)?;
+    let leecher = ctx.oracle(
+        "leecher",
+        OracleConfig::primary()
+            .protocol(crate::oracle::BtProtocol::Both)
+            .lsd(false),
+    )?;
+    leecher.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&leecher.save_path.to_string_lossy()),
+        &h,
+    )?;
+    leecher.api.wait_for(
+        &h,
+        Duration::from_secs(120),
+        "oracle (uTP enabled) to complete",
+        |t| t.is_complete(),
+    )?;
+    fx.verify_data(&leecher.save_path)?
+        .map_err(|e| anyhow::anyhow!("oracle data mismatch: {e}"))?;
+    let peers = leecher.api.peers(&h)?;
+    ctx.note(format!(
+        "oracle's view of us: {:?}",
+        peers
+            .iter()
+            .map(|p| format!("{}:{} {} conn={}", p.ip, p.port, p.client, p.connection))
+            .collect::<Vec<_>>()
+    ));
+    client.shutdown()?;
+    Ok(())
 }

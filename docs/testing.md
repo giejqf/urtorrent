@@ -35,6 +35,16 @@ while a `FORWARD ... -j DROP` rule keeps the lab offline; and Ubuntu's
 AppArmor profile confines it to `/var/lib/transmission-daemon`, so a local
 override for `testkit/runs` is needed (`cargo xtask doctor` prints it).
 
+Each lab also gets an `/etc/hosts` name, `tracker.urt<id>.lab`, resolving to
+the harness's IPv4 and IPv6 bridge addresses, so dual-stack announce
+behaviour can be observed against a hostname (`lab clean` removes stale
+entries).
+
+The tap-peer speaks MSE (using the library's `mse` crate: interop with the
+oracle validates it, since a symmetric mistake cannot complete a handshake
+with libtorrent) and records the peer's `crypto_provide` / `select` and pad
+lengths (`PeerCapture::mse`).
+
 Run artifacts land in `testkit/runs/<stamp>-<scenario>-<shape>/` (gitignored):
 actor stdout/stderr, oracle profiles and logs, tap logs (`*.jsonl`), pcaps.
 Pass `--keep` to leave the namespaces up after a run; `testkit lab clean`

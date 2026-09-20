@@ -101,3 +101,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     same taps: no tells for the qbt profile, tells for the other two.
   - `capture_keys` scenario (40 torrents) and its golden.
   - NOTICE entries for logic confirmed against libtorrent.
+- M5 reach (PT-complete):
+  - UDP tracker (BEP 15) as captured from the oracle (Q10): connect / announce
+    / scrape, BEP 41 URL data, 60 s connection-id cache, one attempt per
+    request; the listen port's UDP sockets with a demultiplexer in the engine.
+  - Scrape (BEP 48) over HTTP and UDP: `Session::scrape`, `ScrapeReply`.
+  - MSE: the `mse` crate (DH, RC4, initiator/responder state machines with
+    libtorrent's shape), `EncryptionMode` (disabled / enabled / forced),
+    plaintext-then-MSE retry (Q3), incoming detection, `prefer_rc4` from
+    capture; `PeerInfo::encrypted`.
+  - Dual-stack: one announce state per listen socket (Q9), announces routed
+    per family, IP-literal endpoint mismatch disabled silently; lab hostname
+    `tracker.urt<id>.lab` via `/etc/hosts`.
+  - testkit: MSE in the tap-peer; captures capture_tracker_udp,
+    capture_scrape, capture_peer_forced, capture_peer_allow_mse,
+    capture_tracker_dual; scenarios udp_tracker (v4/v6/dual), http_scrape,
+    encryption_matrix, mse_shape (Diff), dual_stack_announce (dual, Diff),
+    tracker_failover, pt_tracker, oracle_utp_tcp_fallback; UDP and MSE sides
+    of the discriminator.
+  - Fuzz: mse_responder, udp_reply, scrape_response.

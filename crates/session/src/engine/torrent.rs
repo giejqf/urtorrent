@@ -371,7 +371,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
     let mut picker = Picker::new(info.piece_count(), info.piece_length, info.total_length);
     picker.set_sequential(params.sequential);
     let now = Instant::now();
-    let announcer = Announcer::new(meta.tiers());
+    let announcer = Announcer::new(meta.tiers(), ctx.families.endpoints().len());
     let torrent = Rc::new(RefCell::new(Torrent {
         id,
         info: info.clone(),

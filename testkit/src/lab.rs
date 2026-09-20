@@ -133,6 +133,7 @@ impl Lab {
             keep: false,
             run_dir: run_dir.to_path_buf(),
         };
+        hosts_entry(&lab.tracker_host(), Some((lab.host_v4(), lab.host_v6())));
         let res = (|| -> Result<()> {
             ip(&["link", "set", &bridge, "up"])?;
             ip(&[
@@ -195,6 +196,13 @@ impl Lab {
     pub fn host_v6(&self) -> Ipv6Addr {
         Ipv6Addr::new(0xfd77, u16::from(self.id), 0, 0, 0, 0, 0, 1)
     }
+    /// A hostname resolving to the harness's v4 *and* v6 bridge addresses
+    /// (an `/etc/hosts` entry added for this lab), so dual-stack announce
+    /// behaviour can be observed.
+    pub fn tracker_host(&self) -> String {
+        format!("tracker.{}.lab", self.bridge)
+    }
+
     pub fn host_addr(&self, shape: Shape) -> IpAddr {
         if shape.has_v4() {
             IpAddr::V4(self.host_v4())
@@ -356,7 +364,34 @@ impl Drop for Lab {
             let _ = ip(&["netns", "del", ns]);
         }
         firewall_allow(&self.bridge, false);
+        hosts_entry(&self.tracker_host(), None);
         let _ = ip(&["link", "del", &self.bridge]);
+    }
+}
+
+/// Add (`Some(addrs)`) or remove (`None`) the `/etc/hosts` lines for `name`.
+/// Best effort: a host where this is not permitted simply has no dual-stack
+/// tracker name.
+fn hosts_entry(name: &str, addrs: Option<(Ipv4Addr, Ipv6Addr)>) {
+    // Always strip stale lines first (crashed runs).
+    let mut strip = sudo();
+    strip.args([
+        "sed",
+        "-i",
+        &format!("/[[:space:]]{}$/d", name.replace('.', "\\.")),
+        "/etc/hosts",
+    ]);
+    let _ = run(&mut strip);
+    if let Some((v4, v6)) = addrs {
+        let mut add = sudo();
+        add.args([
+            "sh",
+            "-c",
+            &format!("printf '%s\\t%s\\n%s\\t%s\\n' '{v4}' '{name}' '{v6}' '{name}' >> /etc/hosts"),
+        ]);
+        if let Err(e) = run(&mut add) {
+            tracing::debug!("hosts entry for {name}: {e}");
+        }
     }
 }
 
@@ -412,6 +447,17 @@ pub fn clean_all() -> Result<Vec<String>> {
             let _ = ip(&["link", "del", name]);
             removed.push(name.to_string());
         }
+    }
+    // Stale hosts entries from crashed runs.
+    let mut strip = sudo();
+    strip.args([
+        "sed",
+        "-i",
+        "/[[:space:]]tracker\\.urt[0-9]*\\.lab$/d",
+        "/etc/hosts",
+    ]);
+    if run(&mut strip).is_ok() {
+        removed.push("hosts entries".into());
     }
     // Stale firewall rules from crashed runs.
     for tool in ["iptables", "ip6tables"] {
