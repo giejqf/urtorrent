@@ -440,11 +440,12 @@ fn qbt_magnet_mode_matches_capture() {
     conn.receive(&tap_hs.encode()).unwrap();
     let out = conn.take_outbound();
     let mut f = wire::Framer::new();
-    f.push(&out).unwrap();
     let mut msgs = Vec::new();
-    while let Some(body) = f.next_frame().unwrap() {
-        msgs.push(Message::decode(body).unwrap());
-    }
+    f.feed(&out, |body| {
+        msgs.push(Message::decode(body.body())?);
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
         msgs.len(),
         1,

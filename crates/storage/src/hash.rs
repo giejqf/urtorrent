@@ -51,7 +51,7 @@ enum Outcome {
     /// Whole-buffer digest and the buffer back.
     Digest([u8; 20], Vec<u8>),
     /// Advanced state, the chunks back, and the digest when finalised.
-    Update(HashState, Vec<Vec<u8>>, Option<[u8; 20]>),
+    Update(HashState, Vec<(Vec<u8>, usize)>, Option<[u8; 20]>),
 }
 
 /// `(job id, outcome)` returned from a worker.
@@ -75,7 +75,8 @@ enum Work {
     Digest(Vec<u8>),
     Update {
         state: HashState,
-        chunks: Vec<Vec<u8>>,
+        /// `(buffer, start)`: the bytes to hash are `buffer[start..]`.
+        chunks: Vec<(Vec<u8>, usize)>,
         finish: bool,
     },
 }
@@ -97,8 +98,8 @@ fn run_work(work: Work) -> Outcome {
             chunks,
             finish,
         } => {
-            for c in &chunks {
-                state.0.update(c);
+            for (c, start) in &chunks {
+                state.0.update(&c[(*start).min(c.len())..]);
             }
             let digest = finish.then(|| state.0.clone().finalize().into());
             Outcome::Update(state, chunks, digest)
@@ -254,7 +255,7 @@ impl HashPool {
                     Ok((_, Outcome::Digest(digest, buf))) => return (digest, buf),
                     Ok((_, Outcome::Update(_, mut chunks, digest))) => {
                         // Not what was asked; cannot happen, but stay truthful.
-                        let buf = chunks.pop().unwrap_or_default();
+                        let buf = chunks.pop().unwrap_or_default().0;
                         return (digest.unwrap_or_else(|| sha1(&buf)), buf);
                     }
                     Err(_) => {
@@ -267,7 +268,7 @@ impl HashPool {
                 // Pool gone (shutting down): take the buffer back.
                 Err(std::sync::mpsc::SendError(job)) => match job.work {
                     Work::Digest(d) => d,
-                    Work::Update { mut chunks, .. } => chunks.pop().unwrap_or_default(),
+                    Work::Update { mut chunks, .. } => chunks.pop().unwrap_or_default().0,
                 },
             },
             None => data,
@@ -340,7 +341,7 @@ impl HashPool {
     pub fn update_async(
         &self,
         state: HashState,
-        chunks: Vec<Vec<u8>>,
+        chunks: Vec<(Vec<u8>, usize)>,
         finish: bool,
     ) -> UpdateFuture {
         let slot = self.submit(Work::Update {
@@ -396,7 +397,7 @@ impl Future for VerifyFuture {
             Some(Outcome::Digest(digest, data)) => Poll::Ready((digest == self.expected, data)),
             Some(Outcome::Update(_, mut chunks, digest)) => {
                 // Not expected for this future; stay truthful anyway.
-                let data = chunks.pop().unwrap_or_default();
+                let data = chunks.pop().unwrap_or_default().0;
                 Poll::Ready((digest == Some(self.expected), data))
             }
             None => {
@@ -413,7 +414,7 @@ pub struct UpdateFuture {
 }
 
 impl Future for UpdateFuture {
-    type Output = (HashState, Vec<Vec<u8>>, Option<[u8; 20]>);
+    type Output = (HashState, Vec<(Vec<u8>, usize)>, Option<[u8; 20]>);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut s = self.slot.borrow_mut();
@@ -421,7 +422,7 @@ impl Future for UpdateFuture {
             Some(Outcome::Update(state, chunks, digest)) => Poll::Ready((state, chunks, digest)),
             Some(Outcome::Digest(digest, data)) => {
                 // Not expected for this future.
-                Poll::Ready((HashState::new(), vec![data], Some(digest)))
+                Poll::Ready((HashState::new(), vec![(data, 0)], Some(digest)))
             }
             None => {
                 s.waker = Some(cx.waker().clone());

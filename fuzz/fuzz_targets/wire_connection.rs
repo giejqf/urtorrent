@@ -52,7 +52,15 @@ fuzz_target!(|data: &[u8]| {
         begin: 0,
         length: 16384,
     });
-    for chunk in rest.chunks(7) {
+    // Chunk size varies so frames arrive whole (parsed in place), cut across
+    // chunks (assembled by the framer) and byte by byte.
+    let chunk_len = match flags >> 4 {
+        0..=3 => 1,
+        4..=7 => 7,
+        8..=11 => 64,
+        _ => rest.len().max(1),
+    };
+    for chunk in rest.chunks(chunk_len) {
         match conn.receive(chunk) {
             Ok(_) => {}
             Err(_) => break,

@@ -157,6 +157,11 @@ pub struct Torrent {
     failed: HashMap<SocketAddr, Instant>,
     /// Addresses with a connect in progress.
     pub connecting: HashSet<SocketAddr>,
+    /// Our peer id on every outgoing connection in progress or established
+    /// (libtorrent `m_outgoing_pids`): an incoming handshake carrying one of
+    /// them is ourselves, however we learned our own address (a tracker
+    /// handing back the other family's listen address, for one).
+    pub outgoing_pids: HashSet<[u8; 20]>,
     /// Addresses whose next outgoing attempt uses MSE (Q3 toggle).
     pub mse_retry: HashSet<SocketAddr>,
     pub half_open: usize,
@@ -188,6 +193,14 @@ impl Torrent {
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Payload bytes the live connections copied in user space.
+    pub fn copied_bytes(&self) -> u64 {
+        self.peers
+            .values()
+            .map(|p| p.conn.borrow().copied_in())
+            .sum()
     }
 
     /// Whether the metadata is known.
@@ -420,6 +433,10 @@ impl Torrent {
         }
         let mut added = 0;
         for &p in peers {
+            // Normalise on ingress (AGENTS.md 5.5): a v4-mapped v6 address
+            // (`::ffff:a.b.c.d`, as some trackers put in `peers6` and some
+            // clients in PEX `added6`) is the IPv4 peer it names.
+            let p = canonical_addr(p);
             if !usable_peer_addr(ctx, p) || self.banned.contains(&p.ip()) {
                 continue;
             }
@@ -501,6 +518,13 @@ impl Torrent {
         }
     }
 
+    /// Drop `addr` from the candidates (an address that turned out to be
+    /// ours; `Ctx::note_own_ip` keeps it out of every torrent from now on).
+    pub fn forget_candidate(&mut self, addr: SocketAddr) {
+        self.known.remove(&addr);
+        self.candidates.retain(|a| *a != addr);
+    }
+
     /// Everyone must know when we gain a piece; once complete, connections to
     /// other seeds are pointless on both sides and are closed.
     fn broadcast_have(&self, piece: u32) {
@@ -540,6 +564,22 @@ impl Torrent {
 
 /// Peer address filtering (AGENTS.md 5.5): drop unspecified, multicast,
 /// link-local, port 0, and our own listen endpoint.
+/// A v4-mapped v6 socket address as the IPv4 address it names; anything
+/// else unchanged.
+pub fn canonical_addr(a: SocketAddr) -> SocketAddr {
+    match a.ip() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), a.port()),
+            None => a,
+        },
+        IpAddr::V4(_) => a,
+    }
+}
+
+/// Whether a peer address is worth dialling: not a placeholder, not one we
+/// could not reach (no listen socket of that family, so no route and no
+/// source address to dial from), not ourselves. Callers canonicalise
+/// first; a v4-mapped address that slipped through is refused.
 fn usable_peer_addr(ctx: &Ctx, a: SocketAddr) -> bool {
     if a.port() == 0 {
         return false;
@@ -556,13 +596,13 @@ fn usable_peer_addr(ctx: &Ctx, a: SocketAddr) -> bool {
                 || v6.to_ipv4_mapped().is_some()
         }
     };
-    if bad {
+    if bad || !ctx.families.allows(ip) {
         return false;
     }
     let own = match ip {
         IpAddr::V4(v4) => ctx.cfg.listen_v4 == Some(v4) && !v4.is_unspecified(),
         IpAddr::V6(v6) => ctx.cfg.listen_v6 == Some(v6) && !v6.is_unspecified(),
-    };
+    } || ctx.is_own_ip(ip);
     !(own && a.port() == ctx.listen_port)
 }
 
@@ -661,6 +701,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         sources: HashMap::new(),
         failed: HashMap::new(),
         connecting: HashSet::new(),
+        outgoing_pids: HashSet::new(),
         mse_retry: HashSet::new(),
         half_open: 0,
         closing: Flag::new(),
@@ -1438,7 +1479,7 @@ pub async fn on_block(
     torrent: &Rc<RefCell<Torrent>>,
     peer: &Rc<PeerHandle>,
     request: Request,
-    data: Vec<u8>,
+    data: wire::Block,
 ) -> Option<PendingWrite> {
     peer.downloaded
         .set(peer.downloaded.get() + u64::from(request.length));
@@ -1455,7 +1496,7 @@ pub async fn on_block_from(
     key: u32,
     ip: Option<IpAddr>,
     request: Request,
-    data: Vec<u8>,
+    data: wire::Block,
 ) -> Option<PendingWrite> {
     let block = picker::Block {
         piece: request.index,
@@ -1491,7 +1532,11 @@ pub async fn on_block_from(
     // Queued on the disk thread now; a verify submitted after it is ordered
     // behind it (the disk thread's barrier), whenever the write is awaited.
     torrent.borrow_mut().writes_in_flight += 1;
-    let write = storage.write_block(request.index as usize, request.begin, data);
+    // The block stays in the buffer it arrived in (a whole peer-wire frame
+    // when it fit in one receive chunk): the disk thread writes and hashes
+    // the range in place.
+    let (buf, start) = data.into_parts();
+    let write = storage.write_block_from(request.index as usize, request.begin, buf, start);
     if piece_complete {
         let already = !torrent.borrow_mut().verifying.insert(request.index);
         if !already {
@@ -1813,4 +1858,48 @@ fn split_host_port(s: &str) -> Option<(String, u16)> {
         return None;
     }
     Some((host.to_string(), port.parse().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_port_split_handles_both_literals_and_names() {
+        assert_eq!(
+            split_host_port("[fd77::1]:6881"),
+            Some(("fd77::1".to_string(), 6881))
+        );
+        assert_eq!(
+            split_host_port("10.1.2.3:51413"),
+            Some(("10.1.2.3".to_string(), 51413))
+        );
+        assert_eq!(
+            split_host_port("seed.example:1"),
+            Some(("seed.example".to_string(), 1))
+        );
+        // A bare IPv6 literal is ambiguous without brackets; no port at all;
+        // a port out of range.
+        assert_eq!(split_host_port("fd77::1:6881"), None);
+        assert_eq!(split_host_port("seed.example"), None);
+        assert_eq!(split_host_port("[fd77::1]:70000"), None);
+        assert_eq!(split_host_port(":6881"), None);
+    }
+
+    #[test]
+    fn v4_mapped_addresses_become_ipv4() {
+        let mapped: SocketAddr = "[::ffff:10.1.2.3]:6881".parse().unwrap();
+        assert_eq!(
+            canonical_addr(mapped),
+            "10.1.2.3:6881".parse::<SocketAddr>().unwrap()
+        );
+        for a in ["[fd77::1]:6881", "[::1]:1", "10.0.0.1:2"] {
+            let a: SocketAddr = a.parse().unwrap();
+            assert_eq!(canonical_addr(a), a);
+        }
+        // `::ffff:0:0/96` only: the deprecated v4-compatible form is left
+        // alone (it names nothing routable and is dropped later anyway).
+        let compat: SocketAddr = "[::10.1.2.3]:6881".parse().unwrap();
+        assert_eq!(canonical_addr(compat), compat);
+    }
 }

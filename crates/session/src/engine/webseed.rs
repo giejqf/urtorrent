@@ -296,7 +296,9 @@ async fn run_inner(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, url: &str, key
             };
             match data {
                 Some(d) => {
-                    if let Some(w) = torrent::on_block_from(ctx, torrent, key, None, r, d).await {
+                    if let Some(w) =
+                        torrent::on_block_from(ctx, torrent, key, None, r, d.into()).await
+                    {
                         w.finish(ctx, torrent).await;
                     }
                     delivered += 1;

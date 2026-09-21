@@ -46,6 +46,8 @@ pub struct Manager {
     /// Sockets touched this receive round (readable/writable wakeups happen
     /// once the round is drained, like libtorrent's `socket_drained`).
     touched: Vec<Key>,
+    /// `copied_bytes` of the sockets already removed from the table.
+    retired_copied: u64,
     /// Whether SYNs are accepted.
     incoming_enabled: bool,
     /// SYN flood guard: no new connections beyond this many sockets.
@@ -66,6 +68,7 @@ impl Manager {
             last: None,
             deferred_ack: None,
             touched: Vec::new(),
+            retired_copied: 0,
             incoming_enabled,
             max_sockets,
             restrict_mtu: [u16::MAX; 3],
@@ -82,6 +85,19 @@ impl Manager {
     /// Whether there are no connections.
     pub fn is_empty(&self) -> bool {
         self.sockets.is_empty()
+    }
+
+    /// Payload bytes copied in user space by every socket this table ever
+    /// held (see [`Stats::copied_bytes`]).
+    ///
+    /// [`Stats::copied_bytes`]: crate::Stats::copied_bytes
+    pub fn copied_bytes(&self) -> u64 {
+        self.retired_copied
+            + self
+                .sockets
+                .values()
+                .map(|s| s.stats().copied_bytes)
+                .sum::<u64>()
     }
 
     /// The connection for `key`.
@@ -252,9 +268,11 @@ impl Manager {
     pub fn tick(&mut self, now: Instant) -> Vec<Key> {
         let mut removed = Vec::new();
         let mut hints = Vec::new();
+        let retired = &mut self.retired_copied;
         self.sockets.retain(|k, s| {
             if s.should_delete() {
                 removed.push(*k);
+                *retired += s.stats().copied_bytes;
                 return false;
             }
             s.tick(now);

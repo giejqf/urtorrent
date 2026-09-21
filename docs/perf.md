@@ -132,3 +132,27 @@ one burst reordered packets and overflowed the receiver's socket buffer,
 which the oracle answered with selective acks and retransmits. Zero-copy
 sends and larger batches are the obvious next steps if uTP throughput
 ever matters. `xtask syscalls` covers both transports.
+
+### Copy budgets (2026-09-21, 0.6.0)
+
+Every user-space copy of payload on the data path is counted
+(`SessionStats::copied_bytes`) and the budgets below are gated by
+`crates/session/tests/copies.rs`, which transfers a multi-file torrent whose
+files are mostly smaller than a block (so blocks straddle files) with and
+without rate limits:
+
+| Path | Copies per payload byte | Where |
+|---|---|---|
+| TCP download | **1** (measured 1.000) | the block leaves the receive ring: a frame that lies within one received chunk is parsed in place and its payload copied once into the block buffer the disk thread writes and hashes from; a frame cut by a chunk boundary is assembled once by the framer (`wire::Frame::Owned`) and that buffer *is* the block (`wire::Block` keeps the payload offset, `Storage::write_block_from` writes and hashes the range) |
+| TCP upload | **0** (measured 68 bytes total) | block buffers read from disk are sent as separate chunks of one vectored `sendmsg` |
+| uTP download | **2** (measured 2.007) | datagram payload into the reorder / receive queue, then the framer (every block is cut by a packet boundary) |
+| uTP upload | **2** (measured 2.018) | write queue into a packet, which stays in the send window for retransmission, and the packet into the outgoing queue; a retransmission costs one more |
+| blocks straddling files | **0 extra** | each slice is written from its range of the same buffer |
+| rate-limited TCP | **0 extra** | a grant sends a slice of the chunk batch |
+| rate-limited uTP upload | +1 for the cut chunks | `UtpStream::send_range` copies the part of a chunk a grant cuts; whole batches are moved into the write queue |
+
+Before this pass the TCP download path cost two copies per byte (the framer
+assembled every frame, then the message decoder copied the payload out of
+it). The receive ring buffers themselves are never held past the receive
+cycle: a block is copied out precisely so the kernel gets its buffer back
+while the disk write is in flight.

@@ -10,7 +10,7 @@
 //!
 //! Timestamps use `CLOCK_MONOTONIC` in microseconds, as libtorrent's do.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -71,6 +71,9 @@ pub struct UtpHost {
     udp: Rc<UdpDemux>,
     rng: Rc<super::rng::Rng>,
     me: Weak<UtpHost>,
+    /// Payload bytes copied by the glue itself (partial sends under a rate
+    /// limit, partial handshake reads); the sockets count their own.
+    copied: Cell<u64>,
 }
 
 impl UtpHost {
@@ -89,12 +92,19 @@ impl UtpHost {
             udp,
             rng,
             me: me.clone(),
+            copied: Cell::new(0),
         })
     }
 
     /// Live connections.
     pub fn connections(&self) -> usize {
         self.mgr.borrow().len()
+    }
+
+    /// Payload bytes copied in user space on the uTP data path (see
+    /// [`utp::Stats::copied_bytes`]).
+    pub fn copied_bytes(&self) -> u64 {
+        self.copied.get() + self.mgr.borrow().copied_bytes()
     }
 
     /// A datagram from the UDP demultiplexer. Returns the key of a
@@ -327,10 +337,14 @@ impl UtpStream {
         };
         let n = chunk.len().min(buf.len());
         buf.as_mut_slice()[..n].copy_from_slice(&chunk[..n]);
+        self.host.copied.set(self.host.copied.get() + n as u64);
         // Like the ring's `recv`: the buffer is sized to what arrived.
         buf.truncate(n);
         if n < chunk.len() {
             // Put the rest back in front for the next read.
+            self.host
+                .copied
+                .set(self.host.copied.get() + (chunk.len() - n) as u64);
             self.with_socket(|s| s.unread(chunk[n..].to_vec()));
         }
         (Ok(n as u32), buf)
@@ -368,7 +382,8 @@ impl UtpStream {
         Ok(())
     }
 
-    /// Send bytes `[start, start + len)` of the concatenated `chunks`.
+    /// Send bytes `[start, start + len)` of the concatenated `chunks`,
+    /// copying the parts of chunks the range cuts (a rate-limited send).
     pub async fn send_range(
         &self,
         chunks: &[Buffer],
@@ -387,9 +402,18 @@ impl UtpStream {
                 continue;
             }
             let take = (s.len() - skip).min(left);
+            self.host.copied.set(self.host.copied.get() + take as u64);
             self.send_all(s[skip..skip + take].to_vec()).await?;
             left -= take;
             skip = 0;
+        }
+        Ok(())
+    }
+
+    /// Send whole `chunks`, moving each into the write queue (no copy).
+    pub async fn send_chunks(&self, chunks: Vec<Buffer>) -> uring::Result<()> {
+        for c in chunks {
+            self.send_all(c.into_vec()).await?;
         }
         Ok(())
     }

@@ -58,7 +58,7 @@ pub fn scenarios() -> Vec<ScenarioDef> {
         },
         ScenarioDef {
             name: "http_scrape",
-            shapes: &[Shape::V4],
+            shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It],
             run: http_scrape,
         },
@@ -70,7 +70,7 @@ pub fn scenarios() -> Vec<ScenarioDef> {
         },
         ScenarioDef {
             name: "tracker_failover",
-            shapes: &[Shape::V4],
+            shapes: &[Shape::V4, Shape::V6],
             tags: &[Tag::It],
             run: tracker_failover,
         },
@@ -320,7 +320,18 @@ fn udp_tracker(ctx: &mut Ctx) -> Result<()> {
     let st = client.wait_for(Duration::from_secs(120), "download via udp tracker", |s| {
         s.complete
     })?;
-    ensure!(st.downloaded == fx.total_len);
+    // In the dual shape the oracle is dialled over both families (Q25) and
+    // the end game may fetch a block twice.
+    ensure!(
+        st.downloaded >= fx.total_len
+            && st.downloaded - fx.total_len <= st.redundant
+            && st.corrupt == 0,
+        "downloaded {} redundant {} corrupt {} for {} bytes",
+        st.downloaded,
+        st.redundant,
+        st.corrupt,
+        fx.total_len
+    );
     fx.verify_data(&client.save_path)?
         .map_err(|e| anyhow::anyhow!("data mismatch: {e}"))?;
     // Scrape both ways while we are here (the oracle never scrapes on its

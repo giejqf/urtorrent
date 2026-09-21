@@ -51,6 +51,8 @@ enum Job {
         piece: usize,
         offset: u32,
         data: Vec<u8>,
+        /// Where the payload starts within `data`.
+        start: usize,
         done: Done,
     },
     ReadBlock {
@@ -503,12 +505,25 @@ impl DiskStore {
         offset: u32,
         data: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<(), Error>> + 'static {
+        self.write_block_from(piece, offset, data, 0)
+    }
+
+    /// [`DiskStore::write_block`] for a payload that starts at `start` within
+    /// `data` (see [`Storage::write_block_from`]).
+    pub fn write_block_from(
+        &self,
+        piece: usize,
+        offset: u32,
+        data: Vec<u8>,
+        start: usize,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + 'static {
         let (t, done) = self.ticket();
         self.ring.submit(Job::Write {
             id: self.id,
             piece,
             offset,
             data,
+            start,
             done,
         });
         async move { unit(t.await) }
@@ -925,11 +940,12 @@ async fn run_job(entry: Rc<RefCell<Entry>>, job: Job) {
             piece,
             offset,
             data,
+            start,
             done,
             ..
         } => {
             let r = storage
-                .write_block(piece, offset, uring::Buffer::from_vec(data))
+                .write_block_from(piece, offset, uring::Buffer::from_vec(data), start)
                 .await
                 .map(|_| ());
             done.complete(Reply::Unit(r));

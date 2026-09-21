@@ -618,21 +618,23 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::new(addr.ip(), 0));
     let (mut conn, info_hash) = {
-        let t = torrent.borrow();
+        let mut t = torrent.borrow_mut();
         if t.closing.is_set() || !t.is_running() || t.has_peer_ip(addr.ip()) {
             return;
         }
-        (
-            Connection::new(connection_params(
-                &ctx,
-                &t,
-                Role::Initiator,
-                addr.ip(),
-                local_addr.ip(),
-            )),
-            t.info_hash,
-        )
+        let conn = Connection::new(connection_params(
+            &ctx,
+            &t,
+            Role::Initiator,
+            addr.ip(),
+            local_addr.ip(),
+        ));
+        // Known before the first byte goes out: an MSE responder that is us
+        // reads the handshake (as IA) before this side's handshake returns.
+        t.outgoing_pids.insert(conn.params().our_peer_id);
+        (conn, t.info_hash)
     };
+    let our_pid = conn.params().our_peer_id;
     let _ = stream.set_nodelay(true);
     let mut cipher = Cipher::default();
     let mut initial = Vec::new();
@@ -652,6 +654,7 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
             Ok(Err(e)) => {
                 tracing::debug!(%addr, "mse initiator failed: {e}");
                 let mut t = torrent.borrow_mut();
+                t.outgoing_pids.remove(&our_pid);
                 t.mse_retry.remove(&addr);
                 if !use_utp
                     && e.contains("closed")
@@ -667,6 +670,7 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
             Err(_) => {
                 tracing::debug!(%addr, "mse handshake timed out");
                 let mut t = torrent.borrow_mut();
+                t.outgoing_pids.remove(&our_pid);
                 t.mse_retry.remove(&addr);
                 t.note_disconnect(addr, Instant::now());
                 return;
@@ -1050,9 +1054,22 @@ async fn finish_connection(
     });
     handle.close(&reason);
     ctx.connection_closed();
+    ctx.note_copied(handle.conn.borrow().copied_in());
     let id = {
         let mut t = torrent.borrow_mut();
         t.peers.remove(&key);
+        if !incoming {
+            let pid = handle.conn.borrow().params().our_peer_id;
+            t.outgoing_pids.remove(&pid);
+        }
+        if reason.ends_with("connected to ourselves") {
+            // The IP is ours (a tracker or a peer handed back one of our
+            // own addresses, typically the other family's): never dial our
+            // listen port on it again, for any torrent (libtorrent bans the
+            // peer entry).
+            ctx.note_own_ip(addr.ip());
+            t.forget_candidate(SocketAddr::new(addr.ip(), ctx.listen_port));
+        }
         t.picker.peer_gone(key);
         let last = handle.last_have.borrow().clone();
         t.picker.peer_left(&last);
@@ -1195,6 +1212,26 @@ async fn handle_event(
         WireEvent::Handshaked { peer_id, .. } => {
             let id = {
                 let t = torrent.borrow();
+                // libtorrent `torrent::is_self_connection`: the id is one we
+                // put on an outgoing connection of this torrent (the wire
+                // layer catches the same id on both ends; a profile with a
+                // fresh id per connection needs this set).
+                // Also libtorrent `peer_list::new_connection`: an incoming
+                // connection whose local endpoint is the remote of one of
+                // our outgoing connections (both ends are ours; both go).
+                if handle.incoming {
+                    let by_endpoint = t
+                        .peers
+                        .values()
+                        .find(|p| p.key != handle.key && !p.incoming && p.addr == handle.local)
+                        .cloned();
+                    if let Some(o) = &by_endpoint {
+                        o.close("connected to ourselves");
+                    }
+                    if by_endpoint.is_some() || t.outgoing_pids.contains(&peer_id) {
+                        return Err("connected to ourselves".into());
+                    }
+                }
                 // libtorrent's duplicate rules (peer_list::new_connection and
                 // bt_peer_connection::on_receive), so both ends drop the same
                 // connection:
@@ -1211,7 +1248,20 @@ async fn handle_event(
                     .find(|p| p.key != handle.key && p.peer_id.get() == Some(peer_id))
                     .cloned();
                 if let Some(other) = same_pid {
-                    if (peer_id < our_id) == !handle.incoming {
+                    let keep_this = if other.incoming == handle.incoming
+                        && other.addr.is_ipv6() != handle.addr.is_ipv6()
+                    {
+                        // A dual-stack peer dialled over both families by the
+                        // same side: libtorrent's rule below keys on which
+                        // handshake completed first, which the two ends can
+                        // see in opposite orders (both then close different
+                        // connections and lose both). The family is the same
+                        // on both ends: keep IPv6 (docs/quirks.md Q25).
+                        handle.addr.is_ipv6()
+                    } else {
+                        (peer_id < our_id) == !handle.incoming
+                    };
+                    if keep_this {
                         other.close("duplicate peer id");
                     } else {
                         return Err("duplicate peer id".into());

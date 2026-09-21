@@ -199,6 +199,12 @@ pub struct Stats {
     pub send_delay_us: u32,
     /// The peer's latest one-way delay estimate (microseconds).
     pub recv_delay_us: u32,
+    /// Payload bytes copied in user space by this socket: datagram to
+    /// receive queue (one copy per received byte), write queue to packet and
+    /// packet to outgoing queue (two per sent byte, the second because a
+    /// packet stays in the send window for retransmission). Gated in the
+    /// session's copy-budget tests.
+    pub copied_bytes: u64,
 }
 
 /// A packet in the send window.
@@ -671,6 +677,14 @@ impl Socket {
         self.outgoing.push_back(Outgoing { data, mtu_probe });
     }
 
+    /// [`emit`] of a copy of a packet that stays in the send window.
+    ///
+    /// [`emit`]: Socket::emit
+    fn emit_copy(&mut self, buf: &[u8], mtu_probe: bool) {
+        self.stats.copied_bytes += buf.len() as u64;
+        self.emit(buf.to_vec(), mtu_probe);
+    }
+
     fn wnd_size(&self) -> u32 {
         u32::try_from(
             self.cfg.receive_buffer_capacity
@@ -798,6 +812,7 @@ impl Socket {
             let avail = front.len() - self.write_head;
             let to_copy = usize::try_from(size).unwrap_or(0).min(avail);
             dst.extend_from_slice(&front[self.write_head..self.write_head + to_copy]);
+            self.stats.copied_bytes += to_copy as u64;
             self.write_head += to_copy;
             self.write_buffer_size -= to_copy as i32;
             size -= to_copy as i32;
@@ -1095,7 +1110,7 @@ impl Socket {
         h.timestamp_us = self.clock.micros(now);
         h.write(&mut p.buf);
 
-        self.emit(p.buf.clone(), p.mtu_probe);
+        self.emit_copy(&p.buf, p.mtu_probe);
         self.stats.out_packets += 1;
         p.num_transmissions = p.num_transmissions.saturating_add(1);
         // Only reset the timeout for the initial packet
@@ -1191,7 +1206,7 @@ impl Socket {
         h.ack_nr = self.ack_nr;
         h.write(&mut p.buf);
 
-        self.emit(p.buf.clone(), p.mtu_probe);
+        self.emit_copy(&p.buf, p.mtu_probe);
         if need_resend {
             self.needs_resend.retain(|&s| s != seq);
         }
@@ -1447,6 +1462,7 @@ impl Socket {
                 return true;
             }
             // we received a packet in order
+            self.stats.copied_bytes += payload.len() as u64;
             self.incoming_payload(payload.to_vec());
             self.ack_nr = self.ack_nr.wrapping_add(1);
             // If this packet was previously in the reorder buffer it would
@@ -1478,6 +1494,7 @@ impl Socket {
             }
             // we don't need to save the packet header, just the payload
             self.buffered_incoming_bytes += payload_size;
+            self.stats.copied_bytes += payload.len() as u64;
             self.inbuf.insert(h.seq_nr, payload.to_vec());
         }
         false

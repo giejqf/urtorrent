@@ -95,3 +95,32 @@ through an abstraction uTP can implement later.
 - Registered (fixed) buffers for file I/O were not done: on this hardware
   the remaining cost is the kernel's page-cache copy and SHA-1, which fixed
   buffers do not remove. Revisit with NVMe measurements.
+
+## Amendment (2026-09-21, 0.6.0): one copy per received byte, counted
+
+The first version framed every message by copying it into the framer's
+buffer and then copied the payload out again into the block: two copies per
+downloaded byte. Now:
+
+- `wire::Framer::feed` parses in place. A frame that lies within the chunk
+  it arrived in is handed out borrowed (`Frame::Borrowed`) and only a piece
+  payload is copied, once, into its block. A frame cut by a chunk boundary
+  is assembled in the framer's buffer and that buffer is handed over whole
+  (`Frame::Owned`, length prefix included); a `piece` keeps it as its block
+  with the payload offset (`wire::Block { buf, start }`), and the storage
+  writes and hashes the range (`Storage::write_block_from`,
+  `File::write_range_all_at`). Either way a downloaded byte is copied
+  exactly once, and the ring buffer goes back to the kernel at the end of
+  the receive cycle — the copy is the price of never holding a provided
+  buffer across a disk write.
+- Every user-space copy of payload is counted: `Connection::copied_in`
+  (framer carry-over plus lifted payloads), `utp::Stats::copied_bytes`
+  (datagram to receive queue, write queue to packet, packet to outgoing
+  queue), the uTP glue's partial sends, summed into
+  `SessionStats::copied_bytes`. `crates/session/tests/copies.rs` gates the
+  budgets (TCP download 1, upload 0, uTP 2 each way; `docs/perf.md`).
+
+Not done, on purpose: a block that is a borrowed frame could be written
+straight from the ring buffer if the buffer were held until the write
+completed. With 256 buffers per ring and disk latency in the loop that
+starves the receive ring under load; the copy stays.

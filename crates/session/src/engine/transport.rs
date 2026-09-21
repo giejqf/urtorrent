@@ -107,13 +107,14 @@ impl Transport {
         }
     }
 
-    /// Send all of `buf`.
+    /// Send all of `buf`. TCP returns the buffer for reuse; uTP consumes it
+    /// (moved into the write queue, no copy) and returns an empty one.
     pub async fn send_all(&self, buf: Buffer) -> uring::Result<Buffer> {
         match self {
             Transport::Tcp(s) => s.send_all(buf).await,
             Transport::Utp(s) => {
-                s.send_all(buf.as_slice().to_vec()).await?;
-                Ok(buf)
+                s.send_all(buf.into_vec()).await?;
+                Ok(Buffer::with_capacity(0))
             }
         }
     }
@@ -135,7 +136,9 @@ impl Transport {
     }
 
     /// Send bytes `[start, start + len)` of the concatenated `chunks` in as
-    /// few operations as possible, without copying.
+    /// few operations as possible, without copying. When the range is the
+    /// whole batch, uTP moves the chunks into its write queue and returns
+    /// none (a rate-limited slice of a batch is copied).
     pub async fn send_all_chunks(
         &self,
         chunks: Vec<Buffer>,
@@ -145,6 +148,11 @@ impl Transport {
         match self {
             Transport::Tcp(s) => s.send_all_chunks(chunks, start, len).await,
             Transport::Utp(s) => {
+                let total: usize = chunks.iter().map(Buffer::len).sum();
+                if start == 0 && len == total {
+                    s.send_chunks(chunks).await?;
+                    return Ok(Vec::new());
+                }
                 s.send_range(&chunks, start, len).await?;
                 Ok(chunks)
             }

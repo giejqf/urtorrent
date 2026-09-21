@@ -104,11 +104,24 @@ impl File {
     /// Write all of `buf` at `offset`, resubmitting short writes.
     pub async fn write_all_at(&self, offset: u64, buf: Buffer) -> Result<Buffer> {
         let total = buf.len();
+        self.write_range_all_at(offset, buf, 0, total).await
+    }
+
+    /// Write `buf[start..start + len]` at `offset`, resubmitting short
+    /// writes; the buffer comes back untouched (no copy of a payload that
+    /// sits behind a header).
+    pub async fn write_range_all_at(
+        &self,
+        offset: u64,
+        buf: Buffer,
+        start: usize,
+        len: usize,
+    ) -> Result<Buffer> {
         let mut buf = buf;
         let mut done = 0usize;
-        while done < total {
+        while done < len {
             let (r, b) =
-                write_range_at(self.fd, offset + done as u64, buf, done, total - done).await;
+                write_range_at(self.fd, offset + done as u64, buf, start + done, len - done).await;
             buf = b;
             match r {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),

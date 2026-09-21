@@ -30,7 +30,7 @@ mod utp;
 mod webseed;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -118,6 +118,9 @@ pub struct EngineConfig {
 
 /// Buffer group id of the peer receive ring.
 const RECV_RING_GROUP: u16 = 1;
+
+/// Most addresses remembered as ours (`Ctx::note_own_ip`).
+const MAX_OWN_IPS: usize = 64;
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -246,6 +249,12 @@ pub struct Ctx {
     skeys: RefCell<mse::SkeyIndex>,
     /// Connections plus dials in progress across every torrent.
     connections: Cell<usize>,
+    /// Payload bytes copied in user space by connections since closed (live
+    /// ones are summed at query time; see `SessionStats::copied_bytes`).
+    copied: Cell<u64>,
+    /// Addresses that proved to be ours (a self-connection came in from
+    /// them): never dialled on our listen port again. Bounded.
+    own_ips: RefCell<HashSet<IpAddr>>,
     /// Torrents due for their once-a-second tick, earliest first.
     ticks: RefCell<std::collections::BinaryHeap<std::cmp::Reverse<(Instant, TorrentId)>>>,
     /// Concurrency gates (see `EngineConfig`).
@@ -354,6 +363,24 @@ impl Ctx {
     /// dial started / ended.
     pub fn connection_opened(&self) {
         self.connections.set(self.connections.get() + 1);
+    }
+
+    /// `ip` is one of ours (see `own_ips`).
+    pub fn note_own_ip(&self, ip: IpAddr) {
+        let mut own = self.own_ips.borrow_mut();
+        if own.len() < MAX_OWN_IPS {
+            own.insert(ip);
+        }
+    }
+
+    /// Whether `ip` proved to be ours.
+    pub fn is_own_ip(&self, ip: IpAddr) -> bool {
+        self.own_ips.borrow().contains(&ip)
+    }
+
+    /// Retire a connection's copy count (see `SessionStats::copied_bytes`).
+    pub fn note_copied(&self, bytes: u64) {
+        self.copied.set(self.copied.get() + bytes);
     }
 
     /// See [`Ctx::connection_opened`].
@@ -652,6 +679,8 @@ pub fn run(
             by_hash: RefCell::new(HashMap::new()),
             skeys: RefCell::new(mse::SkeyIndex::new()),
             connections: Cell::new(0),
+            copied: Cell::new(0),
+            own_ips: RefCell::new(HashSet::new()),
             ticks: RefCell::new(std::collections::BinaryHeap::new()),
             check_gate: local::Semaphore::new(cfg.max_checking),
             announce_gate: local::Semaphore::new(cfg.max_concurrent_announces),
@@ -1062,6 +1091,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 external_v6: ctx.external_address(true),
                 ..Default::default()
             };
+            s.copied_bytes = ctx.copied.get();
             for t in torrents.values() {
                 let t = t.borrow();
                 s.peers += t.peer_count();
@@ -1069,6 +1099,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 s.uploaded += t.stats.uploaded;
                 s.download_rate += t.stats.download_rate;
                 s.upload_rate += t.stats.upload_rate;
+                s.copied_bytes += t.copied_bytes();
             }
             s.connections = ctx.connection_count();
             let disk = ctx.disk.stats();
@@ -1087,6 +1118,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             }
             if let Some(h) = &ctx.utp {
                 s.utp_connections = h.connections();
+                s.copied_bytes += h.copied_bytes();
             }
             let _ = reply.send(s);
         }

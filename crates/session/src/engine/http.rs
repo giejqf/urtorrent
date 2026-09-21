@@ -32,7 +32,8 @@ pub struct Families {
 }
 
 impl Families {
-    fn allows(&self, ip: IpAddr) -> bool {
+    /// Whether we have a listen socket of `ip`'s family.
+    pub fn allows(&self, ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(_) => self.v4,
             IpAddr::V6(_) => self.v6,

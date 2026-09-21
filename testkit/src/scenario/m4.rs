@@ -27,7 +27,7 @@ pub fn scenarios() -> Vec<ScenarioDef> {
     vec![
         ScenarioDef {
             name: "https_tracker",
-            shapes: &[Shape::V4, Shape::V6],
+            shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It, Tag::Capture],
             run: https_tracker,
         },
@@ -124,7 +124,18 @@ fn https_tracker(ctx: &mut Ctx) -> Result<()> {
         "download over an https tracker",
         |s| s.complete,
     )?;
-    ensure!(st.downloaded == fx.total_len);
+    // In the dual shape the oracle is dialled over both families (Q25) and
+    // the end game may fetch a block twice.
+    ensure!(
+        st.downloaded >= fx.total_len
+            && st.downloaded - fx.total_len <= st.redundant
+            && st.corrupt == 0,
+        "downloaded {} redundant {} corrupt {} for {} bytes",
+        st.downloaded,
+        st.redundant,
+        st.corrupt,
+        fx.total_len
+    );
     fx.verify_data(&client.save_path)?
         .map_err(|e| anyhow::anyhow!("data mismatch: {e}"))?;
     client.shutdown()?;

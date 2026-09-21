@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-21
+
+Gates for dual-stack edge cases and user-space copies on the data path, and
+BEP 52 (v2/hybrid torrents) taken off the roadmap.
+
+### Added
+
+- `SessionStats::copied_bytes`: every user-space copy of payload on the data
+  path is counted, and `crates/session/tests/copies.rs` gates the budgets
+  (TCP download one copy per byte, TCP upload none, uTP two each way; with
+  and without rate limits, over blocks that straddle files). `docs/perf.md`
+  has the table.
+- Dual-stack gates in `crates/session/tests/dualstack.rs` and `selfconn.rs`:
+  one peer reached over both families (dialled by one side, or one direction
+  each) keeps exactly one connection; an engine without a family never dials
+  that family; v4-mapped addresses from any peer source are dialled as the
+  IPv4 peer they name; a tracker listing one seeder under `peers`, `peers6`
+  and v4-mapped in `peers6` yields one connection; an address of our own
+  handed back by a tracker or a peer is recognised as a self-connection and
+  never dialled again. Lab scenarios `pex_discovery`, `lsd_discovery`,
+  `private_no_pex_lsd`, `magnet_via_ut_metadata`, `web_seed_only`,
+  `https_tracker`, `http_scrape`, `dht_leech_from_oracle` and
+  `utp_leech_from_oracle` now run in the dual shape too; `tracker_failover`,
+  `magnet_dht_from_oracle` and `utp_seed_to_oracle` in v6.
+- docs/quirks.md Q25 (dual-stack duplicates, self-connections, address
+  normalisation).
+
+### Changed
+
+- The receive path copies a block once instead of twice: peer-wire frames
+  are parsed in place in the received chunk (`wire::Frame::Borrowed`), a
+  frame cut by a chunk boundary is assembled once and handed over as the
+  block itself (`wire::Frame::Owned`, `wire::Block` with its payload offset,
+  `Storage::write_block_from`, `File::write_range_all_at`). Blocks straddling
+  files are written from their ranges of the same buffer (no per-slice copy),
+  and uTP moves whole chunk batches into its write queue instead of copying
+  them.
+- Peer addresses are normalised on ingress: a v4-mapped IPv6 address from a
+  tracker, PEX, the DHT, LSD or a magnet's `x.pe` is the IPv4 peer it names.
+  Candidates of a family without a listen socket are dropped instead of
+  dialled from an unbound socket (`listen_v4` / `listen_v6` docs).
+- The same peer id on two connections of the same direction but different
+  families keeps the IPv6 one (libtorrent's order-based rule made the two
+  ends drop different connections); opposite directions keep libtorrent's
+  rule. Self-connections are recognised by the peer ids we put on outgoing
+  connections (libtorrent `is_self_connection`; needed under the qbt
+  profile's per-connection ids) and by endpoints, and the address is never
+  dialled on our listen port again.
+- Lab assertions on `downloaded` allow the end-game redundancy of two
+  connections to the oracle (one per family, Q25): `downloaded - total <=
+  redundant`, `corrupt == 0`, data verified on disk.
+- The `native` profile's identity strings are `-UR0600-` / `urtorrent/0.6.0`
+  / DHT `UR\x00\x06`.
+
+### Removed
+
+- BEP 52 (v2 / hybrid torrents) from the roadmap (maintainer decision:
+  not widely adopted). Hybrid torrents keep working through their v1 half.
+
 ## [0.5.0] - 2026-09-21
 
 Magnet links and the extension protocol, checked against BEP 9, 10, 11 and

@@ -18,7 +18,8 @@ that trackers and peers see nothing unusual.
   2026-09-19): 0.1.0 was TCP-only and tracker/PEX/LSD-driven. The DHT shipped in 0.3.0
   (ADR 0007) and uTP in 0.4.0 (ADR 0008).
 - I2P, SOCKS/HTTP proxies, SSL torrents, share mode, super-seeding (revisit later if asked).
-- BEP 52 (v2/hybrid) is *deferred*, not rejected. See section 4.
+- BEP 52 (v2/hybrid torrents) is **rejected** (maintainer decision, 2026-09-21: not widely
+  adopted). v1 only; hybrid torrents are handled by their v1 half. See section 4.
 
 ### Non-negotiable rules
 
@@ -118,15 +119,15 @@ Tiering reflects what public BT and private-tracker (PT) communities actually us
 BEP 5/32 DHT (**done in 0.3.0**: BEP 5, 42, 43, 51 and libtorrent's extras; BEP 44 items
 are a documented gap, docs/quirks.md Q20), BEP 29 uTP (**done in 0.4.0**, ADR 0008:
 libtorrent's `utp_stream` ported; `TransportPolicy` toggle, TCP first by default,
-docs/quirks.md Q21), BEP 55 `ut_holepunch`, BEP 52 v2/hybrid torrents (merkle trees,
-SHA-256), BEP 17 web seeds, UPnP/NAT-PMP/PCP port mapping.
+docs/quirks.md Q21), BEP 55 `ut_holepunch`, BEP 17 web seeds, UPnP/NAT-PMP/PCP port
+mapping. BEP 52 (v2/hybrid) is off the list (section 1).
 
 "Must not preclude" concretely: the listen port's UDP socket is owned by `uring` with a
 demultiplexer (UDP tracker, DHT and uTP share it), and `session` talks to peers through a
 `Transport` enum (TCP and uTP, ADR 0006 / 0008).
 
 Note: the libtorrent 2.0 oracle speaks v2. If a Tier-1/2 capture shows v2-related bits on
-v1-only torrents, that becomes a fidelity item and gets pulled forward; otherwise v2 waits.
+v1-only torrents, that is a fidelity item (wire shape only); v2 itself is not implemented.
 
 ## 5. Architecture
 
@@ -413,8 +414,8 @@ Each milestone ends with its integration scenarios green in CI.
 - **M6 Extensions.** PEX, `ut_metadata`/magnet, `upload_only`, LSD, web seeds, BEP 40.
 - **M7 0.1.0 hardening.** Soak, perf, fuzz time, API review, docs. **Release 0.1.0.**
 - **Post-0.1.0:** each as its own minor release: 0.2.0 performance pass (done), 0.3.0 DHT
-  (done), 0.4.0 uTP (done), 0.5.0 magnet / LTEP conformance (done), then `ut_holepunch`,
-  BEP 52, port mapping.
+  (done), 0.4.0 uTP (done), 0.5.0 magnet / LTEP conformance (done), 0.6.0 gates for
+  dual-stack edge cases and copy budgets (done), then `ut_holepunch`, port mapping.
 
 ## 9. Working conventions
 
@@ -480,9 +481,9 @@ Each milestone ends with its integration scenarios green in CI.
 - **Versioning: SemVer, first release 0.1.0.** See section 9 for the policy.
 - **Public API integrates with tokio** (5.6); the engine still runs on its own uring
   threads and tokio never owns I/O inside the library.
-- Defaults accepted: oracle line 5.2.3 / libtorrent 2.0.14 only for now; BEP 52 post-0.1.0;
-  kernel baseline 6.1 LTS; rustls with its default crypto provider; `native` is the
-  default profile.
+- Defaults accepted: oracle line 5.2.3 / libtorrent 2.0.14 only for now; kernel baseline
+  6.1 LTS; rustls with its default crypto provider; `native` is the default profile.
+- **BEP 52 (v2/hybrid) is not on the roadmap** (2026-09-21, "not widely adopted").
 - **Licence: Apache-2.0.**
 
 ### Still open

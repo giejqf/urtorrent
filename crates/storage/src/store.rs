@@ -55,7 +55,8 @@ struct PieceHash {
     /// Written ranges `[start, end)`, sorted and merged.
     written: Vec<(u32, u32)>,
     /// Written-but-unhashed block data, by offset.
-    stash: BTreeMap<u32, Vec<u8>>,
+    /// Written blocks kept for the hash cursor: `(buffer, payload start)`.
+    stash: BTreeMap<u32, (Vec<u8>, usize)>,
     stash_bytes: usize,
     /// An advancer is running for this piece.
     hashing: bool,
@@ -639,8 +640,23 @@ impl Storage {
     /// piece's hash cursor (see the module docs). Padding regions in the span
     /// are skipped on disk and hashed as zeros, as BEP 47 defines them.
     pub async fn write_block(&self, piece: usize, offset: u32, data: Buffer) -> Result<(), Error> {
+        self.write_block_from(piece, offset, data, 0).await
+    }
+
+    /// [`Storage::write_block`] for a payload that starts at `start` within
+    /// `data` (a peer-wire frame kept whole: the block follows its header).
+    /// Nothing is copied on the common single-file path: the range is
+    /// written from the buffer and hashed from it afterwards.
+    pub async fn write_block_from(
+        &self,
+        piece: usize,
+        offset: u32,
+        data: Buffer,
+        start: usize,
+    ) -> Result<(), Error> {
+        let start = start.min(data.len());
         let torrent_off = self.torrent_offset(piece, offset)?;
-        let len = data.len() as u64;
+        let len = (data.len() - start) as u64;
         let slices = self.info.slices_for(torrent_off, len);
         // The common case, a block inside one content file: write the
         // buffer itself and hash from it afterwards. No copy.
@@ -650,28 +666,33 @@ impl Storage {
         {
             let (file, off) = self.target(s).await?;
             self.mark_dirty(s);
-            let data = file.write_all_at(off, data).await?;
-            return self.on_written(piece, offset, data.into_vec()).await;
+            let data = file
+                .write_range_all_at(off, data, start, len as usize)
+                .await?;
+            return self
+                .on_written(piece, offset, (data.into_vec(), start))
+                .await;
         }
-        let mut bytes = data.into_vec();
-        let mut pos = 0usize;
+        // A block spanning files (or padding): each slice is written from
+        // its range of the same buffer, one file after the other.
+        let mut data = data;
+        let mut pos = start;
         for s in slices {
             let take = s.length as usize;
             if s.padding {
                 // Synthetic zeros: not stored, and hashed as zeros whatever
                 // the peer sent.
-                bytes[pos..pos + take].fill(0);
+                data.as_mut_slice()[pos..pos + take].fill(0);
                 pos += take;
                 continue;
             }
-            let chunk = &bytes[pos..pos + take];
-            pos += take;
             let (file, off) = self.target(&s).await?;
             self.mark_dirty(&s);
-            let buf = Buffer::from_vec(chunk.to_vec());
-            file.write_all_at(off, buf).await?;
+            data = file.write_range_all_at(off, data, pos, take).await?;
+            pos += take;
         }
-        self.on_written(piece, offset, bytes).await
+        self.on_written(piece, offset, (data.into_vec(), start))
+            .await
     }
 
     /// Remember that the file behind `s` has unsynced writes.
@@ -692,12 +713,18 @@ impl Storage {
 
     /// A block of `piece` is on disk: record it and advance the hash cursor as
     /// far as the contiguous written prefix goes.
-    async fn on_written(&self, piece: usize, offset: u32, data: Vec<u8>) -> Result<(), Error> {
-        if data.is_empty() {
+    async fn on_written(
+        &self,
+        piece: usize,
+        offset: u32,
+        data: (Vec<u8>, usize),
+    ) -> Result<(), Error> {
+        let data_len = data.0.len() - data.1;
+        if data_len == 0 {
             return Ok(());
         }
         let piece_len = self.piece_len(piece)?;
-        let end = offset.saturating_add(data.len() as u32).min(piece_len);
+        let end = offset.saturating_add(data_len as u32).min(piece_len);
         {
             let mut prog = self.progress.borrow_mut();
             let p = prog.entry(piece).or_insert_with(PieceHash::new);
@@ -707,9 +734,8 @@ impl Storage {
                 p.reset();
             }
             p.mark(offset, end);
-            if offset >= p.cursor && (offset == p.cursor || p.stash_bytes + data.len() <= STASH_CAP)
-            {
-                p.stash_bytes += data.len();
+            if offset >= p.cursor && (offset == p.cursor || p.stash_bytes + data_len <= STASH_CAP) {
+                p.stash_bytes += data_len;
                 p.stash.insert(offset, data);
             }
             if p.hashing {
@@ -732,13 +758,13 @@ impl Storage {
                     return;
                 };
                 let mut pos = p.cursor;
-                let mut chunks: Vec<Vec<u8>> = Vec::new();
+                let mut chunks: Vec<(Vec<u8>, usize)> = Vec::new();
                 let mut readback: Vec<(u32, u32)> = Vec::new();
                 let mut budget = MAX_RUN;
                 while pos < piece_len && budget > 0 {
                     if let Some(d) = p.stash.remove(&pos) {
-                        p.stash_bytes -= d.len();
-                        let l = d.len() as u32;
+                        let l = (d.0.len() - d.1) as u32;
+                        p.stash_bytes -= l as usize;
                         chunks.push(d);
                         pos += l;
                         budget = budget.saturating_sub(l);
@@ -750,7 +776,7 @@ impl Storage {
                             e = e.min(next_stash);
                         }
                         readback.push((pos, e));
-                        chunks.push(Vec::new()); // placeholder, filled below
+                        chunks.push((Vec::new(), 0)); // placeholder, filled below
                         budget = budget.saturating_sub(e - pos);
                         pos = e;
                     } else {
@@ -768,7 +794,7 @@ impl Storage {
             let mut rb = readback.iter();
             let mut pooled_idx = Vec::new();
             for (i, c) in chunks.iter_mut().enumerate() {
-                if !c.is_empty() {
+                if !c.0.is_empty() {
                     continue;
                 }
                 let Some(&(s, e)) = rb.next() else { break };
@@ -782,7 +808,7 @@ impl Storage {
                             .stats
                             .readback_bytes
                             .fetch_add(u64::from(e - s), std::sync::atomic::Ordering::Relaxed);
-                        *c = b.into_vec();
+                        *c = (b.into_vec(), 0);
                         pooled_idx.push(i);
                     }
                     Err(err) => {
@@ -804,7 +830,7 @@ impl Storage {
             let (state, chunks, digest) = self.pool.update_async(state, chunks, finish).await;
             for (i, c) in chunks.into_iter().enumerate() {
                 if pooled_idx.contains(&i) {
-                    self.res.put_buf(self.piece_buf_size(), c);
+                    self.res.put_buf(self.piece_buf_size(), c.0);
                 }
             }
             let mut prog = self.progress.borrow_mut();

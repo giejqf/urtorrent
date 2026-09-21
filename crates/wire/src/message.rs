@@ -24,6 +24,77 @@ pub struct Request {
     pub length: u32,
 }
 
+/// A block payload as received. The bytes are `buf[start..]`: a frame the
+/// framer assembled across chunks is used as it is, header and all, so the
+/// payload is not copied a second time; `start` says where it begins.
+#[derive(Clone, Default)]
+pub struct Block {
+    buf: Vec<u8>,
+    start: usize,
+}
+
+impl Block {
+    /// A block over the whole of `buf`.
+    pub fn new(buf: Vec<u8>) -> Block {
+        Block { buf, start: 0 }
+    }
+
+    /// A block over `buf[start..]`.
+    pub fn with_start(buf: Vec<u8>, start: usize) -> Block {
+        let start = start.min(buf.len());
+        Block { buf, start }
+    }
+
+    /// The payload.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    /// Payload length.
+    pub fn len(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    /// Whether the payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The buffer and the payload's offset in it (no copy).
+    pub fn into_parts(self) -> (Vec<u8>, usize) {
+        (self.buf, self.start)
+    }
+
+    /// The payload as its own vector (a copy when it has a prefix).
+    pub fn into_vec(self) -> Vec<u8> {
+        if self.start == 0 {
+            self.buf
+        } else {
+            self.buf[self.start..].to_vec()
+        }
+    }
+}
+
+impl PartialEq for Block {
+    fn eq(&self, other: &Block) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Block {}
+
+impl std::fmt::Debug for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Block({} bytes)", self.len())
+    }
+}
+
+impl From<Vec<u8>> for Block {
+    fn from(v: Vec<u8>) -> Block {
+        Block::new(v)
+    }
+}
+
 /// A peer-wire message.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Message {
@@ -51,7 +122,7 @@ pub enum Message {
         /// Byte offset within the piece.
         begin: u32,
         /// Block payload.
-        data: Vec<u8>,
+        data: Block,
     },
     /// `cancel` (8).
     Cancel(Request),
@@ -197,7 +268,7 @@ impl Message {
                 out.push(id::PIECE);
                 put_u32(out, *index);
                 put_u32(out, *begin);
-                out.extend_from_slice(data);
+                out.extend_from_slice(data.as_slice());
             }
             Message::Cancel(r) => {
                 out.push(id::CANCEL);
@@ -236,6 +307,28 @@ impl Message {
         let mut v = Vec::new();
         self.encode(&mut v);
         v
+    }
+
+    /// Decode a frame the framer assembled in its own buffer: `frame` holds
+    /// the 4-byte length prefix followed by the body. A `piece` keeps the
+    /// buffer as its block (no payload copy); everything else decodes from
+    /// the body slice.
+    pub fn decode_owned(frame: Vec<u8>) -> Result<Message, Error> {
+        const BODY: usize = 4;
+        if frame.len() >= BODY + 9 && frame[BODY] == id::PIECE {
+            let body = &frame[BODY..];
+            if body.len() - 9 > MAX_BLOCK as usize {
+                return Err(Error::TooLarge);
+            }
+            let index = be32(&body[1..5]);
+            let begin = be32(&body[5..9]);
+            return Ok(Message::Piece {
+                index,
+                begin,
+                data: Block::with_start(frame, BODY + 9),
+            });
+        }
+        Message::decode(frame.get(BODY..).unwrap_or(&[]))
     }
 
     /// Decode one frame body (without its length prefix). Bounds every
@@ -289,7 +382,7 @@ impl Message {
                 Message::Piece {
                     index: be32(&body[1..5]),
                     begin: be32(&body[5..9]),
-                    data: body[9..].to_vec(),
+                    data: Block::new(body[9..].to_vec()),
                 }
             }
             id::CANCEL => Message::Cancel(get_req(body)?),
@@ -384,7 +477,7 @@ mod tests {
             Message::Piece {
                 index: 4,
                 begin: 16384,
-                data: vec![1, 2, 3],
+                data: Block::new(vec![1, 2, 3]),
             },
             Message::Cancel(r),
             Message::Port(6881),

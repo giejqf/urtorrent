@@ -33,13 +33,13 @@ pub fn scenarios() -> Vec<ScenarioDef> {
         },
         ScenarioDef {
             name: "dht_leech_from_oracle",
-            shapes: &[Shape::V4, Shape::V6],
+            shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It],
             run: dht_leech_from_oracle,
         },
         ScenarioDef {
             name: "magnet_dht_from_oracle",
-            shapes: &[Shape::V4],
+            shapes: &[Shape::V4, Shape::V6],
             tags: &[Tag::It],
             run: magnet_dht_from_oracle,
         },

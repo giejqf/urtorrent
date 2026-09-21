@@ -33,13 +33,13 @@ pub fn scenarios() -> Vec<ScenarioDef> {
         },
         ScenarioDef {
             name: "utp_leech_from_oracle",
-            shapes: &[Shape::V4, Shape::V6],
+            shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It],
             run: utp_leech_from_oracle,
         },
         ScenarioDef {
             name: "utp_seed_to_oracle",
-            shapes: &[Shape::V4],
+            shapes: &[Shape::V4, Shape::V6],
             tags: &[Tag::It],
             run: utp_seed_to_oracle,
         },

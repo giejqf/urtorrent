@@ -435,6 +435,13 @@ pub struct SessionStats {
     pub dht_stored_peers: usize,
     /// Live uTP connections, including ones finishing their close handshake.
     pub utp_connections: usize,
+    /// Payload bytes copied in user space on the data path since the session
+    /// started: peer-wire frames cut by a receive boundary, block payloads
+    /// lifted out of the receive ring, uTP's receive and send queues, and
+    /// rate-limited partial sends. The budget is documented and gated in
+    /// `docs/perf.md`: a TCP download costs one copy per byte, a TCP upload
+    /// none, a uTP transfer two each way.
+    pub copied_bytes: u64,
 }
 
 /// Something that happened in the engine.
@@ -636,13 +643,17 @@ impl SessionBuilder {
         self
     }
 
-    /// IPv4 listen address (`None` disables IPv4 listening).
+    /// IPv4 listen address (`None` disables IPv4: no listen socket, no
+    /// announce for the family, and IPv4 peers learned from any source are
+    /// not dialled).
     pub fn listen_v4(mut self, addr: Option<Ipv4Addr>) -> Self {
         self.cfg.listen_v4 = addr;
         self
     }
 
-    /// IPv6 listen address (`None` disables IPv6 listening).
+    /// IPv6 listen address (`None` disables IPv6: no listen socket, no
+    /// announce for the family, and IPv6 peers learned from any source are
+    /// not dialled).
     pub fn listen_v6(mut self, addr: Option<Ipv6Addr>) -> Self {
         self.cfg.listen_v6 = addr;
         self

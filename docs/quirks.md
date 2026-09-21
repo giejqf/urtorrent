@@ -457,3 +457,42 @@ Source: libtorrent 2.0.14 `torrent.cpp` (`announce_with_tracker`):
 torrent size, "which upsets some trackers". `corrupt=` and `redundant=`
 carry the excluded bytes. `TorrentStatus::downloaded` stays the gross count
 of payload received; `build_request` subtracts.
+
+## Q25. Dual-stack duplicates and connections to ourselves
+
+Source: libtorrent 2.0.14 `bt_peer_connection.cpp` (`on_receive_handshake`),
+`torrent.cpp` (`is_self_connection`, `m_outgoing_pids`), `peer_list.cpp`
+(`new_connection`), `peer_connection.cpp` (`disconnect`: `ban_peer` on
+`self_connection`); observed in `pex_discovery [dual]`, where the oracle's
+PEX hands us our own listen address.
+
+- **Addresses are normalised on ingress.** A v4-mapped IPv6 address
+  (`::ffff:a.b.c.d`) from a tracker's `peers6`, a PEX `added6`, the DHT or a
+  magnet's `x.pe` is the IPv4 peer it names and is dialled as such (or not at
+  all when IPv4 is off). libtorrent keeps the mapped form and dials it
+  through its v6 socket; the peer sees the same v4 connection either way.
+- **Candidates of a family we do not listen on are dropped** (`listen_v4` /
+  `listen_v6` `None`), not dialled from an unbound socket.
+- **The same peer over both families, dialled by the same side.** libtorrent's
+  duplicate rule keys on which of the two handshakes completed first ("the
+  greater peer id initiates" decides whether the newcomer or the existing
+  connection goes). When one side dialled both, the two ends can see the
+  handshakes complete in opposite orders, each closes a different
+  connection and both are lost until the next reconnect. We keep the IPv6
+  connection in that case (same direction, different family): the family is
+  the same on both ends, so the outcome is. With the oracle this never
+  arises: it puts a fresh peer id on every connection (Q19), so the rule
+  fires only against clients with one id per session, and the accepted
+  outcome there is one connection per family. Opposite directions keep
+  libtorrent's rule unchanged (`incoming_and_outgoing_over_different_families
+  _keep_one_connection`).
+- **Connections to ourselves** are recognised the way libtorrent does: an
+  incoming handshake carrying a peer id we put on an outgoing connection of
+  the same torrent (`outgoing_pids`; the wire layer's "same id on both
+  ends" check cannot see it under the qbt profile's per-connection ids), or
+  an incoming connection whose local endpoint is the remote of one of our
+  outgoing ones (then both go). The address is then known to be ours and is
+  never dialled on our listen port again, for any torrent, like libtorrent's
+  ban of the peer entry. A tracker or PEX peer handing back our other
+  family's address while we listen on the unspecified address is the common
+  trigger.

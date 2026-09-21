@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use metainfo::{Bitfield, InfoHash};
 
 use crate::Error;
-use crate::framer::Framer;
+use crate::framer::{Frame, Framer};
 use crate::handshake::{HANDSHAKE_LEN, Handshake};
 use crate::ltep::{EXT_HANDSHAKE_ID, ExtHandshake};
 use crate::message::{MAX_BLOCK, Message, Request};
@@ -144,8 +144,8 @@ pub enum Event {
     Block {
         /// The request it satisfies.
         request: Request,
-        /// The payload.
-        data: Vec<u8>,
+        /// The payload (its buffer may carry the frame header in front).
+        data: crate::Block,
     },
     /// A block arrived that we did not request (or requested and then
     /// cancelled): counts as wasted bytes.
@@ -242,6 +242,8 @@ pub struct Connection {
     payload_in: u64,
     payload_out: u64,
     wasted_in: u64,
+    /// Block payload bytes copied out of a received chunk (see `copied_in`).
+    copied_payload: u64,
 }
 
 impl Connection {
@@ -278,6 +280,7 @@ impl Connection {
             payload_in: 0,
             payload_out: 0,
             wasted_in: 0,
+            copied_payload: 0,
             params,
         };
         if c.params.role == Role::Initiator {
@@ -604,21 +607,59 @@ impl Connection {
     /// Feed received bytes. Returns the events they produced, in order, or an
     /// error meaning the peer must be disconnected.
     pub fn receive(&mut self, bytes: &[u8]) -> Result<Vec<Event>, Error> {
-        self.framer.push(bytes)?;
         let mut events = Vec::new();
+        let mut framer = std::mem::take(&mut self.framer);
+        let r = self.receive_into(&mut framer, bytes, &mut events);
+        self.framer = framer;
+        r.map(|()| events)
+    }
+
+    fn receive_into(
+        &mut self,
+        framer: &mut Framer,
+        bytes: &[u8],
+        events: &mut Vec<Event>,
+    ) -> Result<(), Error> {
+        let mut bytes = bytes;
         if !self.established {
-            let hs = match Handshake::parse(self.framer.pending())? {
+            // The handshake is a fixed-size prefix, parsed from the stash.
+            framer.stash(bytes)?;
+            let hs = match Handshake::parse(framer.pending())? {
                 Some(hs) => hs,
-                None => return Ok(events),
+                None => return Ok(()),
             };
-            self.framer.consume(HANDSHAKE_LEN);
-            self.on_handshake(hs, &mut events)?;
+            framer.consume(HANDSHAKE_LEN);
+            self.on_handshake(hs, events)?;
+            // Whatever followed the handshake in the same chunks.
+            framer.drain_stashed(|frame| self.on_frame(frame, events))?;
+            bytes = &[];
         }
-        while let Some(body) = self.framer.next_frame()? {
-            let msg = Message::decode(body)?;
-            self.on_message(msg, &mut events)?;
-        }
-        Ok(events)
+        framer.feed(bytes, |frame| self.on_frame(frame, events))
+    }
+
+    /// Decode one frame and act on it. A `piece` borrowed from the chunk
+    /// costs one copy of its payload (counted); one assembled across chunks
+    /// keeps the framer's buffer as its block.
+    fn on_frame(&mut self, frame: Frame<'_>, events: &mut Vec<Event>) -> Result<(), Error> {
+        let msg = match frame {
+            Frame::Borrowed(body) => {
+                let m = Message::decode(body)?;
+                if let Message::Piece { data, .. } = &m {
+                    self.copied_payload += data.len() as u64;
+                }
+                m
+            }
+            Frame::Owned(v) => Message::decode_owned(v)?,
+        };
+        self.on_message(msg, events)
+    }
+
+    /// Bytes this connection copied in user space on the receive path: the
+    /// carry-over of frames cut by chunk boundaries plus one copy of every
+    /// block payload lifted out of a chunk. That is the whole cost: whole
+    /// frames are parsed in place and assembled frames become the block.
+    pub fn copied_in(&self) -> u64 {
+        self.framer.copied() + self.copied_payload
     }
 
     fn on_handshake(&mut self, hs: Handshake, events: &mut Vec<Event>) -> Result<(), Error> {
@@ -1104,11 +1145,12 @@ mod tests {
             bytes = &bytes[HANDSHAKE_LEN..];
         }
         let mut f = Framer::new();
-        f.push(bytes).unwrap();
         let mut out = Vec::new();
-        while let Some(body) = f.next_frame().unwrap() {
-            out.push(Message::decode(body).unwrap());
-        }
+        f.feed(bytes, |body| {
+            out.push(Message::decode(body.body())?);
+            Ok(())
+        })
+        .unwrap();
         out
     }
 
@@ -1345,7 +1387,7 @@ mod tests {
                 &Message::Piece {
                     index: 1,
                     begin: 16384,
-                    data: vec![0; 16384],
+                    data: crate::Block::new(vec![0; 16384]),
                 }
                 .to_bytes(),
             )
@@ -1358,7 +1400,7 @@ mod tests {
                 &Message::Piece {
                     index: 1,
                     begin: 0,
-                    data: vec![7; 16384],
+                    data: crate::Block::new(vec![7; 16384]),
                 }
                 .to_bytes(),
             )
@@ -1516,7 +1558,7 @@ mod tests {
                 &Message::Piece {
                     index: 0,
                     begin: 0,
-                    data: vec![7; 16384],
+                    data: crate::Block::new(vec![7; 16384]),
                 }
                 .to_bytes(),
             )
@@ -1531,7 +1573,7 @@ mod tests {
                 &Message::Piece {
                     index: 2,
                     begin: 0,
-                    data: vec![7; 16384],
+                    data: crate::Block::new(vec![7; 16384]),
                 }
                 .to_bytes(),
             )

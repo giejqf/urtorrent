@@ -8,7 +8,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 
@@ -58,31 +58,31 @@ pub fn scenarios() -> Vec<ScenarioDef> {
         },
         ScenarioDef {
             name: "pex_discovery",
-            shapes: &[Shape::V4, Shape::V6],
+            shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It, Tag::Diff],
             run: pex_discovery,
         },
         ScenarioDef {
             name: "magnet_via_ut_metadata",
-            shapes: &[Shape::V4, Shape::V6],
+            shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It],
             run: magnet_via_ut_metadata,
         },
         ScenarioDef {
             name: "lsd_discovery",
-            shapes: &[Shape::V4, Shape::V6],
+            shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It],
             run: lsd_discovery,
         },
         ScenarioDef {
             name: "web_seed_only",
-            shapes: &[Shape::V4, Shape::V6],
+            shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It, Tag::Diff],
             run: web_seed_only,
         },
         ScenarioDef {
             name: "private_no_pex_lsd",
-            shapes: &[Shape::V4, Shape::V6],
+            shapes: &[Shape::V4, Shape::V6, Shape::Dual],
             tags: &[Tag::It],
             run: private_no_pex_lsd,
         },
@@ -724,7 +724,27 @@ fn magnet_via_ut_metadata(ctx: &mut Ctx) -> Result<()> {
     })?;
     fx_a.verify_data(&client.save_path)?
         .map_err(|e| anyhow::anyhow!("client data mismatch: {e}"))?;
-    ensure!(st.downloaded == fx_a.total_len && st.corrupt == 0);
+    // The oracle connects over both families in the dual shape (a fresh
+    // peer id per connection, Q25), so the end game may fetch a few blocks
+    // twice; `redundant` also counts a metadata piece that arrived after the
+    // metadata was complete (libtorrent `waste_reason::piece_unknown`).
+    ctx.note(format!(
+        "downloaded={} redundant={} corrupt={} peers seen={}",
+        st.downloaded,
+        st.redundant,
+        st.corrupt,
+        st.peers_seen.len()
+    ));
+    ensure!(
+        st.downloaded >= fx_a.total_len
+            && st.downloaded - fx_a.total_len <= st.redundant
+            && st.corrupt == 0,
+        "downloaded {} redundant {} corrupt {} for {} bytes",
+        st.downloaded,
+        st.redundant,
+        st.corrupt,
+        fx_a.total_len
+    );
     // The announces before the metadata carried libtorrent's 16 KiB `left`
     // placeholder (Q12), the ones after it the real size.
     let events = tracker.events();
@@ -869,11 +889,23 @@ fn lsd_discovery(ctx: &mut Ctx) -> Result<()> {
     client.shutdown()?;
     let mut pcap = pcap;
     if let Some(p) = pcap.as_mut() {
+        let oracle_ips = oracle.actor.addrs();
+        let our_ips = client.actor.addrs();
+        // tcpdump writes packet by packet (`-U`); give the oracle's announce
+        // a moment to land in the file before stopping (it was seen on the
+        // wire: we learned the oracle through it), so the tap is not cut
+        // between the kernel's filter and tcpdump's read.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && !lsd_packets(&pcap_path)
+                .map(|ps| ps.iter().any(|(ip, _)| oracle_ips.contains(ip)))
+                .unwrap_or(false)
+        {
+            std::thread::sleep(Duration::from_millis(200));
+        }
         p.stop();
         std::thread::sleep(Duration::from_millis(300));
         let packets = lsd_packets(&pcap_path)?;
-        let oracle_ips = oracle.actor.addrs();
-        let our_ips = client.actor.addrs();
         let theirs: Vec<&(IpAddr, String)> = packets
             .iter()
             .filter(|(ip, _)| oracle_ips.contains(ip))
