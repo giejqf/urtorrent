@@ -22,8 +22,10 @@ use crate::Error;
 use metainfo::Bitfield;
 
 /// Current resume-data format version. Version 2 added `file_priorities`
-/// (optional; version-1 files read as "all default").
-pub const FORMAT_VERSION: i64 = 3;
+/// (optional; version-1 files read as "all default"), version 3 the time
+/// counters, version 4 the queue fields (`auto_managed`, `queue_position`;
+/// absent in older files: managed, appended).
+pub const FORMAT_VERSION: i64 = 4;
 
 /// Decoded resume data for one torrent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,11 @@ pub struct ResumeData {
     pub active_time: u64,
     /// Seconds the torrent has been active as a seed in total (v3).
     pub seeding_time: u64,
+    /// Whether the active-torrent queue manages the torrent (v4; `true`
+    /// when absent).
+    pub auto_managed: bool,
+    /// Queue order key (v4; `None` when absent: appended on load).
+    pub queue_position: Option<u64>,
 }
 
 impl ResumeData {
@@ -69,6 +76,8 @@ impl ResumeData {
             file_priorities: Vec::new(),
             active_time: 0,
             seeding_time: 0,
+            auto_managed: true,
+            queue_position: None,
         }
     }
 
@@ -84,6 +93,7 @@ impl ResumeData {
         // Keys in sorted order (canonical bencode).
         let mut entries: Vec<(&[u8], Value)> = vec![
             (b"active_time", Value::Int(active)),
+            (b"auto_managed", Value::Int(i64::from(self.auto_managed))),
             (b"downloaded", Value::Int(down)),
             (b"format", Value::Int(self.format_version)),
             (b"have", Value::Bytes(self.have.as_bytes())),
@@ -96,7 +106,18 @@ impl ResumeData {
         ];
         if !self.file_priorities.is_empty() {
             // `file_priorities` sorts between `downloaded` and `format`.
-            entries.insert(2, (b"file_priorities", Value::Bytes(&self.file_priorities)));
+            entries.insert(3, (b"file_priorities", Value::Bytes(&self.file_priorities)));
+        }
+        if let Some(q) = self.queue_position {
+            // `queue_position` sorts between `pieces` and `seeding_time`.
+            let at = entries
+                .iter()
+                .position(|(k, _)| *k == b"seeding_time")
+                .unwrap_or(entries.len());
+            entries.insert(
+                at,
+                (b"queue_position", Value::Int(q.min(i64::MAX as u64) as i64)),
+            );
         }
         bencode::to_bytes(&Value::Dict { entries, raw: b"" })
     }
@@ -171,6 +192,16 @@ impl ResumeData {
             file_priorities,
             active_time: secs("active_time"),
             seeding_time: secs("seeding_time"),
+            // v4 fields.
+            auto_managed: v
+                .get_str("auto_managed")
+                .and_then(Value::as_int)
+                .is_none_or(|a| a != 0),
+            queue_position: v
+                .get_str("queue_position")
+                .and_then(Value::as_int)
+                .filter(|q| *q >= 0)
+                .map(|q| q as u64),
         })
     }
 
@@ -240,7 +271,33 @@ mod tests {
             file_priorities: vec![4, 0, 7],
             active_time: 3600,
             seeding_time: 1200,
+            auto_managed: false,
+            queue_position: Some(7),
         }
+    }
+
+    /// A version-3 file (no queue fields) still loads: managed, no position.
+    #[test]
+    fn reads_format_version_3() {
+        let mut v3 = sample();
+        v3.format_version = 3;
+        v3.auto_managed = true;
+        v3.queue_position = None;
+        let bytes = v3.encode();
+        let strip = |b: &[u8], needle: &[u8]| -> Vec<u8> {
+            let at = b
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .expect("key present");
+            [&b[..at], &b[at + needle.len()..]].concat()
+        };
+        let stripped = strip(&bytes, b"12:auto_managedi1e");
+        assert!(!stripped.windows(14).any(|w| w == b"queue_position"));
+        let back = ResumeData::decode(&stripped).unwrap();
+        assert_eq!(back.format_version, 3);
+        assert!(back.auto_managed);
+        assert_eq!(back.queue_position, None);
+        assert_eq!(back.active_time, 3600);
     }
 
     /// A version-2 file (no time counters) still loads, with zero times; the
@@ -251,6 +308,8 @@ mod tests {
         v2.format_version = 2;
         v2.active_time = 0;
         v2.seeding_time = 0;
+        v2.auto_managed = true;
+        v2.queue_position = None;
         // What 0.1.0 wrote: the same dictionary minus the two time keys.
         let bytes = v2.encode();
         let strip = |b: &[u8], needle: &[u8]| -> Vec<u8> {
@@ -262,6 +321,7 @@ mod tests {
         };
         let stripped = strip(&bytes, b"11:active_timei0e");
         let stripped = strip(&stripped, b"12:seeding_timei0e");
+        let stripped = strip(&stripped, b"12:auto_managedi1e");
         assert_ne!(bytes, stripped);
         let back = ResumeData::decode(&stripped).unwrap();
         assert_eq!(back.format_version, 2);
@@ -277,6 +337,8 @@ mod tests {
         let mut v1 = sample();
         v1.format_version = 1;
         v1.file_priorities = Vec::new();
+        v1.auto_managed = true;
+        v1.queue_position = None;
         let bytes = v1.encode();
         assert!(!bytes.windows(15).any(|w| w == b"file_priorities"));
         let back = ResumeData::decode(&bytes).unwrap();

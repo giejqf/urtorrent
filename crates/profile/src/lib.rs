@@ -537,13 +537,13 @@ impl Profile {
         Profile {
             name: "native",
             peer_id: PeerIdShape {
-                prefix: "-UR0600-",
+                prefix: "-UR0700-",
                 tail_alphabet: NATIVE_TAIL_ALPHABET,
                 lifetime: PeerIdLifetime::PerSession,
                 handshake: HandshakePeerId::SameAsAnnounce,
             },
-            user_agent: "urtorrent/0.6.0",
-            ltep_version: "urtorrent 0.6.0",
+            user_agent: "urtorrent/0.7.0",
+            ltep_version: "urtorrent 0.7.0",
             http: HttpAnnounceShape {
                 params: QBT_ANNOUNCE_PARAMS,
                 headers: QBT_ANNOUNCE_HEADERS,
@@ -582,7 +582,7 @@ impl Profile {
             },
             dht: DhtShape {
                 // Our own honest version tag: `UR` + the minor version.
-                version: *b"UR\x00\x06",
+                version: *b"UR\x00\x07",
                 bootstrap_nodes: &["dht.libtorrent.org:25401", "router.bittorrent.com:6881"],
             },
         }
@@ -717,7 +717,7 @@ mod tests {
         }
         assert_eq!(p.peer_id.lifetime, PeerIdLifetime::PerTorrent);
         let n = Profile::native().peer_id.generate(&mut Counter(2));
-        assert_eq!(&n[..8], b"-UR0600-");
+        assert_eq!(&n[..8], b"-UR0700-");
         assert!(n[8..].iter().all(u8::is_ascii_alphanumeric));
     }
 

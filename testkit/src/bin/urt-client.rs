@@ -128,6 +128,8 @@ fn peer_json(p: &urtorrent::PeerInfo) -> serde_json::Value {
         "source": format!("{:?}", p.source),
         "upload_only": p.upload_only,
         "transport": format!("{:?}", p.transport),
+        "am_choking": p.am_choking, "peer_interested": p.peer_interested,
+        "peer_choking": p.peer_choking, "am_interested": p.am_interested,
     })
 }
 
@@ -252,6 +254,9 @@ async fn main() -> Result<()> {
                 "save_path": st.save_path.to_string_lossy(),
                 "total_wanted": st.total_wanted,
                 "total_wanted_done": st.total_wanted_done,
+                "auto_managed": st.auto_managed,
+                "queue_position": st.queue_position,
+                "max_uploads": st.max_uploads,
                 "files": st.files.iter().map(|f| serde_json::json!({
                     "path": f.path, "size": f.size, "priority": f.priority, "done": f.done,
                 })).collect::<Vec<_>>(),

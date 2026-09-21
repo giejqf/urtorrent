@@ -16,7 +16,7 @@ use profile::Profile;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::Error;
-use crate::engine::{self, Command, EngineConfig};
+use crate::engine::{self, Command, EngineConfig, SessionLimit};
 
 /// Message Stream Encryption policy (qBittorrent's "Allow" / "Require" /
 /// "Disable").
@@ -67,6 +67,23 @@ pub struct AddTorrent {
     /// Allocate every content file to its full size up front (`fallocate`)
     /// instead of writing sparse files (default off).
     pub preallocate: bool,
+    /// Upload limit in bytes/s from the start (`0` = unlimited, the
+    /// default); [`Session::set_torrent_rate_limits`] changes it later.
+    pub upload_limit: u64,
+    /// Download limit in bytes/s from the start (`0` = unlimited).
+    pub download_limit: u64,
+    /// Connection cap for this torrent (`None` = the session's
+    /// `max_peers_per_torrent`); [`Session::set_max_peers`] changes it later.
+    pub max_peers: Option<usize>,
+    /// Upload slot cap for this torrent (`None` = only the session-wide
+    /// `unchoke_slots` budget applies); [`Session::set_max_uploads`] changes
+    /// it later.
+    pub max_uploads: Option<usize>,
+    /// Whether the session's [`ActiveLimits`] queue manages this torrent
+    /// (started and stopped to keep within the limits, in queue order).
+    /// `None` keeps the resume data's value, else `true`. `false` is a
+    /// "force start": the torrent runs regardless of the limits.
+    pub auto_managed: Option<bool>,
 }
 
 impl AddTorrent {
@@ -80,6 +97,11 @@ impl AddTorrent {
             sequential: false,
             file_priorities: None,
             preallocate: false,
+            upload_limit: 0,
+            download_limit: 0,
+            max_peers: None,
+            max_uploads: None,
+            auto_managed: None,
         }
     }
 
@@ -93,6 +115,11 @@ impl AddTorrent {
             sequential: false,
             file_priorities: None,
             preallocate: false,
+            upload_limit: 0,
+            download_limit: 0,
+            max_peers: None,
+            max_uploads: None,
+            auto_managed: None,
         }
     }
 
@@ -125,6 +152,88 @@ impl AddTorrent {
         self.file_priorities = Some(prios);
         self
     }
+
+    /// Upload limit in bytes/s from the start (`0` = unlimited).
+    pub fn upload_limit(mut self, bytes_per_sec: u64) -> AddTorrent {
+        self.upload_limit = bytes_per_sec;
+        self
+    }
+
+    /// Download limit in bytes/s from the start (`0` = unlimited).
+    pub fn download_limit(mut self, bytes_per_sec: u64) -> AddTorrent {
+        self.download_limit = bytes_per_sec;
+        self
+    }
+
+    /// Connection cap for this torrent.
+    pub fn max_peers(mut self, n: usize) -> AddTorrent {
+        self.max_peers = Some(n);
+        self
+    }
+
+    /// Upload slot cap for this torrent.
+    pub fn max_uploads(mut self, n: usize) -> AddTorrent {
+        self.max_uploads = Some(n);
+        self
+    }
+
+    /// Whether the active-torrent queue manages this torrent (see the field).
+    pub fn auto_managed(mut self, on: bool) -> AddTorrent {
+        self.auto_managed = Some(on);
+        self
+    }
+}
+
+/// How many torrents may be active at once (libtorrent `active_downloads` /
+/// `active_seeds` / `active_limit`, qBittorrent's "torrent queueing"). A
+/// torrent is *active* when it is running (announcing, connecting); the
+/// others wait in queue order (`TorrentState::Queued`) until a slot frees.
+/// `None` means unlimited, the default for all three, so nothing is queued
+/// unless a limit is set. Auto-managed torrents (`AddTorrent::auto_managed`,
+/// the default) take part; force-started ones run regardless and count
+/// towards the limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ActiveLimits {
+    /// Torrents still downloading that may be active.
+    pub downloads: Option<usize>,
+    /// Complete torrents (seeds) that may be active.
+    pub seeds: Option<usize>,
+    /// Active torrents in total.
+    pub total: Option<usize>,
+    /// Count torrents that move no data towards the limits. Off (the
+    /// default, libtorrent `dont_count_slow_torrents`): a running torrent
+    /// whose rates have stayed below 2 KiB/s for 60 s no longer holds a
+    /// slot, so stalled torrents (no peers, dead trackers) do not block the
+    /// queue; it starts counting again when data flows.
+    pub count_slow: bool,
+}
+
+impl ActiveLimits {
+    /// No limits: every torrent runs.
+    pub const UNLIMITED: ActiveLimits = ActiveLimits {
+        downloads: None,
+        seeds: None,
+        total: None,
+        count_slow: false,
+    };
+
+    /// Whether any limit is set.
+    pub fn is_limited(&self) -> bool {
+        self.downloads.is_some() || self.seeds.is_some() || self.total.is_some()
+    }
+}
+
+/// Where to move a torrent in the queue (`Session::move_in_queue`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMove {
+    /// To the front.
+    Top,
+    /// One place towards the front.
+    Up,
+    /// One place towards the back.
+    Down,
+    /// To the back.
+    Bottom,
 }
 
 /// One content file in a status snapshot.
@@ -153,6 +262,9 @@ pub enum TorrentState {
     Downloading,
     /// Complete; announcing and accepting peers.
     Seeding,
+    /// Waiting for an active slot (`ActiveLimits`): auto-managed and beyond
+    /// the limits, in queue order.
+    Queued,
     /// Stopped by the caller.
     Paused,
     /// Stopped by an error (see `error`).
@@ -250,6 +362,16 @@ pub struct TorrentStatus {
     pub seeding_time: Duration,
     /// Per-torrent connection cap, if set (`Session::set_max_peers`).
     pub max_peers: Option<usize>,
+    /// Upload slot cap set for this torrent (`None` = session budget only).
+    pub max_uploads: Option<usize>,
+    /// Whether the active-torrent queue manages this torrent.
+    pub auto_managed: bool,
+    /// Position in the queue (0 = first, dense across the session's
+    /// torrents): the order in which auto-managed torrents get the
+    /// `ActiveLimits` slots, downloads against `downloads` and seeds against
+    /// `seeds`. libtorrent ranks seeds by its `seed_rank` instead; here the
+    /// caller's order applies to both.
+    pub queue_position: usize,
     /// Time until the earliest scheduled tracker announce, if any.
     pub next_announce_in: Option<Duration>,
 }
@@ -315,6 +437,10 @@ pub struct PeerInfo {
     pub is_seed: bool,
     /// The peer is choking us.
     pub peer_choking: bool,
+    /// We are choking the peer (it holds no upload slot).
+    pub am_choking: bool,
+    /// The peer wants our data.
+    pub peer_interested: bool,
     /// We are interested in the peer.
     pub am_interested: bool,
     /// Outstanding requests to the peer.
@@ -702,6 +828,13 @@ impl SessionBuilder {
         self
     }
 
+    /// How many torrents may be active at once (see [`ActiveLimits`];
+    /// default unlimited).
+    pub fn active_limits(mut self, limits: ActiveLimits) -> Self {
+        self.cfg.active_limits = limits;
+        self
+    }
+
     /// Encryption policy (default: `Enabled`, like the oracle's default).
     pub fn encryption(mut self, mode: EncryptionMode) -> Self {
         self.cfg.encryption = mode;
@@ -938,6 +1071,61 @@ impl Session {
         self.send(|tx| Command::SetMaxPeers(id, max, tx)).await?
     }
 
+    /// Cap this torrent's upload slots (`None` = only the session-wide
+    /// budget applies). Takes effect at the next choking round.
+    pub async fn set_max_uploads(&self, id: TorrentId, max: Option<usize>) -> Result<(), Error> {
+        self.send(|tx| Command::SetMaxUploads(id, max, tx)).await?
+    }
+
+    /// Change the session-wide connection limit
+    /// (`SessionBuilder::max_connections`). Existing connections above the
+    /// limit are kept; no new ones are made until below it.
+    pub async fn set_max_connections(&self, n: usize) -> Result<(), Error> {
+        self.send(|tx| Command::SetSessionLimits(SessionLimit::Connections(n), tx))
+            .await
+    }
+
+    /// Change the default per-torrent connection cap
+    /// (`SessionBuilder::max_peers_per_torrent`) for torrents without a cap
+    /// of their own.
+    pub async fn set_max_peers_per_torrent(&self, n: usize) -> Result<(), Error> {
+        self.send(|tx| Command::SetSessionLimits(SessionLimit::PeersPerTorrent(n), tx))
+            .await
+    }
+
+    /// Change the session-wide unchoke slot budget
+    /// (`SessionBuilder::unchoke_slots`); applied at the next choking round.
+    pub async fn set_unchoke_slots(&self, n: usize) -> Result<(), Error> {
+        self.send(|tx| Command::SetSessionLimits(SessionLimit::UnchokeSlots(n), tx))
+            .await
+    }
+
+    /// Change the active-torrent limits (`SessionBuilder::active_limits`);
+    /// the queue is re-evaluated at once.
+    pub async fn set_active_limits(&self, limits: ActiveLimits) -> Result<(), Error> {
+        self.send(|tx| Command::SetActiveLimits(limits, tx)).await
+    }
+
+    /// Hand a torrent to the queue (`true`: it runs when the
+    /// [`ActiveLimits`] allow, in queue order, and waits as
+    /// `TorrentState::Queued` otherwise) or take it out (`false`: it keeps
+    /// its current running / paused state and is never started or stopped
+    /// by the queue; a running one still counts towards the limits).
+    pub async fn set_auto_managed(&self, id: TorrentId, on: bool) -> Result<(), Error> {
+        self.send(|tx| Command::SetAutoManaged(id, on, tx)).await?
+    }
+
+    /// Start a torrent regardless of the active limits ("force start"):
+    /// takes it out of the queue's hands and resumes it.
+    pub async fn force_resume(&self, id: TorrentId) -> Result<(), Error> {
+        self.send(|tx| Command::ForceResume(id, tx)).await?
+    }
+
+    /// Move a torrent in the queue (`TorrentStatus::queue_position`).
+    pub async fn move_in_queue(&self, id: TorrentId, to: QueueMove) -> Result<(), Error> {
+        self.send(|tx| Command::MoveInQueue(id, to, tx)).await?
+    }
+
     /// The DHT's persistable state (node ids and routing-table nodes) for
     /// [`SessionBuilder::dht_state`]; `None` when the DHT is off. Save it at
     /// shutdown.
@@ -951,12 +1139,16 @@ impl Session {
         self.send(|tx| Command::AddDhtNode(addr, tx)).await
     }
 
-    /// Pause a torrent (sends `stopped`, drops peers).
+    /// Pause a torrent (sends `stopped`, drops peers). The torrent leaves
+    /// the queue's hands (`auto_managed = false`) so it stays paused until
+    /// resumed.
     pub async fn pause(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::Pause(id, tx)).await?
     }
 
-    /// Resume a paused torrent.
+    /// Resume a paused torrent under the queue (`auto_managed = true`): it
+    /// starts when the [`ActiveLimits`] allow, else waits as
+    /// `TorrentState::Queued`. [`Session::force_resume`] bypasses the queue.
     pub async fn resume(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::Resume(id, tx)).await?
     }
@@ -987,7 +1179,8 @@ impl Session {
     }
 
     /// Add a peer address to try (libtorrent `connect_peer`): a manual
-    /// source alongside trackers, PEX and LSD.
+    /// source alongside trackers, PEX and LSD, dialled at the next tick
+    /// even if an earlier attempt put the address in reconnect backoff.
     pub async fn add_peer(&self, id: TorrentId, addr: SocketAddr) -> Result<(), Error> {
         self.send(|tx| Command::AddPeer(id, addr, tx)).await?
     }

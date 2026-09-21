@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-09-21
+
+The configuration a client needs from the library, checked against what
+qBittorrent maps onto libtorrent (`docs/config.md`): the active-torrent
+queue, per-torrent upload slots, add-time limits and runtime changes of the
+session limits. Frontend policy (share limits, schedulers, categories) stays
+out by design.
+
+### Added
+
+- The active-torrent queue (ADR 0009, docs/quirks.md Q26):
+  `ActiveLimits { downloads, seeds, total, count_slow }` via
+  `SessionBuilder::active_limits` / `Session::set_active_limits` (default
+  unlimited); per torrent `AddTorrent::auto_managed`,
+  `Session::set_auto_managed`, `force_resume`, `move_in_queue(QueueMove)`;
+  `TorrentState::Queued`; `TorrentStatus::{auto_managed, queue_position}`.
+  `pause` takes a torrent out of the queue, `resume` hands it back (it may
+  wait as `Queued`). Slow torrents (below 2 KiB/s for 60 s) hold no slot
+  unless `count_slow`. Resume data format 4 persists `auto_managed` and the
+  queue order (format 1–3 files still load).
+- Per-torrent upload slots: `AddTorrent::max_uploads`,
+  `Session::set_max_uploads`, `TorrentStatus::max_uploads` (the choker
+  yields a capped torrent's slots to the next torrent's peers).
+- Add-time limits: `AddTorrent::{upload_limit, download_limit, max_peers}`.
+- Runtime session limits: `Session::{set_max_connections,
+  set_max_peers_per_torrent, set_unchoke_slots}`.
+- `PeerInfo::{am_choking, peer_interested}` (both directions of choke and
+  interest are now reported).
+- `docs/config.md`: library knobs, frontend responsibilities, and what is
+  deliberately not offered.
+
+### Changed
+
+- `Session::add_peer` dials the address at the next tick even when an
+  earlier attempt left it in reconnect backoff (libtorrent `connect_peer`).
+- The reconnect backoff after a disconnect counts from the time the
+  connection was made, not from the disconnect (libtorrent
+  `min_reconnect_time` against `last_connected`): a peer that was connected
+  for over a minute is redialled at once after a pause / resume.
+- A `resume` during a pause's wind-down (`stopped` announces in flight) is
+  applied once the pause completes instead of overlapping two lifecycles.
+- The `native` profile's identity strings are `-UR0700-` / `urtorrent/0.7.0`
+  / DHT `UR\x00\x07`.
+
 ## [0.6.0] - 2026-09-21
 
 Gates for dual-stack edge cases and user-space copies on the data path, and

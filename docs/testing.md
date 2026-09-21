@@ -5,7 +5,7 @@
 | Layer | Where | Command |
 |---|---|---|
 | Unit / property | each crate's `tests` + `proptest` | `cargo xtask check` |
-| In-process gates | `crates/session/tests` (`copies.rs`: copy budgets; `dualstack.rs`, `selfconn.rs`: dual-stack edge cases; `utp.rs`, `dht.rs`, `extensions.rs`, ...) | `cargo xtask check` |
+| In-process gates | `crates/session/tests` (`copies.rs`: copy budgets; `dualstack.rs`, `selfconn.rs`: dual-stack edge cases; `queue.rs`: the active-torrent queue and limits; `utp.rs`, `dht.rs`, `extensions.rs`, ...) | `cargo xtask check` |
 | Fuzz | `fuzz/` | `cargo xtask fuzz <target> [secs]` |
 | Replay | crate tests fed from `testkit/golden` | `cargo xtask check` |
 | Integration | `testkit/src/scenario` | `cargo xtask it [--shape v4\|v6\|dual] [scenario]` |

@@ -8,8 +8,9 @@ enough that trackers and peers see nothing unusual.
 Read [AGENTS.md](AGENTS.md) first: it is the project charter (scope, rules,
 architecture, milestones). Design decisions live in [docs/adr](docs/adr),
 oracle-vs-BEP disagreements in [docs/quirks.md](docs/quirks.md), the test
-layers in [docs/testing.md](docs/testing.md) and soak/perf baselines in
-[docs/perf.md](docs/perf.md).
+layers in [docs/testing.md](docs/testing.md), soak/perf baselines in
+[docs/perf.md](docs/perf.md) and the configuration a client gets from the
+library (versus what stays in the frontend) in [docs/config.md](docs/config.md).
 
 ## Status
 
@@ -24,6 +25,7 @@ layers in [docs/testing.md](docs/testing.md) and soak/perf baselines in
 | M6 Extensions | done: PEX, `ut_metadata` / magnets, `upload_only`, LSD, web seeds, BEP 40; private torrents proven silent on the wire (Q11); scenarios green in v4 / v6 |
 | M7 Hardening | done: file priorities with a parts file + move storage (Tier 1), torrent files opened on the ring, `xtask syscalls` on a real session, `xtask soak` (20 GiB loopback, 500 torrents), fuzz time, API review; **0.1.0** |
 | 0.3.0 DHT | done: `crates/dht` (BEP 5 / 42 / 43 / 51 sans-IO node ported from libtorrent), engine integration on the listen port's UDP demux, `port` messages, per-actor /24s in the lab, `tap-dht`, `dht_leech_from_oracle` / `dht_seed_to_oracle` / `dht_shape` green (our node is indistinguishable from the oracle's on every probed shape); **0.3.0** |
+| 0.7.0 Configuration | done: the active-torrent queue (`ActiveLimits`: max active downloads / seeds / total, slow-torrent exemption, queue order and moves, force start, persisted in resume data v4; ADR 0009), per-torrent upload slots, add-time rate / peer limits, runtime session limits, both choke directions in `PeerInfo`; `docs/config.md` records what the library offers and what is the frontend's; **0.7.0** |
 | 0.6.0 Gates | done: user-space copy budgets counted (`SessionStats::copied_bytes`) and gated (TCP download 1 copy / byte, upload 0, uTP 2 each way; receive path parses frames in place), dual-stack edge cases gated in-process (one connection per peer over both families, family-less engines never dial the other family, v4-mapped addresses normalised, self-connections recognised under per-connection peer ids) and in the lab (dual / v6 shapes for the discovery, magnet, DHT, uTP and tracker scenarios); BEP 52 dropped from the roadmap; **0.6.0** |
 | 0.5.0 Magnet / LTEP | done: BEP 9 `x.pe` peers, `ws` web seeds and BEP 53 `so=` in magnet links, tracker-less magnets resolved through the DHT (`magnet_dht_from_oracle`), BEP 10 additive re-handshakes and `reqq` honoured, BEP 11 seed flag aligned with libtorrent, `capture_magnet_private` / `magnet_private_shape` (private torrents keep BEP 10 and drop only discovery, Q11); **0.5.0** |
 | 0.4.0 uTP | done: `crates/utp` (BEP 29 sans-IO transport ported from libtorrent's `utp_stream`: LEDBAT, selective acks, path-MTU probing, close reasons), `Transport::Utp` on the UDP listen socket with multishot `recvmsg` and an ordered send queue, `TransportPolicy` (TCP first by default, uTP for what TCP cannot reach; libtorrent's uTP-first order on request), `capture_utp` goldens, `utp_leech_from_oracle` / `utp_seed_to_oracle` / `utp_shape` green; **0.4.0** |

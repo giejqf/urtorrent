@@ -496,3 +496,39 @@ PEX hands us our own listen address.
   ban of the peer entry. A tracker or PEX peer handing back our other
   family's address while we listen on the unspecified address is the common
   trigger.
+
+## Q26. The active-torrent queue
+
+Source: libtorrent 2.0.14 `session_impl.cpp`
+(`recalculate_auto_managed_torrents`, `auto_manage_torrents`), `torrent.cpp`
+(`seed_rank`, `is_inactive`); settings `active_downloads` / `active_seeds` /
+`active_limit`, `dont_count_slow_torrents`, `inactive_down_rate` /
+`inactive_up_rate` (2 KiB/s), `auto_manage_startup` (60 s),
+`auto_manage_interval` (30 s). qBittorrent's "torrent queueing" is this
+mechanism with its own defaults (3 / 3 / 5) and "pause" implemented as
+"unset auto-managed, then pause"; "resume" as "set auto-managed"; "force
+resume" as "unset auto-managed, resume".
+
+What matches: the three limits and their meaning, auto-managed torrents
+started in queue order and stopped beyond the limits, force-started
+torrents running regardless but charged, the slow-torrent exemption (a
+running torrent below 2 KiB/s both ways for 60 s holds no slot; on by
+default), pause / resume / force-resume semantics, `queue_position` and
+`auto_managed` persisted in resume data.
+
+What differs (L3, deliberate):
+
+- **Seeds are ordered by queue position, not `seed_rank`.** libtorrent
+  ranks finished torrents by a score (recently started, below share limits,
+  scrape data, time seeded) and gives them no queue position. Here every
+  torrent has a position and the caller's order applies to seeds too, which
+  is predictable and lets a frontend implement any seed policy by moving
+  torrents.
+- **Re-evaluated once a second** (and at once on every limit change,
+  move, resume or state change) instead of every 30 s.
+- **The default is unlimited** (nothing queued until a limit is set);
+  libtorrent's defaults are 3 / 5 / 15 with new torrents auto-managed.
+- **A torrent stopped by the queue redials its peers under libtorrent's
+  `min_reconnect_time`** (60 s counted from when the connection was made,
+  like any other disconnect; a connection older than that is redialled at
+  once); `Session::add_peer` dials at once.

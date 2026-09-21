@@ -19,6 +19,7 @@ mod lsd;
 mod metadata;
 mod peer;
 mod pex;
+mod queue;
 mod rate;
 mod rng;
 mod tls;
@@ -43,7 +44,8 @@ use uring::{Notifier, NotifyHandle, Runtime, TcpListener};
 
 use crate::Error;
 use crate::api::{
-    AddTorrent, Event, PeerInfo, SessionStats, TorrentId, TorrentStatus, TrackerStatus,
+    ActiveLimits, AddTorrent, Event, PeerInfo, QueueMove, SessionStats, TorrentId, TorrentStatus,
+    TrackerStatus,
 };
 use dns::Dns;
 use local::{Either, Flag, select2};
@@ -68,6 +70,8 @@ pub struct EngineConfig {
     pub download_rate: u64,
     /// Session-wide unchoke slots.
     pub unchoke_slots: usize,
+    /// Active-torrent queue limits (default unlimited).
+    pub active_limits: ActiveLimits,
     /// Extra CA certificates (PEM bundles) trusted for HTTPS trackers.
     pub extra_roots: Vec<Vec<u8>>,
     /// MSE policy.
@@ -137,6 +141,7 @@ impl Default for EngineConfig {
             upload_rate: 0,
             download_rate: 0,
             unchoke_slots: choker::DEFAULT_SLOTS,
+            active_limits: ActiveLimits::UNLIMITED,
             extra_roots: Vec::new(),
             encryption: crate::api::EncryptionMode::Enabled,
             pex: true,
@@ -160,6 +165,14 @@ impl Default for EngineConfig {
 }
 
 /// Messages from `Session` handles.
+/// A session-wide limit changed at runtime.
+#[derive(Debug, Clone, Copy)]
+pub enum SessionLimit {
+    Connections(usize),
+    PeersPerTorrent(usize),
+    UnchokeSlots(usize),
+}
+
 pub enum Command {
     AddTorrent(Box<AddTorrent>, oneshot::Sender<Result<TorrentId, Error>>),
     /// Remove; `true` deletes the content files too.
@@ -172,6 +185,12 @@ pub enum Command {
     AddTracker(TorrentId, String, usize, oneshot::Sender<Result<(), Error>>),
     RemoveTracker(TorrentId, String, oneshot::Sender<Result<(), Error>>),
     SetMaxPeers(TorrentId, Option<usize>, oneshot::Sender<Result<(), Error>>),
+    SetMaxUploads(TorrentId, Option<usize>, oneshot::Sender<Result<(), Error>>),
+    SetSessionLimits(SessionLimit, oneshot::Sender<()>),
+    SetActiveLimits(ActiveLimits, oneshot::Sender<()>),
+    SetAutoManaged(TorrentId, bool, oneshot::Sender<Result<(), Error>>),
+    ForceResume(TorrentId, oneshot::Sender<Result<(), Error>>),
+    MoveInQueue(TorrentId, QueueMove, oneshot::Sender<Result<(), Error>>),
     DhtState(oneshot::Sender<Option<Vec<u8>>>),
     AddDhtNode(SocketAddr, oneshot::Sender<()>),
     Status(TorrentId, oneshot::Sender<Result<TorrentStatus, Error>>),
@@ -249,6 +268,14 @@ pub struct Ctx {
     skeys: RefCell<mse::SkeyIndex>,
     /// Connections plus dials in progress across every torrent.
     connections: Cell<usize>,
+    /// Session-wide connection limit (`Session::set_max_connections`).
+    max_connections: Cell<usize>,
+    /// Default per-torrent connection cap (`Session::set_max_peers_per_torrent`).
+    max_peers: Cell<usize>,
+    /// Active-torrent queue limits (`Session::set_active_limits`).
+    active_limits: Cell<ActiveLimits>,
+    /// Next queue position handed to an added torrent.
+    next_queue_position: Cell<u64>,
     /// Payload bytes copied in user space by connections since closed (live
     /// ones are summed at query time; see `SessionStats::copied_bytes`).
     copied: Cell<u64>,
@@ -363,6 +390,39 @@ impl Ctx {
     /// dial started / ended.
     pub fn connection_opened(&self) {
         self.connections.set(self.connections.get() + 1);
+    }
+
+    /// Session-wide connection limit.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections.get()
+    }
+
+    /// Default per-torrent connection cap.
+    pub fn default_max_peers(&self) -> usize {
+        self.max_peers.get()
+    }
+
+    /// The active-torrent limits.
+    pub fn active_limits(&self) -> ActiveLimits {
+        self.active_limits.get()
+    }
+
+    /// A fresh queue position at the back of the queue.
+    pub fn next_queue_position(&self) -> u64 {
+        let p = self.next_queue_position.get();
+        self.next_queue_position.set(p + 1);
+        p
+    }
+
+    /// Positions were renumbered `0..n`: hand out `n` next.
+    pub fn reset_queue_positions(&self, n: u64) {
+        self.next_queue_position.set(n);
+    }
+
+    /// A position restored from resume data: later additions go behind it.
+    pub fn note_queue_position(&self, q: u64) {
+        let next = self.next_queue_position.get();
+        self.next_queue_position.set(next.max(q.saturating_add(1)));
     }
 
     /// `ip` is one of ours (see `own_ips`).
@@ -679,6 +739,10 @@ pub fn run(
             by_hash: RefCell::new(HashMap::new()),
             skeys: RefCell::new(mse::SkeyIndex::new()),
             connections: Cell::new(0),
+            max_connections: Cell::new(cfg.max_connections),
+            max_peers: Cell::new(cfg.max_peers),
+            active_limits: Cell::new(cfg.active_limits),
+            next_queue_position: Cell::new(0),
             copied: Cell::new(0),
             own_ips: RefCell::new(HashSet::new()),
             ticks: RefCell::new(std::collections::BinaryHeap::new()),
@@ -822,6 +886,7 @@ async fn ticker(ctx: Rc<Ctx>) {
             if let Some(d) = ctx.dht.clone() {
                 d.tick(&ctx, now);
             }
+            queue::recalculate(&ctx, now);
         }
         if now.duration_since(last_choke) >= choker::UNCHOKE_INTERVAL {
             last_choke = now;
@@ -849,6 +914,14 @@ async fn ticker(ctx: Rc<Ctx>) {
             }
         }
     }
+}
+
+/// A torrent's dense queue position from `queue::positions`.
+fn queue_index(positions: &[(TorrentId, usize)], id: TorrentId) -> usize {
+    positions
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map_or(0, |(_, p)| *p)
 }
 
 fn peer_choke_key(torrent: TorrentId, peer: u32) -> u64 {
@@ -880,6 +953,8 @@ fn choke_round(ctx: &Ctx, torrents: &[Rc<RefCell<torrent::Torrent>>], rotate: bo
                 download_rate: p.download_rate(),
                 seeding,
                 peer_is_seed: p.is_seed(n),
+                torrent: t.id.0,
+                max_uploads: t.max_uploads,
             });
             handles.insert(key, p.clone());
         }
@@ -920,11 +995,23 @@ pub fn maybe_unchoke_now(
                 .count()
         })
         .sum();
-    let (running, n) = {
+    let (running, n, under_cap) = {
         let t = torrent.borrow();
-        (t.is_running(), t.piece_count())
+        let own = t
+            .peers
+            .values()
+            .filter(|p| {
+                let (est, _, choked) = p.choke_state();
+                est && !choked
+            })
+            .count();
+        (
+            t.is_running(),
+            t.piece_count(),
+            t.max_uploads.is_none_or(|cap| own < cap),
+        )
     };
-    if running && unchoked < ctx.slots.get() && !handle.is_seed(n) {
+    if running && under_cap && unchoked < ctx.slots.get() && !handle.is_seed(n) {
         handle.set_choked(false, Instant::now());
     }
 }
@@ -967,6 +1054,9 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         }
         Command::PauseAll(reply) => {
             let all: Vec<Rc<RefCell<Torrent>>> = ctx.torrents.borrow().values().cloned().collect();
+            for t in &all {
+                t.borrow_mut().auto_managed = false;
+            }
             let ctx2 = ctx.clone();
             uring::spawn(async move {
                 for t in all {
@@ -978,8 +1068,9 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         Command::ResumeAll(reply) => {
             let all: Vec<Rc<RefCell<Torrent>>> = ctx.torrents.borrow().values().cloned().collect();
             for t in all {
-                torrent::resume(ctx, &t);
+                queue::mark_eligible(&t);
             }
+            queue::recalculate(ctx, Instant::now());
             let _ = reply.send(());
         }
         Command::AddTracker(id, url, tier, reply) => match ctx.torrent(id) {
@@ -1028,6 +1119,51 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             }
             let _ = reply.send(());
         }
+        Command::SetMaxUploads(id, max, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                t.borrow_mut().max_uploads = max;
+                let _ = reply.send(Ok(()));
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::SetSessionLimits(limit, reply) => {
+            match limit {
+                SessionLimit::Connections(n) => ctx.max_connections.set(n.max(1)),
+                SessionLimit::PeersPerTorrent(n) => ctx.max_peers.set(n.max(1)),
+                SessionLimit::UnchokeSlots(n) => ctx.slots.set(n),
+            }
+            let _ = reply.send(());
+        }
+        Command::SetActiveLimits(limits, reply) => {
+            ctx.active_limits.set(limits);
+            queue::recalculate(ctx, Instant::now());
+            let _ = reply.send(());
+        }
+        Command::SetAutoManaged(id, on, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                queue::set_auto_managed(ctx, &t, on);
+                let _ = reply.send(Ok(()));
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::ForceResume(id, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                t.borrow_mut().auto_managed = false;
+                torrent::resume(ctx, &t);
+                let _ = reply.send(Ok(()));
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::MoveInQueue(id, to, reply) => {
+            let r = queue::move_in_queue(ctx, id, to);
+            let _ = reply.send(r);
+        }
         Command::SetMaxPeers(id, max, reply) => match ctx.torrent(id) {
             Some(t) => {
                 t.borrow_mut().max_peers = max;
@@ -1039,6 +1175,9 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         },
         Command::Pause(id, reply) => match ctx.torrent(id) {
             Some(t) => {
+                // A paused auto-managed torrent would be restarted by the
+                // queue: pausing takes it out of the queue's hands.
+                t.borrow_mut().auto_managed = false;
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
                     torrent::pause(&ctx2, &t).await;
@@ -1051,7 +1190,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         },
         Command::Resume(id, reply) => match ctx.torrent(id) {
             Some(t) => {
-                torrent::resume(ctx, &t);
+                queue::set_auto_managed(ctx, &t, true);
                 let _ = reply.send(Ok(()));
             }
             None => {
@@ -1059,19 +1198,27 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             }
         },
         Command::Status(id, reply) => {
+            let positions = queue::positions(ctx);
             let r = ctx
                 .torrent(id)
-                .map(|t| t.borrow().status(Instant::now()))
+                .map(|t| {
+                    t.borrow()
+                        .status(Instant::now(), queue_index(&positions, id))
+                })
                 .ok_or(Error::NoSuchTorrent);
             let _ = reply.send(r);
         }
         Command::Statuses(reply) => {
             let now = Instant::now();
+            let positions = queue::positions(ctx);
             let mut v: Vec<TorrentStatus> = ctx
                 .torrents
                 .borrow()
                 .values()
-                .map(|t| t.borrow().status(now))
+                .map(|t| {
+                    let t = t.borrow();
+                    t.status(now, queue_index(&positions, t.id))
+                })
                 .collect();
             v.sort_by_key(|s| s.id);
             let _ = reply.send(v);
@@ -1136,8 +1283,13 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         },
         Command::AddPeer(id, addr, reply) => match ctx.torrent(id) {
             Some(t) => {
-                t.borrow_mut()
-                    .add_candidates(ctx, &[addr], crate::api::PeerSource::Manual);
+                {
+                    let mut tb = t.borrow_mut();
+                    tb.add_candidates(ctx, &[addr], crate::api::PeerSource::Manual);
+                    // An explicit request: dial now, whatever the backoff
+                    // from an earlier attempt (libtorrent `connect_peer`).
+                    tb.allow_reconnect_now(torrent::canonical_addr(addr));
+                }
                 torrent::on_new_candidates(ctx, &t);
                 let _ = reply.send(Ok(()));
             }
@@ -1204,7 +1356,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
                     tracker_task::scrape_all(&ctx2, &t).await;
-                    let st = t.borrow().status(Instant::now());
+                    let st = t.borrow().status(Instant::now(), 0);
                     let _ = reply.send(Ok(st.trackers));
                 });
             }

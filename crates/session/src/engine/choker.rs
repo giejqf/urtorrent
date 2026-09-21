@@ -43,6 +43,11 @@ pub struct Candidate {
     pub seeding: bool,
     /// The peer is itself a seed (never worth a slot).
     pub peer_is_seed: bool,
+    /// The peer's torrent (for the per-torrent cap).
+    pub torrent: u64,
+    /// Upload slot cap of the peer's torrent (`None` = the session budget
+    /// alone; libtorrent `max_uploads`).
+    pub max_uploads: Option<usize>,
 }
 
 /// What to do after a round.
@@ -88,13 +93,36 @@ pub fn round(
     };
     eligible.sort_by_key(|p| key(p));
     let regular_slots = if slots == 1 { 1 } else { slots - 1 };
-    let mut unchoked: Vec<u64> = eligible.iter().take(regular_slots).map(|p| p.key).collect();
+    // Per-torrent caps: a torrent at its `max_uploads` yields its place in
+    // the ranking to the next torrent's peers (the optimistic slot counts).
+    let mut per_torrent: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut capped = |p: &Candidate| -> bool {
+        let n = per_torrent.entry(p.torrent).or_insert(0);
+        if p.max_uploads.is_some_and(|cap| *n >= cap) {
+            return true;
+        }
+        *n += 1;
+        false
+    };
+    let mut unchoked: Vec<u64> = Vec::new();
+    for p in &eligible {
+        if unchoked.len() >= regular_slots {
+            break;
+        }
+        if !capped(p) {
+            unchoked.push(p.key);
+        }
+    }
     // Optimistic slot (only when there is a slot to spare).
     if slots > 1 {
         let rest: Vec<&Candidate> = eligible
             .iter()
             .copied()
             .filter(|p| !unchoked.contains(&p.key))
+            .filter(|p| {
+                p.max_uploads
+                    .is_none_or(|cap| per_torrent.get(&p.torrent).copied().unwrap_or(0) < cap)
+            })
             .collect();
         let keep_current =
             current_optimistic.filter(|k| !rotate_optimistic && rest.iter().any(|p| p.key == *k));
@@ -138,7 +166,39 @@ mod tests {
             download_rate: rate,
             seeding: false,
             peer_is_seed: false,
+            torrent: 0,
+            max_uploads: None,
         }
+    }
+
+    #[test]
+    fn per_torrent_cap_yields_slots_to_other_torrents() {
+        // Torrent 1 (cap 1) has the two fastest peers; torrent 2 no cap.
+        let mut peers = vec![
+            cand(1, true, true, 500),
+            cand(2, true, true, 400),
+            cand(3, true, true, 300),
+            cand(4, true, true, 200),
+        ];
+        for p in &mut peers[..2] {
+            p.torrent = 1;
+            p.max_uploads = Some(1);
+        }
+        for p in &mut peers[2..] {
+            p.torrent = 2;
+        }
+        let d = round(&peers, 3, None, true);
+        // Regular slots: 1 (torrent 1), 3 (torrent 2); optimistic: 4 (peer 2
+        // is capped out).
+        assert_eq!(d.unchoke.len(), 3);
+        assert!(d.unchoke.contains(&1) && d.unchoke.contains(&3) && d.unchoke.contains(&4));
+        assert_eq!(d.optimistic, Some(4));
+        // A cap of 0 gives a torrent's peers nothing at all.
+        for p in &mut peers[..2] {
+            p.max_uploads = Some(0);
+        }
+        let d = round(&peers, 3, None, true);
+        assert!(!d.unchoke.contains(&1) && !d.unchoke.contains(&2));
     }
 
     #[test]
@@ -191,6 +251,8 @@ mod tests {
                 download_rate: 0,
                 seeding: true,
                 peer_is_seed: false,
+                torrent: 0,
+                max_uploads: None,
             })
             .collect();
         let d = round(&peers, 2, None, true);

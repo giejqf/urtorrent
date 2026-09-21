@@ -69,7 +69,7 @@ pub struct PeerHandle {
     up_rate: Cell<u64>,
     up_rate_mark: Cell<u64>,
     /// When the connection was set up.
-    opened_at: Instant,
+    pub opened_at: Instant,
     /// Requests from the peer waiting to be read from disk and sent.
     upload_queue: RefCell<VecDeque<Request>>,
     upload_notify: Rc<Notify>,
@@ -266,6 +266,8 @@ impl PeerHandle {
             },
             is_seed: have.is_seed(pieces),
             peer_choking: conn.peer_choking(),
+            am_choking: conn.am_choking(),
+            peer_interested: conn.peer_interested(),
             am_interested: conn.am_interested(),
             outstanding: conn.outstanding().len(),
             encrypted: self.encrypted.get(),
@@ -810,8 +812,8 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
         if t.closing.is_set()
             || !t.is_running()
             || t.is_banned(addr.ip())
-            || t.peers.len() >= ctx.cfg.max_peers
-            || ctx.connection_count() >= ctx.cfg.max_connections
+            || t.peers.len() >= t.max_peers(&ctx)
+            || ctx.connection_count() >= ctx.max_connections()
         {
             return;
         }
@@ -1108,9 +1110,11 @@ async fn finish_connection(
             t.mse_retry.remove(&addr);
             t.note_disconnect(addr, Instant::now());
         } else {
-            // Do not dial this address again right away (libtorrent's
-            // `min_reconnect_time`).
-            t.note_disconnect(addr, Instant::now());
+            // Do not dial this address again right away: libtorrent's
+            // `min_reconnect_time` counts from the last connection *attempt*
+            // (`torrent_peer::last_connected`), so a connection that lived
+            // longer than that may be redialled at once.
+            t.note_disconnect(addr, handle.opened_at);
         }
         t.id
     };

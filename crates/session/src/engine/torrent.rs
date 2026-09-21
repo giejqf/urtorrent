@@ -118,6 +118,26 @@ pub struct Torrent {
     pub peer_id: [u8; 20],
     /// Stopped by the caller.
     pub paused: bool,
+    /// Paused by the active-torrent queue, not the caller
+    /// (`TorrentState::Queued`); implies `paused`.
+    pub auto_paused: bool,
+    /// A pause is winding the torrent down (`stopped` announces in flight);
+    /// a resume meanwhile only clears `paused`, and the pause restarts the
+    /// tasks when it is done.
+    pub stopping: bool,
+    /// The queue may start and stop this torrent.
+    pub auto_managed: bool,
+    /// `auto_managed` came from `AddTorrent` (not to be overridden by the
+    /// resume data).
+    pub auto_managed_explicit: bool,
+    /// Order in the queue (lower first; dense positions are computed for
+    /// status).
+    pub queue_position: u64,
+    /// Since when both rates have been below the queue's inactivity
+    /// thresholds while running.
+    pub slow_since: Option<Instant>,
+    /// Per-torrent upload slot cap (`None` = session budget only).
+    pub max_uploads: Option<usize>,
     /// Per-torrent connection cap (`None` = the session default).
     pub max_peers: Option<usize>,
     /// Preallocate files when creating them (`fallocate`).
@@ -210,7 +230,7 @@ impl Torrent {
 
     /// Connection cap for this torrent.
     pub fn max_peers(&self, ctx: &Ctx) -> usize {
-        self.max_peers.unwrap_or(ctx.cfg.max_peers)
+        self.max_peers.unwrap_or(ctx.default_max_peers())
     }
 
     /// Total active / seeding time including the current run.
@@ -274,7 +294,11 @@ impl Torrent {
                 TorrentState::Checking
             }
         } else if self.paused {
-            TorrentState::Paused
+            if self.auto_paused {
+                TorrentState::Queued
+            } else {
+                TorrentState::Paused
+            }
         } else if self.info.is_none() {
             TorrentState::FetchingMetadata
         } else if self.picker.is_complete() {
@@ -287,6 +311,18 @@ impl Torrent {
     /// Peers may be connected and served.
     pub fn is_running(&self) -> bool {
         !self.paused && !self.checking && self.error.is_none()
+    }
+
+    /// Running for a while and moving no data (the queue's slow-torrent
+    /// exemption, libtorrent `dont_count_slow_torrents`).
+    pub fn is_inactive(&self, now: Instant) -> bool {
+        let started = self
+            .active_since
+            .is_some_and(|s| now.duration_since(s) >= super::queue::INACTIVE_AFTER);
+        started
+            && self
+                .slow_since
+                .is_some_and(|s| now.duration_since(s) >= super::queue::INACTIVE_AFTER)
     }
 
     /// The tick / tracker tasks keep running (checking included).
@@ -304,7 +340,7 @@ impl Torrent {
         self.picker.bytes_left()
     }
 
-    pub fn status(&self, now: Instant) -> TorrentStatus {
+    pub fn status(&self, now: Instant, queue_position: usize) -> TorrentStatus {
         let trackers = self
             .announcer
             .snapshot()
@@ -353,6 +389,9 @@ impl Torrent {
             active_time: self.times(now).0,
             seeding_time: self.times(now).1,
             max_peers: self.max_peers,
+            max_uploads: self.max_uploads,
+            auto_managed: self.auto_managed,
+            queue_position,
             next_announce_in: self
                 .announcer
                 .snapshot()
@@ -480,9 +519,11 @@ impl Torrent {
         self.banned.contains(&ip)
     }
 
-    /// A connect failed or a connection ended: back this address off.
-    pub fn note_disconnect(&mut self, addr: SocketAddr, now: Instant) {
-        self.failed.insert(addr, now);
+    /// A connect failed or a connection ended: back this address off for
+    /// `RECONNECT_BACKOFF` from `attempted` (the time the connection was
+    /// made or tried).
+    pub fn note_disconnect(&mut self, addr: SocketAddr, attempted: Instant) {
+        self.failed.insert(addr, attempted);
     }
 
     /// Let the next tick dial `addr` again immediately (libtorrent's
@@ -679,7 +720,15 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         announce_key: ctx.new_announce_key(),
         peer_id: ctx.new_torrent_peer_id(),
         paused: params.paused,
-        max_peers: None,
+        auto_paused: false,
+        stopping: false,
+        // Resume data may say otherwise (`load_resume`); the caller wins.
+        auto_managed: params.auto_managed.unwrap_or(true),
+        auto_managed_explicit: params.auto_managed.is_some(),
+        queue_position: ctx.next_queue_position(),
+        slow_since: None,
+        max_uploads: params.max_uploads,
+        max_peers: params.max_peers,
         preallocate: params.preallocate,
         active_time: Duration::ZERO,
         active_since: None,
@@ -689,8 +738,8 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         check_queued: false,
         error: None,
         stats: Stats::default(),
-        up_limit: Limiter::new(0, now),
-        down_limit: Limiter::new(0, now),
+        up_limit: Limiter::new(params.upload_limit, now),
+        down_limit: Limiter::new(params.download_limit, now),
         peers: HashMap::new(),
         candidates: VecDeque::new(),
         candidates_dirty: false,
@@ -722,7 +771,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
     ctx.emit(Event::TorrentAdded { id });
     match parsed {
         Some((info, raw)) => {
-            let resume = load_resume(&torrent);
+            let resume = load_resume(&ctx, &torrent);
             if let Err(e) = attach_metadata(&ctx, &torrent, info, raw, resume.as_ref()) {
                 ctx.remove_torrent_entry(id);
                 return Err(e);
@@ -746,7 +795,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
             // fetch the metadata from. BEP 9 `x.pe` peers are dialled right
             // away (host names through the DNS helper).
             if !params.paused {
-                start_tasks(&ctx, &torrent);
+                super::queue::activate(&ctx, &torrent);
             }
             if let Some(m) = &magnet {
                 for peer in m.peers.clone() {
@@ -792,12 +841,26 @@ fn wanted_files_present(torrent: &Rc<RefCell<Torrent>>) -> bool {
 }
 
 /// Load the resume file, if any (unreadable data is ignored with a warning).
-fn load_resume(torrent: &Rc<RefCell<Torrent>>) -> Option<ResumeData> {
+fn load_resume(ctx: &Ctx, torrent: &Rc<RefCell<Torrent>>) -> Option<ResumeData> {
     let path = torrent.borrow().resume_path.clone()?;
-    ResumeData::load(&path).unwrap_or_else(|e| {
+    let r = ResumeData::load(&path).unwrap_or_else(|e| {
         tracing::warn!("ignoring unreadable resume data {}: {e}", path.display());
         None
-    })
+    })?;
+    // The queue fields: the caller's `AddTorrent::auto_managed` wins over the
+    // file's; the saved order is restored (positions are dense per session,
+    // so a restored key only orders the torrent among the others restored).
+    {
+        let mut t = torrent.borrow_mut();
+        if !t.auto_managed_explicit {
+            t.auto_managed = r.auto_managed;
+        }
+        if let Some(q) = r.queue_position {
+            t.queue_position = q;
+            ctx.note_queue_position(q);
+        }
+    }
+    Some(r)
 }
 
 /// Expand content-file priorities to one entry per `info.files` (padding
@@ -897,7 +960,7 @@ pub async fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec
         fail_torrent(ctx, torrent, "v2-only metadata (BEP 52) is deferred".into());
         return;
     }
-    let resume = load_resume(torrent);
+    let resume = load_resume(ctx, torrent);
     if let Err(e) = attach_metadata(ctx, torrent, info, raw, resume.as_ref()) {
         fail_torrent(ctx, torrent, e.to_string());
         return;
@@ -1051,7 +1114,7 @@ fn finish_check(
         pieces_have: have.count(),
     });
     if start {
-        start_tasks(ctx, torrent);
+        super::queue::activate(ctx, torrent);
     } else if running {
         // Peers connected during the metadata fetch learn our have-set and
         // get requests; trackers hear the real `left`.
@@ -1132,7 +1195,7 @@ fn finish_check_after_recheck(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, hav
         kick.notify();
         on_new_candidates(ctx, torrent);
     } else if !torrent.borrow().paused {
-        start_tasks(ctx, torrent);
+        super::queue::activate(ctx, torrent);
     }
 }
 
@@ -1167,8 +1230,10 @@ pub fn resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
         if !t.paused || t.error.is_some() {
             return;
         }
-        if t.checking {
-            // `finish_check` starts the tasks once the check completes.
+        t.auto_paused = false;
+        if t.checking || t.stopping {
+            // `finish_check` (or the pause winding down) starts the tasks
+            // once it completes.
             t.paused = false;
             return;
         }
@@ -1180,12 +1245,22 @@ pub fn resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
 pub async fn pause(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
     {
         let mut t = torrent.borrow_mut();
-        if t.paused {
+        if t.paused || t.stopping {
             return;
         }
         t.paused = true;
+        t.stopping = true;
     }
     stop(ctx, torrent, false).await;
+    let restart = {
+        let mut t = torrent.borrow_mut();
+        t.stopping = false;
+        // Resumed while winding down: start again now that it is over.
+        !t.paused && !t.checking && t.error.is_none()
+    };
+    if restart {
+        start_tasks(ctx, torrent);
+    }
 }
 
 /// Wind a torrent down: send `stopped` to every started tracker, close every
@@ -1282,7 +1357,7 @@ pub async fn delete_files(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
 /// Persist resume data: fsync content first so the have-set never claims data
 /// the disk does not hold.
 pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
-    let (storage, path, have, downloaded, uploaded, info, times) = {
+    let (storage, path, have, downloaded, uploaded, info, times, auto_managed, queue_position) = {
         let t = torrent.borrow();
         let Some(path) = t.resume_path.clone() else {
             return Ok(());
@@ -1300,6 +1375,8 @@ pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Resul
             t.stats.uploaded,
             info,
             t.times(Instant::now()),
+            t.auto_managed,
+            t.queue_position,
         )
     };
     // Bounded concurrency: each save fsyncs the torrent's files.
@@ -1322,6 +1399,8 @@ pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Resul
         file_priorities: storage.file_priorities(),
         active_time: times.0.as_secs(),
         seeding_time: times.1.as_secs(),
+        auto_managed,
+        queue_position: Some(queue_position),
     };
     data.save(&path)?;
     let mut t = torrent.borrow_mut();
@@ -1349,6 +1428,14 @@ pub fn tick_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, now: Instant) ->
         t.stats.last_uploaded = t.stats.uploaded;
         t.stats.download_rate = (t.stats.download_rate * 3 + d) / 4;
         t.stats.upload_rate = (t.stats.upload_rate * 3 + u) / 4;
+        // The queue's inactivity clock (`ActiveLimits::count_slow`).
+        if t.stats.download_rate < super::queue::INACTIVE_RATE
+            && t.stats.upload_rate < super::queue::INACTIVE_RATE
+        {
+            t.slow_since.get_or_insert(now);
+        } else {
+            t.slow_since = None;
+        }
 
         // Per-peer housekeeping.
         let peers: Vec<Rc<PeerHandle>> = t.peers.values().cloned().collect();
@@ -1416,7 +1503,7 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
     for _ in 0..t.candidates.len() {
         if t.peers.len() + t.half_open >= max_peers
             || t.half_open >= max_half_open
-            || ctx.connection_count() >= ctx.cfg.max_connections
+            || ctx.connection_count() >= ctx.max_connections()
         {
             break;
         }

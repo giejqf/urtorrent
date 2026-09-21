@@ -27,13 +27,13 @@ socket2 = "0.6"
 # The library under test, driven from a tokio runtime (AGENTS.md 5.6). Only
 # `rt`, `macros`, `time` and `sync` are enabled: none of them pull in `mio`,
 # and `testkit` is outside the audited library graph anyway.
-urtorrent = { path = "../crates/urtorrent", version = "0.6.0" }
+urtorrent = { path = "../crates/urtorrent", version = "0.7.0" }
 # The discriminator checks the library's own request builder against the
 # goldens too (a unit-level differential).
-tracker = { path = "../crates/tracker", version = "0.6.0" }
+tracker = { path = "../crates/tracker", version = "0.7.0" }
 # MSE for the tap-peer: interop with the oracle validates it (a symmetric
 # mistake cannot complete a handshake with libtorrent), and it lets the tap
 # record the oracle's crypto_provide / select and pad lengths.
-mse = { path = "../crates/mse", version = "0.6.0" }
-profile = { path = "../crates/profile", version = "0.6.0" }
+mse = { path = "../crates/mse", version = "0.7.0" }
+profile = { path = "../crates/profile", version = "0.7.0" }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }

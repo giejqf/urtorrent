@@ -12,8 +12,8 @@ description = "Piece picker and block request scheduling (rarest-first, prioriti
 workspace = true
 
 [dependencies]
-metainfo = { path = "../metainfo", version = "0.6.0" }
-profile = { path = "../profile", version = "0.6.0" }
+metainfo = { path = "../metainfo", version = "0.7.0" }
+profile = { path = "../profile", version = "0.7.0" }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -415,7 +415,9 @@ Each milestone ends with its integration scenarios green in CI.
 - **M7 0.1.0 hardening.** Soak, perf, fuzz time, API review, docs. **Release 0.1.0.**
 - **Post-0.1.0:** each as its own minor release: 0.2.0 performance pass (done), 0.3.0 DHT
   (done), 0.4.0 uTP (done), 0.5.0 magnet / LTEP conformance (done), 0.6.0 gates for
-  dual-stack edge cases and copy budgets (done), then `ut_holepunch`, port mapping.
+  dual-stack edge cases and copy budgets (done), 0.7.0 configuration coverage: the
+  active-torrent queue and the remaining library-side limits (done, `docs/config.md`
+  draws the library / frontend line), then `ut_holepunch`, port mapping.
 
 ## 9. Working conventions
 
@@ -484,6 +486,10 @@ Each milestone ends with its integration scenarios green in CI.
 - Defaults accepted: oracle line 5.2.3 / libtorrent 2.0.14 only for now; kernel baseline
   6.1 LTS; rustls with its default crypto provider; `native` is the default profile.
 - **BEP 52 (v2/hybrid) is not on the roadmap** (2026-09-21, "not widely adopted").
+- **Configuration boundary** (2026-09-21): limits the engine enforces (connections, slots,
+  rates, the active-torrent queue) are library knobs; policy that only needs snapshots and
+  the public operations (share-ratio actions, schedulers, categories, watch folders) is
+  the frontend's and is not implemented here. `docs/config.md` is the inventory.
 - **Licence: Apache-2.0.**
 
 ### Still open
