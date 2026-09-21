@@ -1140,6 +1140,12 @@ impl Picker {
         self.open.len()
     }
 
+    /// The pieces with requests or blocks in flight (a download in
+    /// progress), in no particular order.
+    pub fn open_piece_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.open.iter().copied()
+    }
+
     /// Recompute every counter from scratch and check the index against the
     /// piece states. Test-only: this is the O(pieces) walk the counters exist
     /// to avoid.

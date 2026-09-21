@@ -77,6 +77,11 @@ impl Manager {
         }
     }
 
+    /// Accept (or refuse) incoming SYNs from now on.
+    pub fn set_incoming_enabled(&mut self, on: bool) {
+        self.incoming_enabled = on;
+    }
+
     /// Number of live connections.
     pub fn len(&self) -> usize {
         self.sockets.len()

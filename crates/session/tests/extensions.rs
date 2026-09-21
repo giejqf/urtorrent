@@ -10,13 +10,12 @@
 
 mod common;
 
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{block_on, make_torrent};
+use common::{block_on, make_torrent, spawn_range_server};
 use session::{AddTorrent, Event, PeerSource, Session, TorrentState};
 
 fn init_log() {
@@ -300,7 +299,7 @@ fn web_seed_only() {
     let piece_len = 64 * 1024;
     let (torrent_bytes, data) = make_torrent("ext.bin", size, piece_len, "http://127.0.0.1:1/x");
     let data = Arc::new(data);
-    let (url, hits) = spawn_range_server(data.clone());
+    let (url, hits) = spawn_range_server(data.clone(), "/files/ext.bin");
     // Add `url-list` to the torrent (root dict is sorted: `announce`, `info`,
     // `url-list`).
     let mut t = torrent_bytes.clone();
@@ -324,57 +323,6 @@ fn web_seed_only() {
     assert!(wait_event(&mut events, 1, |e| matches!(e, Event::WebSeedError { .. })).is_none());
     block_on(b.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Minimal HTTP/1.1 server honouring `Range: bytes=a-b` for one file.
-fn spawn_range_server(data: Arc<Vec<u8>>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let hits2 = hits.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            let data = data.clone();
-            let hits = hits2.clone();
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 1024];
-                loop {
-                    let n = s.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        return;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let head = String::from_utf8_lossy(&buf).to_string();
-                assert!(
-                    head.starts_with("GET /files/ext.bin HTTP/1.1\r\n"),
-                    "{head}"
-                );
-                let range = head
-                    .lines()
-                    .find_map(|l| l.strip_prefix("Range: bytes="))
-                    .expect("range header");
-                let (a, b) = range.split_once('-').unwrap();
-                let a: usize = a.parse().unwrap();
-                let b: usize = b.parse().unwrap();
-                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let body = &data[a..=b.min(data.len() - 1)];
-                let resp = format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{}\r\nConnection: close\r\n\r\n",
-                    body.len(),
-                    data.len()
-                );
-                let _ = s.write_all(resp.as_bytes());
-                let _ = s.write_all(body);
-            });
-        }
-    });
-    (format!("http://127.0.0.1:{port}/files/ext.bin"), hits)
 }
 
 /// BEP 9 `x.pe` and BEP 53 `so=` in a magnet link: the peer named in the

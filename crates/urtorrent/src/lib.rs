@@ -38,8 +38,9 @@ pub use metainfo::{InfoHash, MagnetLink, Torrent};
 pub use profile::Profile;
 pub use session::{
     ActiveLimits, AddTorrent, EncryptionMode, Error, Event, EventStream, FileStatus, PeerInfo,
-    PeerSource, PeerTransport, QueueMove, Session, SessionBuilder, SessionStats, TorrentId,
-    TorrentSource, TorrentState, TorrentStatus, TrackerStatus, TransportPolicy,
+    PeerSource, PeerTransport, PieceInfo, PieceState, QueueMove, Session, SessionBuilder,
+    SessionSettings, SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus,
+    TrackerStatus, TransportPolicy,
 };
 
 /// Stream conveniences for [`EventStream`] (`tokio` feature).

@@ -178,6 +178,9 @@ async fn run_inner(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, url: &str, key
             if t.closing.is_set() || !t.is_running() || t.is_complete() {
                 return "done".into();
             }
+            if !t.web_seeds.iter().any(|u| u == url) {
+                return "removed".into();
+            }
             if t.webseed.failures.get(url).copied().unwrap_or(0) >= MAX_FAILURES {
                 return "abandoned".into();
             }

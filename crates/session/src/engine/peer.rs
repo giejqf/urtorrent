@@ -475,7 +475,7 @@ fn connection_params(
 
 /// MSE `allowed` mask for the session's policy.
 fn allowed_mask(ctx: &Ctx) -> u32 {
-    match ctx.cfg.encryption {
+    match ctx.encryption() {
         EncryptionMode::Disabled => 0,
         EncryptionMode::Enabled => mse::allowed_mask(true, true),
         EncryptionMode::Forced => mse::allowed_mask(false, true),
@@ -556,7 +556,7 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
     // failed (`PreferTcp`); libtorrent's order under `PreferUtp` (uTP unless
     // a uTP dial to the address failed, or it was reached over uTP before);
     // only one of them under the `*Only` policies.
-    let policy = ctx.cfg.transports;
+    let policy = ctx.transports();
     let use_utp = {
         let t = torrent.borrow();
         let utp_possible =
@@ -609,7 +609,7 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
         }
         // Q3: "enabled" connects out in plaintext first and retries with MSE
         // after a failed attempt (libtorrent toggles `pe_support` per peer).
-        let use_mse = match ctx.cfg.encryption {
+        let use_mse = match ctx.encryption() {
             EncryptionMode::Disabled => false,
             EncryptionMode::Forced => true,
             EncryptionMode::Enabled => t.mse_retry.contains(&addr),
@@ -690,6 +690,9 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
 /// responder handshake), find the torrent, run.
 pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
     let Ok(addr) = stream.peer_addr() else { return };
+    if ctx.is_banned_ip(addr.ip()) {
+        return;
+    }
     let local_addr = stream
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::new(addr.ip(), ctx.listen_port));
@@ -708,7 +711,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
         }
         let plaintext_head = Handshake::parse(&raw[..20.min(raw.len())]).is_ok();
         if plaintext_head {
-            if ctx.cfg.encryption == EncryptionMode::Forced {
+            if ctx.encryption() == EncryptionMode::Forced {
                 tracing::debug!(%addr, "incoming plaintext refused (encryption forced)");
                 return;
             }
@@ -733,7 +736,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
                 _ => return,
             };
         }
-        if ctx.cfg.encryption == EncryptionMode::Disabled {
+        if ctx.encryption() == EncryptionMode::Disabled {
             tracing::debug!(%addr, "incoming: not a BitTorrent handshake (encryption disabled)");
             return;
         }
@@ -968,7 +971,7 @@ async fn run_connection(
 /// is available for the address and has not failed for it, mark the
 /// address for a uTP dial and say so (the caller reconnects right away).
 fn tcp_closed_before_handshake(t: &mut Torrent, ctx: &Ctx, addr: SocketAddr) -> bool {
-    let fallback = ctx.cfg.transports.utp_outgoing()
+    let fallback = ctx.transports().utp_outgoing()
         && ctx.utp.is_some()
         && ctx.udp.supports(addr.ip())
         && !t.utp_failed.contains(&addr)
@@ -985,7 +988,7 @@ fn tcp_closed_before_handshake(t: &mut Torrent, ctx: &Ctx, addr: SocketAddr) -> 
 /// when uTP is available and has not failed for it too. Anything else backs
 /// off as usual.
 fn dial_failed(t: &mut Torrent, ctx: &Ctx, addr: SocketAddr, was_utp: bool) {
-    let policy = ctx.cfg.transports;
+    let policy = ctx.transports();
     let retry_now = if was_utp {
         t.utp_confirmed.remove(&addr);
         t.utp_failed.insert(addr);
@@ -1086,7 +1089,7 @@ async fn finish_connection(
         // handshake is retried encrypted, at once, on the same transport
         // (the peer may simply require encryption).
         let plaintext_refused = died_before_handshake
-            && ctx.cfg.encryption == EncryptionMode::Enabled
+            && ctx.encryption() == EncryptionMode::Enabled
             && !handle.encrypted.get();
         // Otherwise an outgoing TCP connection the peer closed before any
         // handshake (a uTP-only peer accepts and drops TCP) gets one uTP
@@ -1103,7 +1106,7 @@ async fn finish_connection(
         } else if tcp_dead_before_handshake {
             t.allow_reconnect_now(addr);
         } else if !incoming
-            && ctx.cfg.encryption == EncryptionMode::Enabled
+            && ctx.encryption() == EncryptionMode::Enabled
             && handle.peer_id.get().is_none()
         {
             // The encrypted retry died too: back to plaintext next time.

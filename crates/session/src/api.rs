@@ -4,7 +4,7 @@
 //! Public API types and the `Session` handle. Everything here is plain data
 //! or a message to the engine thread.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -57,8 +57,9 @@ pub struct AddTorrent {
     pub resume_dir: Option<PathBuf>,
     /// Add without starting (no announces, no connections).
     pub paused: bool,
-    /// Download pieces in order.
-    pub sequential: bool,
+    /// Download pieces in order. `None` keeps the resume data's value, else
+    /// `false`.
+    pub sequential: Option<bool>,
     /// Initial file priorities, one per content file in torrent order
     /// (`0` = skip, `1..=7`; libtorrent's default is 4). `None` keeps the
     /// priorities from the resume data, or the default. For a magnet link
@@ -67,17 +68,20 @@ pub struct AddTorrent {
     /// Allocate every content file to its full size up front (`fallocate`)
     /// instead of writing sparse files (default off).
     pub preallocate: bool,
-    /// Upload limit in bytes/s from the start (`0` = unlimited, the
-    /// default); [`Session::set_torrent_rate_limits`] changes it later.
-    pub upload_limit: u64,
-    /// Download limit in bytes/s from the start (`0` = unlimited).
-    pub download_limit: u64,
-    /// Connection cap for this torrent (`None` = the session's
-    /// `max_peers_per_torrent`); [`Session::set_max_peers`] changes it later.
+    /// Upload limit in bytes/s from the start (`0` = unlimited). `None`
+    /// keeps the resume data's value, else unlimited;
+    /// [`Session::set_torrent_rate_limits`] changes it later.
+    pub upload_limit: Option<u64>,
+    /// Download limit in bytes/s from the start (`0` = unlimited); `None` as
+    /// for `upload_limit`.
+    pub download_limit: Option<u64>,
+    /// Connection cap for this torrent. `None` keeps the resume data's
+    /// value, else the session's `max_peers_per_torrent`;
+    /// [`Session::set_max_peers`] changes it later.
     pub max_peers: Option<usize>,
-    /// Upload slot cap for this torrent (`None` = only the session-wide
-    /// `unchoke_slots` budget applies); [`Session::set_max_uploads`] changes
-    /// it later.
+    /// Upload slot cap for this torrent. `None` keeps the resume data's
+    /// value, else only the session-wide `unchoke_slots` budget applies;
+    /// [`Session::set_max_uploads`] changes it later.
     pub max_uploads: Option<usize>,
     /// Whether the session's [`ActiveLimits`] queue manages this torrent
     /// (started and stopped to keep within the limits, in queue order).
@@ -94,11 +98,11 @@ impl AddTorrent {
             save_path: save_path.into(),
             resume_dir: None,
             paused: false,
-            sequential: false,
+            sequential: None,
             file_priorities: None,
             preallocate: false,
-            upload_limit: 0,
-            download_limit: 0,
+            upload_limit: None,
+            download_limit: None,
             max_peers: None,
             max_uploads: None,
             auto_managed: None,
@@ -112,11 +116,11 @@ impl AddTorrent {
             save_path: save_path.into(),
             resume_dir: None,
             paused: false,
-            sequential: false,
+            sequential: None,
             file_priorities: None,
             preallocate: false,
-            upload_limit: 0,
-            download_limit: 0,
+            upload_limit: None,
+            download_limit: None,
             max_peers: None,
             max_uploads: None,
             auto_managed: None,
@@ -143,7 +147,7 @@ impl AddTorrent {
 
     /// Sequential download.
     pub fn sequential(mut self, sequential: bool) -> AddTorrent {
-        self.sequential = sequential;
+        self.sequential = Some(sequential);
         self
     }
 
@@ -155,13 +159,13 @@ impl AddTorrent {
 
     /// Upload limit in bytes/s from the start (`0` = unlimited).
     pub fn upload_limit(mut self, bytes_per_sec: u64) -> AddTorrent {
-        self.upload_limit = bytes_per_sec;
+        self.upload_limit = Some(bytes_per_sec);
         self
     }
 
     /// Download limit in bytes/s from the start (`0` = unlimited).
     pub fn download_limit(mut self, bytes_per_sec: u64) -> AddTorrent {
-        self.download_limit = bytes_per_sec;
+        self.download_limit = Some(bytes_per_sec);
         self
     }
 
@@ -223,6 +227,43 @@ impl ActiveLimits {
     }
 }
 
+/// The session's settings as they stand (`Session::settings`). The first
+/// block is fixed for the session's lifetime (build a new session to change
+/// it); the rest changes at runtime through the `Session::set_*` methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettings {
+    /// The listen port in use (the ephemeral one if 0 was asked for).
+    pub listen_port: u16,
+    /// IPv4 listen address, if IPv4 is on.
+    pub listen_v4: Option<Ipv4Addr>,
+    /// IPv6 listen address, if IPv6 is on.
+    pub listen_v6: Option<Ipv6Addr>,
+    /// The identity profile's name.
+    pub profile: String,
+    /// Whether a DHT node runs.
+    pub dht: bool,
+    /// Session upload limit in bytes/s (0 = unlimited).
+    pub upload_limit: u64,
+    /// Session download limit in bytes/s (0 = unlimited).
+    pub download_limit: u64,
+    /// Session-wide connection limit.
+    pub max_connections: usize,
+    /// Default per-torrent connection cap.
+    pub max_peers_per_torrent: usize,
+    /// Session-wide unchoke slots.
+    pub unchoke_slots: usize,
+    /// The active-torrent queue limits.
+    pub active_limits: ActiveLimits,
+    /// The MSE policy.
+    pub encryption: EncryptionMode,
+    /// The transport policy.
+    pub transports: TransportPolicy,
+    /// PEX on.
+    pub pex: bool,
+    /// LSD on.
+    pub lsd: bool,
+}
+
 /// Where to move a torrent in the queue (`Session::move_in_queue`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMove {
@@ -234,6 +275,26 @@ pub enum QueueMove {
     Down,
     /// To the back.
     Bottom,
+}
+
+/// A piece's standing (`Session::pieces`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PieceState {
+    /// Not verified on disk, no download in progress.
+    Missing,
+    /// Blocks requested or received but not yet verified.
+    Downloading,
+    /// Verified and written.
+    Have,
+}
+
+/// One piece in [`Session::pieces`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieceInfo {
+    /// Its standing.
+    pub state: PieceState,
+    /// Connected peers (and web seeds) that have it.
+    pub availability: u32,
 }
 
 /// One content file in a status snapshot.
@@ -339,15 +400,31 @@ pub struct TorrentStatus {
     pub peers: usize,
     /// Connected peers that are seeds.
     pub seeds: usize,
-    /// Trackers.
+    /// Tracker states. Empty in [`Session::statuses`] (see
+    /// [`Session::status`] or [`Session::trackers`]).
     pub trackers: Vec<TrackerStatus>,
     /// Whether the torrent is complete (all wanted pieces).
     pub complete: bool,
     /// Web seeds (BEP 19) configured.
     pub web_seeds: usize,
-    /// Content files with their priorities and progress (empty until the
-    /// metadata is known).
+    /// The web seed URLs (`Session::add_web_seed` / `remove_web_seed`).
+    pub web_seed_urls: Vec<String>,
+    /// Content files with their priorities and progress. Empty until the
+    /// metadata is known, and in [`Session::statuses`] (per-torrent detail
+    /// comes from [`Session::status`] or [`Session::files`]).
     pub files: Vec<FileStatus>,
+    /// Piece length in bytes (0 until the metadata is known).
+    pub piece_length: u32,
+    /// The `.torrent`'s `comment`, if it had one.
+    pub comment: Option<String>,
+    /// The `.torrent`'s `created by`, if present.
+    pub created_by: Option<String>,
+    /// The `.torrent`'s `creation date` (unix seconds), if present.
+    pub creation_date: Option<i64>,
+    /// This torrent's upload limit in bytes/s (0 = unlimited).
+    pub upload_limit: u64,
+    /// This torrent's download limit in bytes/s (0 = unlimited).
+    pub download_limit: u64,
     /// Bytes in wanted pieces (priority > 0).
     pub total_wanted: u64,
     /// Bytes in wanted pieces already verified.
@@ -1104,6 +1181,103 @@ impl Session {
     /// the queue is re-evaluated at once.
     pub async fn set_active_limits(&self, limits: ActiveLimits) -> Result<(), Error> {
         self.send(|tx| Command::SetActiveLimits(limits, tx)).await
+    }
+
+    /// Change the MSE policy (`SessionBuilder::encryption`) for connections
+    /// made or accepted from now on; existing ones are kept.
+    pub async fn set_encryption(&self, mode: EncryptionMode) -> Result<(), Error> {
+        self.send(|tx| Command::SetEncryption(mode, tx)).await
+    }
+
+    /// Change the transport policy (`SessionBuilder::transports`) for
+    /// connections made or accepted from now on.
+    pub async fn set_transports(&self, policy: TransportPolicy) -> Result<(), Error> {
+        self.send(|tx| Command::SetTransports(policy, tx)).await
+    }
+
+    /// Turn peer exchange on or off (`SessionBuilder::pex`). Off: PEX
+    /// messages are neither sent nor acted on from now on.
+    pub async fn set_pex(&self, on: bool) -> Result<(), Error> {
+        self.send(|tx| Command::SetPex(on, tx)).await
+    }
+
+    /// Turn Local Service Discovery on or off (`SessionBuilder::lsd`). The
+    /// multicast sockets open on first use and stay for the session.
+    pub async fn set_lsd(&self, on: bool) -> Result<(), Error> {
+        self.send(|tx| Command::SetLsd(on, tx)).await
+    }
+
+    /// The per-file status of a torrent (empty until the metadata is known).
+    pub async fn files(&self, id: TorrentId) -> Result<Vec<FileStatus>, Error> {
+        self.send(|tx| Command::Files(id, tx)).await?
+    }
+
+    /// The tracker list of a torrent with each tracker's state.
+    pub async fn trackers(&self, id: TorrentId) -> Result<Vec<TrackerStatus>, Error> {
+        self.send(|tx| Command::Trackers(id, tx)).await?
+    }
+
+    /// Every piece's state and availability (empty until the metadata is
+    /// known); the piece bar of a UI.
+    pub async fn pieces(&self, id: TorrentId) -> Result<Vec<PieceInfo>, Error> {
+        self.send(|tx| Command::Pieces(id, tx)).await?
+    }
+
+    /// The torrent as a `.torrent` file: the info dictionary as received
+    /// (byte-exact, so the info-hash matches), the current trackers as
+    /// `announce` / `announce-list`, the web seeds as `url-list`, and the
+    /// original `comment` / `created by` / `creation date`. `None` for a
+    /// magnet link whose metadata has not arrived. What a daemon stores to
+    /// re-add the torrent after a restart.
+    pub async fn torrent_file(&self, id: TorrentId) -> Result<Option<Vec<u8>>, Error> {
+        self.send(|tx| Command::TorrentFile(id, tx)).await?
+    }
+
+    /// Rename (move within the save path) content file `index` (as numbered
+    /// in [`TorrentStatus::files`]) to `path`, `/`-separated and relative to
+    /// the save path, sanitised like a `.torrent` path (no `..`, no absolute
+    /// paths). The file on disk is renamed if it exists; the new path is
+    /// used from then on and persisted in the resume data.
+    pub async fn rename_file(
+        &self,
+        id: TorrentId,
+        index: usize,
+        path: String,
+    ) -> Result<(), Error> {
+        self.send(|tx| Command::RenameFile(id, index, path, tx))
+            .await?
+    }
+
+    /// Add a web seed (BEP 19 `url-list`) URL; it is used once the torrent
+    /// runs and has something left to download.
+    pub async fn add_web_seed(&self, id: TorrentId, url: String) -> Result<(), Error> {
+        self.send(|tx| Command::WebSeed(id, url, true, tx)).await?
+    }
+
+    /// Remove a web seed URL; a running request for it ends.
+    pub async fn remove_web_seed(&self, id: TorrentId, url: String) -> Result<(), Error> {
+        self.send(|tx| Command::WebSeed(id, url, false, tx)).await?
+    }
+
+    /// The settings in force.
+    pub async fn settings(&self) -> Result<SessionSettings, Error> {
+        self.send(Command::Settings).await
+    }
+
+    /// Ban an address for the session: its connections on every torrent are
+    /// dropped, and it is neither dialled nor accepted until unbanned.
+    pub async fn ban_ip(&self, ip: IpAddr) -> Result<(), Error> {
+        self.send(|tx| Command::BanIp(ip, true, tx)).await
+    }
+
+    /// Lift a [`Session::ban_ip`].
+    pub async fn unban_ip(&self, ip: IpAddr) -> Result<(), Error> {
+        self.send(|tx| Command::BanIp(ip, false, tx)).await
+    }
+
+    /// The addresses banned with [`Session::ban_ip`].
+    pub async fn banned_ips(&self) -> Result<Vec<IpAddr>, Error> {
+        self.send(Command::BannedIps).await
     }
 
     /// Hand a torrent to the queue (`true`: it runs when the

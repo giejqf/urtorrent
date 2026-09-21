@@ -88,7 +88,7 @@ fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
         event: job.event,
         tracker_id: job.tracker_id.clone(),
         // Q8: `supportcrypto=1` unless encryption is disabled.
-        crypto_supported: ctx.cfg.encryption != crate::api::EncryptionMode::Disabled,
+        crypto_supported: ctx.encryption() != crate::api::EncryptionMode::Disabled,
         ipv4_hints: if t.private {
             ctx.cfg
                 .listen_v4

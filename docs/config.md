@@ -1,7 +1,8 @@
 # Configuration coverage
 
 What a client built on this library can configure, checked (2026-09-21,
-0.7.0) against the settings qBittorrent exposes and maps onto libtorrent. The
+0.7.0, revisited for the daemon in 0.8.0) against the settings qBittorrent
+exposes and maps onto libtorrent. The
 rule for what lives here: anything that needs engine state or timing to get
 right (limits the choker, dialler and queue enforce; anything that must hold
 between two of our own decisions) is a library knob. Policy that only needs
@@ -17,15 +18,35 @@ snapshots and the public operations is the frontend's, and stays out.
 | Upload slots | `unchoke_slots` (+ `set_unchoke_slots`) | `max_uploads` (+ `set_max_uploads`) |
 | Rates | `upload_limit`, `download_limit` (+ `set_rate_limits`) | `upload_limit`, `download_limit` (+ `set_torrent_rate_limits`) |
 | Queue | `active_limits` (`downloads` / `seeds` / `total` / `count_slow`, + `set_active_limits`) | `auto_managed` (+ `set_auto_managed`, `force_resume`, `move_in_queue`); `pause` leaves the queue, `resume` rejoins it |
-| Transports | `transports` (`TcpOnly` / `PreferTcp` / `PreferUtp` / `UtpOnly`), `encryption` (`Disabled` / `Enabled` / `Forced`) | |
-| Discovery | `pex`, `lsd`, `dht`, `dht_bootstrap_nodes`, `dht_read_only`, `dht_state` | `add_peer`, `add_tracker` / `remove_tracker`, `force_reannounce`, `scrape` |
-| Storage | `max_open_files`, `disk_thread`, `max_checking`, `piece_extent_affinity` | `save_path`, `resume_dir`, `preallocate`, `file_priorities` (+ `set_file_priorities`), `sequential` (+ `set_sequential`), `move_storage`, `force_recheck`, `save_resume_data` |
+| Transports | `transports` (`TcpOnly` / `PreferTcp` / `PreferUtp` / `UtpOnly`, + `set_transports`), `encryption` (`Disabled` / `Enabled` / `Forced`, + `set_encryption`) | |
+| Discovery | `pex` (+ `set_pex`), `lsd` (+ `set_lsd`), `dht`, `dht_bootstrap_nodes`, `dht_read_only`, `dht_state` | `add_peer`, `add_tracker` / `remove_tracker`, `add_web_seed` / `remove_web_seed`, `force_reannounce`, `scrape` |
+| Peers | `ban_ip` / `unban_ip` / `banned_ips` (session-wide) | |
+| Storage | `max_open_files`, `disk_thread`, `max_checking`, `piece_extent_affinity` | `save_path`, `resume_dir`, `preallocate`, `file_priorities` (+ `set_file_priorities`), `sequential` (+ `set_sequential`), `rename_file`, `move_storage`, `force_recheck`, `save_resume_data` |
 | Engine | `hash_threads`, `recv_ring`, `zero_copy_send`, `max_concurrent_announces`, `root_certificate_pem` | `paused` |
+
+`Session::settings()` returns the values in force. Fixed for a session's
+lifetime (build a new one to change them): the listen port and addresses,
+the profile, whether a DHT node runs, and the engine tuning row.
 
 Snapshots carry what the policies above need: `TorrentStatus` (rates,
 counters, `active_time` / `seeding_time`, `queue_position`, `auto_managed`,
-`max_peers` / `max_uploads`, files, trackers), `PeerInfo` (both choke and
-interest directions, rates, transport, source), `SessionStats`.
+`max_peers` / `max_uploads`, the torrent's own rate limits, `piece_length`,
+`comment` / `created_by` / `creation_date`, web seed URLs; files and
+trackers in `status(id)` / `files(id)` / `trackers(id)` while `statuses()`
+stays cheap for large lists), `pieces(id)` (state and availability per
+piece, for a piece bar), `PeerInfo` (both choke and interest directions,
+rates, transport, source), `SessionStats`.
+
+## Daemon persistence
+
+A daemon restarts from three things: `torrent_file(id)` (the `.torrent`
+as bytes, info dictionary byte-exact so the info-hash holds, current
+trackers and web seeds included; the daemon stores it, also for magnets
+once their metadata arrived), the resume directory (have-set, accounting,
+queue standing, sequential / rate limits / connection and slot caps,
+renamed files: everything `AddTorrent` did not say explicitly is restored
+from it), and its own table of the frontend-side state (save path, paused,
+categories, tags, ...). `Session::dht_state()` persists the DHT.
 
 ## Frontend responsibilities (deliberately not in the library)
 
@@ -57,7 +78,9 @@ interest directions, rates, transport, source), `SessionStats`.
 | `connection_speed` / half-open limit | engine constant (10) |
 | peer / request / inactivity timeouts | libtorrent's defaults as constants (L3) |
 | `min_reconnect_time` | libtorrent's 60 s; `add_peer` bypasses it |
-| listen port change at runtime | rebuild the session (candidate) |
+| listen port / addresses, DHT on/off, profile at runtime | rebuild the session |
 | piece priorities / first-and-last-piece first | candidate: `set_piece_priorities` |
-| programmatic IP block list | candidate |
+| IP block list by range (`ip_filter`) | `ban_ip` bans single addresses; ranges are a candidate |
+| `seed_mode` / "skip hash check" on add | not offered: advertising unverified pieces would break rule 1; a lazy per-piece verify is the honest form and a candidate |
+| content layout (subfolder / no subfolder) | `rename_file` covers the effect per file; no add-time switch |
 | proxies, UPnP / NAT-PMP, share mode, super-seeding | non-goals or roadmap (AGENTS.md 1, 4) |

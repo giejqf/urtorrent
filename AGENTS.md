@@ -417,7 +417,9 @@ Each milestone ends with its integration scenarios green in CI.
   (done), 0.4.0 uTP (done), 0.5.0 magnet / LTEP conformance (done), 0.6.0 gates for
   dual-stack edge cases and copy budgets (done), 0.7.0 configuration coverage: the
   active-torrent queue and the remaining library-side limits (done, `docs/config.md`
-  draws the library / frontend line), then `ut_holepunch`, port mapping.
+  draws the library / frontend line), 0.8.0 daemon readiness (done: what an HTTP API
+  daemon needs from the library), then the daemon itself (a separate crate/repo),
+  `ut_holepunch`, port mapping.
 
 ## 9. Working conventions
 

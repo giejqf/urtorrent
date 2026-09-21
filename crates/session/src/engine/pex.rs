@@ -106,7 +106,7 @@ fn exchangeable(t: &Torrent) -> Vec<(SocketAddr, u8)> {
 
 /// The once-a-second PEX step for a torrent.
 pub fn tick(ctx: &Ctx, t: &mut Torrent, now: Instant) {
-    if !ctx.cfg.pex || !t.discovery_allowed() {
+    if !ctx.pex() || !t.discovery_allowed() {
         return;
     }
     // Torrent level: rebuild the delta once a minute.
@@ -202,14 +202,14 @@ pub fn on_message(
             return Err("too frequent pex messages".into());
         }
     }
-    if !ctx.cfg.pex || !t.discovery_allowed() {
+    if !ctx.pex() || !t.discovery_allowed() {
         // Silently ignored, as libtorrent does with `disable_pex`.
         return Ok(());
     }
     let pex = Pex::parse(payload).map_err(|e| format!("pex: {e}"))?;
     let addrs: Vec<SocketAddr> = pex.added.iter().map(|(a, _)| *a).collect();
     let added = t.add_candidates(ctx, &addrs, PeerSource::Pex);
-    if ctx.cfg.encryption == EncryptionMode::Enabled {
+    if ctx.encryption() == EncryptionMode::Enabled {
         for (a, f) in &pex.added {
             if f & pex_flags::ENCRYPTION != 0 {
                 t.mse_retry.insert(*a);

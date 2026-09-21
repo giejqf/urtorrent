@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-21
+
+Gap check before the daemon (an HTTP API in front of the library, then a
+web UI): what a daemon would otherwise have to work around, now in the
+library. `docs/config.md` has the persistence story.
+
+### Added
+
+- `Session::torrent_file(id)`: the torrent as `.torrent` bytes (raw info
+  dictionary spliced verbatim, current trackers and web seeds, original
+  `comment` / `created by` / `creation date`); `None` for a magnet
+  without metadata yet. `TorrentStatus::{comment, created_by,
+  creation_date, piece_length, upload_limit, download_limit,
+  web_seed_urls}`.
+- `Session::pieces(id)` (`PieceInfo { state: Missing | Downloading |
+  Have, availability }`), `Session::files(id)`, `Session::trackers(id)`.
+  `Session::statuses()` now leaves the per-file and per-tracker vectors
+  empty (a list of thousands of torrents no longer clones every file
+  path per poll); `status(id)` still fills them.
+- Runtime settings: `Session::{set_encryption, set_transports, set_pex,
+  set_lsd}` and `Session::settings()` (`SessionSettings`: everything in
+  force, fixed values included). The uTP host now exists whenever the UDP
+  socket does, gated by the policy, so `set_transports` can turn uTP on.
+- `Session::{ban_ip, unban_ip, banned_ips}`: a session-wide ban list that
+  drops the address's connections on every torrent and refuses it on dial
+  and accept.
+- `Session::{add_web_seed, remove_web_seed}` at runtime (a removed seed's
+  request ends).
+- `Session::rename_file(id, index, path)`: renames within the save path
+  (validated like a `.torrent` path), the file on disk moved if present,
+  the mapping used from then on and persisted.
+- Resume data format 5: `sequential`, rate limits, `max_peers`,
+  `max_uploads` and renamed files (`mapped_files`) are saved and restored
+  unless `AddTorrent` sets them explicitly (`AddTorrent::{sequential,
+  upload_limit, download_limit}` became `Option`s for that; the builder
+  methods are unchanged). Formats 1–4 still load.
+- `PeerInfo` / `Session` / `EventStream` / `Error` bounds asserted in a
+  test (`Send + Sync`, `std::error::Error`) for the daemon's task
+  boundaries; `crates/session/tests/daemon.rs` gates all of the above.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0800-` / `urtorrent/0.8.0`
+  / DHT `UR\x00\x08`.
+
 ## [0.7.0] - 2026-09-21
 
 The configuration a client needs from the library, checked against what

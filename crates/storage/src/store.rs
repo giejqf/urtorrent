@@ -28,12 +28,12 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
 
-use metainfo::{FileSlice, Info};
+use metainfo::{FileSlice, Info, SafePath};
 use uring::{Buffer, BufferPool, File};
 
 use crate::Error;
@@ -180,6 +180,12 @@ impl FilePool {
         self.lru.insert(stamp, key);
     }
 
+    fn remove(&mut self, key: FileKey) {
+        if let Some((_, stamp)) = self.open.remove(&key) {
+            self.lru.remove(&stamp);
+        }
+    }
+
     fn remove_store(&mut self, store: u64) {
         let keys: Vec<FileKey> = self
             .open
@@ -262,6 +268,9 @@ pub struct Storage {
     /// Whether a file's bytes live in the parts file (skipped and never
     /// created on disk).
     use_parts: RefCell<Vec<bool>>,
+    /// Per `info.files` entry: the path the file lives at when it was
+    /// renamed (`rename_file`), else the metainfo's.
+    mapped: RefCell<Vec<Option<SafePath>>>,
     /// Pieces being downloaded, hashed as they are written.
     progress: RefCell<HashMap<usize, PieceHash>>,
     /// Bytes the hash cursor had to read back (diagnostics: zero when blocks
@@ -304,6 +313,7 @@ impl Storage {
             have: RefCell::new(Bitfield::new(pieces)),
             priorities: RefCell::new(priorities),
             use_parts: RefCell::new(vec![false; n]),
+            mapped: RefCell::new(vec![None; n]),
             progress: RefCell::new(HashMap::new()),
             readback_bytes: std::cell::Cell::new(0),
         }
@@ -354,8 +364,86 @@ impl Storage {
                     .min(MAX_PRIORITY)
             };
             cur[i] = p;
-            use_parts[i] = !f.is_padding() && p == 0 && !f.path.to_path(&root).exists();
+            use_parts[i] =
+                !f.is_padding() && p == 0 && !self.abs_path(i, &root).is_some_and(|p| p.exists());
         }
+    }
+
+    /// Install renamed paths (from resume data) before any file is touched.
+    pub fn set_mapped_files(&self, mapped: Vec<Option<SafePath>>) {
+        let mut m = self.mapped.borrow_mut();
+        for (i, p) in mapped.into_iter().enumerate() {
+            if i < m.len() {
+                m[i] = p;
+            }
+        }
+    }
+
+    /// The renamed paths, per `info.files` entry (`None` = the metainfo's).
+    pub fn mapped_files(&self) -> Vec<Option<SafePath>> {
+        self.mapped.borrow().clone()
+    }
+
+    /// Where file `index` lives, relative to the root.
+    pub fn rel_path(&self, index: usize) -> Option<SafePath> {
+        let f = self.info.files.get(index)?;
+        Some(
+            self.mapped
+                .borrow()
+                .get(index)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| f.path.clone()),
+        )
+    }
+
+    fn abs_path(&self, index: usize, root: &Path) -> Option<PathBuf> {
+        self.rel_path(index).map(|p| p.to_path(root))
+    }
+
+    /// Where file `index` lives on disk now.
+    pub fn file_path(&self, index: usize) -> Option<PathBuf> {
+        self.abs_path(index, &self.root.borrow())
+    }
+
+    /// Rename (move within the save path) file `index` to `new`: the file on
+    /// disk is renamed if it exists, the mapping is kept for every later
+    /// open. Padding files, out-of-range indices and a path another file
+    /// already uses are refused. The caller must have quiesced I/O on the
+    /// file (the disk ring runs this as a barrier).
+    pub async fn rename_file(&self, index: usize, new: SafePath) -> Result<(), Error> {
+        let f = self.info.files.get(index).ok_or(Error::OutOfRange)?;
+        if f.is_padding() {
+            return Err(Error::OutOfRange);
+        }
+        let current = self.rel_path(index).ok_or(Error::OutOfRange)?;
+        if current == new {
+            return Ok(());
+        }
+        for i in 0..self.info.files.len() {
+            if i != index && self.rel_path(i).is_some_and(|p| p == new) {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "another file of the torrent has that path",
+                )));
+            }
+        }
+        self.sync_all().await?;
+        self.res.files.borrow_mut().remove(FileKey {
+            store: self.store_id,
+            index: Some(index),
+        });
+        let root = self.root.borrow().clone();
+        let from = current.to_path(&root);
+        let to = new.to_path(&root);
+        if from.exists() {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&from, &to)?;
+        }
+        self.mapped.borrow_mut()[index] = Some(new);
+        Ok(())
     }
 
     /// Change file priorities. A file leaving priority 0 gets the parts held
@@ -377,8 +465,9 @@ impl Storage {
                 if p > 0 && use_parts[i] {
                     to_export.push(i);
                 } else if p == 0 && old[i] > 0 {
-                    let path = f.path.to_path(&root);
-                    let has_data = std::fs::metadata(&path).is_ok_and(|m| m.len() > 0);
+                    let has_data = self
+                        .abs_path(i, &root)
+                        .is_some_and(|path| std::fs::metadata(&path).is_ok_and(|m| m.len() > 0));
                     if !has_data {
                         use_parts[i] = true;
                     }
@@ -478,10 +567,19 @@ impl Storage {
         let old_root = self.root.borrow().clone();
         std::fs::create_dir_all(&new_root)?;
         let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
-        for f in self.info.files.iter().filter(|f| !f.is_padding()) {
-            let from = f.path.to_path(&old_root);
+        for (i, _) in self
+            .info
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.is_padding())
+        {
+            let Some(rel) = self.rel_path(i) else {
+                continue;
+            };
+            let from = rel.to_path(&old_root);
             if from.exists() {
-                moves.push((from, f.path.to_path(&new_root)));
+                moves.push((from, rel.to_path(&new_root)));
             }
         }
         let parts_from = self.parts_path();
@@ -550,7 +648,7 @@ impl Storage {
             if f.is_padding() || self.use_parts.borrow()[i] {
                 continue;
             }
-            let path = f.path.to_path(&self.root.borrow());
+            let path = self.file_path(i).ok_or(Error::OutOfRange)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -570,11 +668,13 @@ impl Storage {
         self.dirty.borrow_mut().clear();
         let root = self.root.borrow().clone();
         let mut dirs: Vec<PathBuf> = Vec::new();
-        for f in &self.info.files {
+        for (i, f) in self.info.files.iter().enumerate() {
             if f.is_padding() {
                 continue;
             }
-            let path = f.path.to_path(&root);
+            let Some(path) = self.abs_path(i, &root) else {
+                continue;
+            };
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -626,8 +726,7 @@ impl Storage {
         if let Some(f) = self.res.files.borrow_mut().touch(key) {
             return Ok(f);
         }
-        let spec = self.info.files.get(index).ok_or(Error::OutOfRange)?;
-        let path = spec.path.to_path(&self.root.borrow());
+        let path = self.file_path(index).ok_or(Error::OutOfRange)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

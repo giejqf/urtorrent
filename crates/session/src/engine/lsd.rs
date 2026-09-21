@@ -86,7 +86,7 @@ impl Lsd {
 /// Announce `torrent` now (three datagrams over six seconds), unless LSD is
 /// off, the torrent is private, or it is not running.
 pub fn announce_now(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
-    if !ctx.cfg.lsd || ctx.lsd.borrow().is_none() {
+    if !ctx.lsd_on() {
         return;
     }
     let ctx = ctx.clone();
@@ -151,6 +151,10 @@ async fn receive_loop(ctx: Rc<Ctx>, socket: Rc<UdpSocket>) {
 }
 
 fn on_datagram(ctx: &Rc<Ctx>, data: &[u8], from: SocketAddr) {
+    if !ctx.lsd_on() {
+        // Switched off at runtime: the sockets stay, the searches are ignored.
+        return;
+    }
     let Some(search) = tracker::lsd::parse(data) else {
         return;
     };

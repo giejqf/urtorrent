@@ -296,7 +296,7 @@ impl Dht {
         let mut rng = RngRef(&ctx.rng);
         // `implied_port` whenever incoming uTP is on (libtorrent: the DHT node
         // then records our UDP source port, the one uTP is reachable on).
-        let implied_port = ctx.cfg.transports.utp_incoming() && ctx.utp.is_some();
+        let implied_port = ctx.transports().utp_incoming() && ctx.utp.is_some();
         for f in fams.iter_mut() {
             let l = f
                 .node

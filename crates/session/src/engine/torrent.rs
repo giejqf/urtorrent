@@ -89,6 +89,11 @@ pub struct Torrent {
     pub pex: super::pex::State,
     /// BEP 19 web seeds (`url-list`).
     pub web_seeds: Vec<String>,
+    /// `.torrent` extras kept for `Session::torrent_file` and the status:
+    /// `comment`, `created by`, `creation date`.
+    pub comment: Option<String>,
+    pub created_by: Option<String>,
+    pub creation_date: Option<i64>,
     pub webseed: super::webseed::State,
     pub save_path: PathBuf,
     sequential: bool,
@@ -130,6 +135,9 @@ pub struct Torrent {
     /// `auto_managed` came from `AddTorrent` (not to be overridden by the
     /// resume data).
     pub auto_managed_explicit: bool,
+    /// Which per-torrent settings came from `AddTorrent` (the resume data's
+    /// values apply to the others).
+    pub settings_explicit: SettingsExplicit,
     /// Order in the queue (lower first; dense positions are computed for
     /// status).
     pub queue_position: u64,
@@ -195,7 +203,7 @@ pub struct Torrent {
     trust: HashMap<IpAddr, i32>,
     banned: HashSet<IpAddr>,
     resume_path: Option<PathBuf>,
-    resume_dirty: bool,
+    pub resume_dirty: bool,
     last_resume_save: Instant,
     /// Pieces whose hash is being computed.
     verifying: HashSet<u32>,
@@ -340,9 +348,21 @@ impl Torrent {
         self.picker.bytes_left()
     }
 
-    pub fn status(&self, now: Instant, queue_position: usize) -> TorrentStatus {
-        let trackers = self
-            .announcer
+    /// The status snapshot. `detailed` fills the per-file and per-tracker
+    /// vectors (`Session::status`); `Session::statuses` leaves them empty.
+    pub fn status(&self, now: Instant, queue_position: usize, detailed: bool) -> TorrentStatus {
+        let trackers = if detailed {
+            self.trackers(now)
+        } else {
+            Vec::new()
+        };
+        let files = if detailed { self.files() } else { Vec::new() };
+        self.status_with(now, queue_position, files, trackers)
+    }
+
+    /// The tracker list as a status snapshot.
+    pub fn trackers(&self, now: Instant) -> Vec<TrackerStatus> {
+        self.announcer
             .snapshot()
             .into_iter()
             .map(|t| TrackerStatus {
@@ -356,7 +376,110 @@ impl Torrent {
                 downloaded: t.downloaded,
                 next_announce_in: t.next_announce.map(|a| a.saturating_duration_since(now)),
             })
+            .collect()
+    }
+
+    /// The per-file status list.
+    pub fn files(&self) -> Vec<crate::api::FileStatus> {
+        self.file_statuses()
+    }
+
+    /// The torrent as `.torrent` bytes (`Session::torrent_file`): the raw
+    /// info dictionary spliced in verbatim so the info-hash is preserved
+    /// whatever its original encoding; everything else re-encoded from the
+    /// current state.
+    pub fn torrent_file(&self) -> Option<Vec<u8>> {
+        use bencode::Value;
+        let raw = self.raw_info.as_ref()?;
+        let mut tiers: Vec<Vec<String>> = Vec::new();
+        for t in self.announcer.snapshot() {
+            while tiers.len() <= t.tier {
+                tiers.push(Vec::new());
+            }
+            tiers[t.tier].push(t.url);
+        }
+        tiers.retain(|t| !t.is_empty());
+        let mut out = Vec::new();
+        let key = |out: &mut Vec<u8>, k: &str| {
+            out.extend_from_slice(k.len().to_string().as_bytes());
+            out.push(b':');
+            out.extend_from_slice(k.as_bytes());
+        };
+        // Keys in sorted order (canonical bencode).
+        out.push(b'd');
+        if let Some(first) = tiers.first().and_then(|t| t.first()) {
+            key(&mut out, "announce");
+            out.extend_from_slice(&bencode::to_bytes(&Value::Bytes(first.as_bytes())));
+        }
+        if tiers.iter().map(Vec::len).sum::<usize>() > 1 || tiers.len() > 1 {
+            key(&mut out, "announce-list");
+            let items: Vec<Value<'_>> = tiers
+                .iter()
+                .map(|t| Value::List {
+                    items: t.iter().map(|u| Value::Bytes(u.as_bytes())).collect(),
+                    raw: &[],
+                })
+                .collect();
+            out.extend_from_slice(&bencode::to_bytes(&Value::List { items, raw: &[] }));
+        }
+        if let Some(c) = &self.comment {
+            key(&mut out, "comment");
+            out.extend_from_slice(&bencode::to_bytes(&Value::Bytes(c.as_bytes())));
+        }
+        if let Some(c) = &self.created_by {
+            key(&mut out, "created by");
+            out.extend_from_slice(&bencode::to_bytes(&Value::Bytes(c.as_bytes())));
+        }
+        if let Some(d) = self.creation_date {
+            key(&mut out, "creation date");
+            out.extend_from_slice(&bencode::to_bytes(&Value::Int(d)));
+        }
+        key(&mut out, "info");
+        out.extend_from_slice(raw);
+        if !self.web_seeds.is_empty() {
+            key(&mut out, "url-list");
+            let items: Vec<Value<'_>> = self
+                .web_seeds
+                .iter()
+                .map(|u| Value::Bytes(u.as_bytes()))
+                .collect();
+            out.extend_from_slice(&bencode::to_bytes(&Value::List { items, raw: &[] }));
+        }
+        out.push(b'e');
+        Some(out)
+    }
+
+    /// The per-piece state and availability (`Session::pieces`).
+    pub fn pieces(&self) -> Vec<crate::api::PieceInfo> {
+        use crate::api::{PieceInfo, PieceState};
+        let n = self.piece_count();
+        let mut v: Vec<PieceInfo> = (0..n)
+            .map(|i| PieceInfo {
+                state: if self.picker.have(i) {
+                    PieceState::Have
+                } else {
+                    PieceState::Missing
+                },
+                availability: self.picker.availability(i),
+            })
             .collect();
+        for i in self.picker.open_piece_indices() {
+            if let Some(p) = v.get_mut(i)
+                && p.state == PieceState::Missing
+            {
+                p.state = PieceState::Downloading;
+            }
+        }
+        v
+    }
+
+    fn status_with(
+        &self,
+        now: Instant,
+        queue_position: usize,
+        files: Vec<crate::api::FileStatus>,
+        trackers: Vec<TrackerStatus>,
+    ) -> TorrentStatus {
         let n = self.piece_count();
         let seeds = self.peers.values().filter(|p| p.is_seed(n)).count();
         TorrentStatus {
@@ -382,7 +505,14 @@ impl Torrent {
             trackers,
             complete: self.is_complete(),
             web_seeds: self.web_seeds.len(),
-            files: self.file_statuses(),
+            web_seed_urls: self.web_seeds.clone(),
+            files,
+            piece_length: self.info.as_ref().map_or(0, |i| i.piece_length),
+            comment: self.comment.clone(),
+            created_by: self.created_by.clone(),
+            creation_date: self.creation_date,
+            upload_limit: self.up_limit.rate(),
+            download_limit: self.down_limit.rate(),
             total_wanted: self.wanted().0,
             total_wanted_done: self.wanted().1,
             save_path: self.save_path.clone(),
@@ -433,7 +563,11 @@ impl Torrent {
             .enumerate()
             .filter(|(_, f)| !f.is_padding())
             .map(|(i, f)| crate::api::FileStatus {
-                path: f.path.components().join("/"),
+                path: storage
+                    .rel_path(i)
+                    .unwrap_or_else(|| f.path.clone())
+                    .components()
+                    .join("/"),
                 size: f.length,
                 priority: prios.get(i).copied().unwrap_or(0),
                 done: storage.file_done(i),
@@ -476,7 +610,10 @@ impl Torrent {
             // (`::ffff:a.b.c.d`, as some trackers put in `peers6` and some
             // clients in PEX `added6`) is the IPv4 peer it names.
             let p = canonical_addr(p);
-            if !usable_peer_addr(ctx, p) || self.banned.contains(&p.ip()) {
+            if !usable_peer_addr(ctx, p)
+                || self.banned.contains(&p.ip())
+                || ctx.is_banned_ip(p.ip())
+            {
                 continue;
             }
             if self.known.insert(p) {
@@ -605,6 +742,16 @@ impl Torrent {
 
 /// Peer address filtering (AGENTS.md 5.5): drop unspecified, multicast,
 /// link-local, port 0, and our own listen endpoint.
+/// Which of a torrent's settings the caller gave explicitly at add time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SettingsExplicit {
+    pub sequential: bool,
+    pub upload_limit: bool,
+    pub download_limit: bool,
+    pub max_peers: bool,
+    pub max_uploads: bool,
+}
+
 /// A v4-mapped v6 socket address as the IPv4 address it names; anything
 /// else unchanged.
 pub fn canonical_addr(a: SocketAddr) -> SocketAddr {
@@ -654,9 +801,15 @@ fn resume_file(dir: &std::path::Path, h: &InfoHash) -> PathBuf {
 /// `Session::add_torrent`.
 pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<TorrentId, Error> {
     let now = Instant::now();
+    let mut extras: (Option<String>, Option<String>, Option<i64>) = (None, None, None);
     let (info_hash, name, tiers, web_seeds, parsed) = match &params.source {
         TorrentSource::Metainfo(bytes) => {
             let meta = Metainfo::parse(bytes).map_err(|e| Error::Metainfo(e.to_string()))?;
+            extras = (
+                meta.comment.clone(),
+                meta.created_by.clone(),
+                meta.creation_date,
+            );
             if meta.info.has_v2 && meta.info.piece_hashes.is_empty() {
                 return Err(Error::Unsupported("v2-only torrents (BEP 52) are deferred"));
             }
@@ -705,9 +858,19 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         metadata: super::metadata::Fetch::default(),
         pex: super::pex::State::default(),
         web_seeds,
+        comment: extras.0,
+        created_by: extras.1,
+        creation_date: extras.2,
         webseed: super::webseed::State::default(),
         save_path: params.save_path.clone(),
-        sequential: params.sequential,
+        sequential: params.sequential.unwrap_or(false),
+        settings_explicit: SettingsExplicit {
+            sequential: params.sequential.is_some(),
+            upload_limit: params.upload_limit.is_some(),
+            download_limit: params.download_limit.is_some(),
+            max_peers: params.max_peers.is_some(),
+            max_uploads: params.max_uploads.is_some(),
+        },
         pending_priorities: params.file_priorities.clone(),
         select_only: magnet.as_ref().and_then(|m| m.select_only.clone()),
         moving: false,
@@ -738,8 +901,8 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         check_queued: false,
         error: None,
         stats: Stats::default(),
-        up_limit: Limiter::new(params.upload_limit, now),
-        down_limit: Limiter::new(params.download_limit, now),
+        up_limit: Limiter::new(params.upload_limit.unwrap_or(0), now),
+        down_limit: Limiter::new(params.download_limit.unwrap_or(0), now),
         peers: HashMap::new(),
         candidates: VecDeque::new(),
         candidates_dirty: false,
@@ -837,7 +1000,11 @@ fn wanted_files_present(torrent: &Rc<RefCell<Torrent>>) -> bool {
         .iter()
         .enumerate()
         .filter(|(i, f)| !f.is_padding() && prios.get(*i).copied().unwrap_or(0) > 0)
-        .all(|(_, f)| std::fs::metadata(f.path.to_path(&t.save_path)).is_ok())
+        .all(|(i, _)| {
+            storage
+                .file_path(i)
+                .is_some_and(|p| std::fs::metadata(p).is_ok())
+        })
 }
 
 /// Load the resume file, if any (unreadable data is ignored with a warning).
@@ -858,6 +1025,25 @@ fn load_resume(ctx: &Ctx, torrent: &Rc<RefCell<Torrent>>) -> Option<ResumeData> 
         if let Some(q) = r.queue_position {
             t.queue_position = q;
             ctx.note_queue_position(q);
+        }
+        // Per-torrent settings (v5), unless the caller set them.
+        let now = Instant::now();
+        let e = t.settings_explicit;
+        if !e.sequential {
+            t.sequential = r.sequential;
+            t.picker.set_sequential(r.sequential);
+        }
+        if !e.upload_limit {
+            t.up_limit.set_rate(r.upload_limit, now);
+        }
+        if !e.download_limit {
+            t.down_limit.set_rate(r.download_limit, now);
+        }
+        if !e.max_peers {
+            t.max_peers = r.max_peers.map(|m| m as usize);
+        }
+        if !e.max_uploads {
+            t.max_uploads = r.max_uploads.map(|m| m as usize);
         }
     }
     Some(r)
@@ -918,7 +1104,27 @@ fn attach_metadata(
             .filter(|r| r.matches(&info) && r.file_priorities.len() == info.files.len())
             .map(|r| r.file_priorities.clone()),
     };
-    let storage = Rc::new(ctx.disk.open(info.clone(), t.save_path.clone(), initial));
+    // Renamed paths from the resume data (v5), validated like any path.
+    let mapped: Vec<Option<metainfo::SafePath>> = resume
+        .filter(|r| r.matches(&info) && r.mapped_files.len() == info.files.len())
+        .map(|r| {
+            r.mapped_files
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    if m.is_empty() {
+                        return None;
+                    }
+                    let comps: Vec<&[u8]> = m.split('/').map(str::as_bytes).collect();
+                    metainfo::SafePath::from_components(&comps, i).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let storage = Rc::new(
+        ctx.disk
+            .open_mapped(info.clone(), t.save_path.clone(), initial, mapped),
+    );
     let mut picker = Picker::new(info.piece_count(), info.piece_length, info.total_length);
     picker.set_sequential(t.sequential);
     picker.set_extent_affinity(ctx.cfg.piece_extent_affinity);
@@ -1013,12 +1219,12 @@ async fn initial_check(
     files_present: bool,
     resume: Option<ResumeData>,
 ) {
-    let (storage, info, save_path) = {
+    let (storage, info) = {
         let t = torrent.borrow();
         let (Some(s), Some(i)) = (t.storage.clone(), t.info.clone()) else {
             return;
         };
-        (s, i, t.save_path.clone())
+        (s, i)
     };
     let mut have = Bitfield::new(info.piece_count());
     let mut carried: Option<(u64, u64)> = None;
@@ -1031,10 +1237,11 @@ async fn initial_check(
             t.seeding_time = Duration::from_secs(r.seeding_time);
         }
         _ => {
-            let any_data = info
-                .content_files()
-                .any(|f| std::fs::metadata(f.path.to_path(&save_path)).is_ok_and(|m| m.len() > 0))
-                || std::fs::metadata(storage.parts_path()).is_ok_and(|m| m.len() > 0);
+            let any_data = (0..info.files.len()).any(|i| {
+                storage
+                    .file_path(i)
+                    .is_some_and(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
+            }) || std::fs::metadata(storage.parts_path()).is_ok_and(|m| m.len() > 0);
             if any_data {
                 let result = checked(&ctx, &torrent, storage.check_all()).await;
                 match result {
@@ -1357,7 +1564,22 @@ pub async fn delete_files(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
 /// Persist resume data: fsync content first so the have-set never claims data
 /// the disk does not hold.
 pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
-    let (storage, path, have, downloaded, uploaded, info, times, auto_managed, queue_position) = {
+    let (
+        storage,
+        path,
+        have,
+        downloaded,
+        uploaded,
+        info,
+        times,
+        auto_managed,
+        queue_position,
+        sequential,
+        upload_limit,
+        download_limit,
+        max_peers,
+        max_uploads,
+    ) = {
         let t = torrent.borrow();
         let Some(path) = t.resume_path.clone() else {
             return Ok(());
@@ -1377,6 +1599,11 @@ pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Resul
             t.times(Instant::now()),
             t.auto_managed,
             t.queue_position,
+            t.sequential,
+            t.up_limit.rate(),
+            t.down_limit.rate(),
+            t.max_peers,
+            t.max_uploads,
         )
     };
     // Bounded concurrency: each save fsyncs the torrent's files.
@@ -1401,6 +1628,25 @@ pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Resul
         seeding_time: times.1.as_secs(),
         auto_managed,
         queue_position: Some(queue_position),
+        sequential,
+        upload_limit,
+        download_limit,
+        max_peers: max_peers.map(|m| m.min(u32::MAX as usize) as u32),
+        max_uploads: max_uploads.map(|m| m.min(u32::MAX as usize) as u32),
+        mapped_files: {
+            let mapped = storage.mapped_files();
+            if mapped.iter().all(Option::is_none) {
+                Vec::new()
+            } else {
+                mapped
+                    .iter()
+                    .map(|m| {
+                        m.as_ref()
+                            .map_or(String::new(), |p| p.components().join("/"))
+                    })
+                    .collect()
+            }
+        },
     };
     data.save(&path)?;
     let mut t = torrent.borrow_mut();
@@ -1512,6 +1758,7 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
         };
         t.candidates.push_back(addr);
         if t.banned.contains(&addr.ip())
+            || ctx.is_banned_ip(addr.ip())
             || t.has_peer_ip(addr.ip()) // one connection per IP, as the oracle
             || t.connecting.contains(&addr)
             || t.failed
@@ -1864,6 +2111,63 @@ pub async fn move_storage(
         }
         Err(e) => Err(Error::Io(format!("move storage: {e}"))),
     }
+}
+
+/// `Session::rename_file`: `index` counts content files (the public
+/// numbering); the storage move happens under the same quiescing as a
+/// storage move, as a disk-ring barrier.
+pub async fn rename_file(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    index: usize,
+    path: &str,
+) -> Result<(), Error> {
+    let components: Vec<&[u8]> = path
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .map(str::as_bytes)
+        .collect();
+    let safe = metainfo::SafePath::from_components(&components, index)
+        .map_err(|e| Error::InvalidArgument(format!("path: {e}")))?;
+    let (storage, file_index) = {
+        let mut t = torrent.borrow_mut();
+        let (Some(storage), Some(info)) = (t.storage.clone(), t.info.clone()) else {
+            return Err(Error::Busy("metadata not known yet"));
+        };
+        let file_index = *Torrent::content_indices(&info)
+            .get(index)
+            .ok_or_else(|| Error::InvalidArgument(format!("no file {index}")))?;
+        if t.moving {
+            return Err(Error::Busy("storage is being moved"));
+        }
+        if t.checking {
+            return Err(Error::Busy("torrent is checking"));
+        }
+        t.moving = true;
+        (storage, file_index)
+    };
+    for _ in 0..600 {
+        let quiet = {
+            let t = torrent.borrow();
+            t.writes_in_flight == 0 && t.verifying.is_empty()
+        };
+        if quiet {
+            break;
+        }
+        uring::sleep(Duration::from_millis(50)).await;
+    }
+    let result = storage.rename_file(file_index, safe).await;
+    let gate = {
+        let mut t = torrent.borrow_mut();
+        t.moving = false;
+        if result.is_ok() {
+            t.resume_dirty = true;
+        }
+        t.move_gate.clone()
+    };
+    gate.notify();
+    let _ = ctx;
+    result.map_err(|e| Error::Io(format!("rename file: {e}")))
 }
 
 /// Wait while a storage move is in progress (disk I/O callers).

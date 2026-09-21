@@ -250,3 +250,57 @@ pub fn event_param(line: &str) -> Option<String> {
                 .map(|v| v.split(' ').next().unwrap().to_string())
         })
 }
+
+/// Minimal HTTP/1.1 server honouring `Range: bytes=a-b` for one file.
+pub fn spawn_range_server(
+    data: Arc<Vec<u8>>,
+    path: &'static str,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits2 = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let data = data.clone();
+            let hits = hits2.clone();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = s.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                assert!(
+                    head.starts_with(&format!("GET {path} HTTP/1.1\r\n")),
+                    "{head}"
+                );
+                let range = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Range: bytes="))
+                    .expect("range header");
+                let (a, b) = range.split_once('-').unwrap();
+                let a: usize = a.parse().unwrap();
+                let b: usize = b.parse().unwrap();
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let body = &data[a..=b.min(data.len() - 1)];
+                let resp = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    data.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.write_all(body);
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}{path}"), hits)
+}

@@ -101,6 +101,11 @@ impl UtpHost {
         self.mgr.borrow().len()
     }
 
+    /// Accept (or refuse) incoming uTP connections from now on.
+    pub fn set_incoming(&self, on: bool) {
+        self.mgr.borrow_mut().set_incoming_enabled(on);
+    }
+
     /// Payload bytes copied in user space on the uTP data path (see
     /// [`utp::Stats::copied_bytes`]).
     pub fn copied_bytes(&self) -> u64 {

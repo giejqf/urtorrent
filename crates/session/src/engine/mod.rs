@@ -187,6 +187,28 @@ pub enum Command {
     SetMaxPeers(TorrentId, Option<usize>, oneshot::Sender<Result<(), Error>>),
     SetMaxUploads(TorrentId, Option<usize>, oneshot::Sender<Result<(), Error>>),
     SetSessionLimits(SessionLimit, oneshot::Sender<()>),
+    SetEncryption(crate::api::EncryptionMode, oneshot::Sender<()>),
+    SetTransports(crate::api::TransportPolicy, oneshot::Sender<()>),
+    SetPex(bool, oneshot::Sender<()>),
+    SetLsd(bool, oneshot::Sender<()>),
+    BanIp(IpAddr, bool, oneshot::Sender<()>),
+    BannedIps(oneshot::Sender<Vec<IpAddr>>),
+    Settings(oneshot::Sender<crate::api::SessionSettings>),
+    Files(
+        TorrentId,
+        oneshot::Sender<Result<Vec<crate::api::FileStatus>, Error>>,
+    ),
+    Trackers(
+        TorrentId,
+        oneshot::Sender<Result<Vec<TrackerStatus>, Error>>,
+    ),
+    Pieces(
+        TorrentId,
+        oneshot::Sender<Result<Vec<crate::api::PieceInfo>, Error>>,
+    ),
+    TorrentFile(TorrentId, oneshot::Sender<Result<Option<Vec<u8>>, Error>>),
+    WebSeed(TorrentId, String, bool, oneshot::Sender<Result<(), Error>>),
+    RenameFile(TorrentId, usize, String, oneshot::Sender<Result<(), Error>>),
     SetActiveLimits(ActiveLimits, oneshot::Sender<()>),
     SetAutoManaged(TorrentId, bool, oneshot::Sender<Result<(), Error>>),
     ForceResume(TorrentId, oneshot::Sender<Result<(), Error>>),
@@ -274,6 +296,18 @@ pub struct Ctx {
     max_peers: Cell<usize>,
     /// Active-torrent queue limits (`Session::set_active_limits`).
     active_limits: Cell<ActiveLimits>,
+    /// MSE policy (`Session::set_encryption`).
+    encryption: Cell<crate::api::EncryptionMode>,
+    /// Transport policy (`Session::set_transports`).
+    transports: Cell<crate::api::TransportPolicy>,
+    /// PEX on (`Session::set_pex`).
+    pex: Cell<bool>,
+    /// LSD on (`Session::set_lsd`); the sockets in `lsd` stay open once
+    /// opened.
+    lsd_on: Cell<bool>,
+    /// Addresses banned by the caller (`Session::ban_ip`): never dialled,
+    /// never accepted, for every torrent.
+    banned_ips: RefCell<HashSet<IpAddr>>,
     /// Next queue position handed to an added torrent.
     next_queue_position: Cell<u64>,
     /// Payload bytes copied in user space by connections since closed (live
@@ -405,6 +439,31 @@ impl Ctx {
     /// The active-torrent limits.
     pub fn active_limits(&self) -> ActiveLimits {
         self.active_limits.get()
+    }
+
+    /// The MSE policy in force.
+    pub fn encryption(&self) -> crate::api::EncryptionMode {
+        self.encryption.get()
+    }
+
+    /// The transport policy in force.
+    pub fn transports(&self) -> crate::api::TransportPolicy {
+        self.transports.get()
+    }
+
+    /// Whether PEX is on.
+    pub fn pex(&self) -> bool {
+        self.pex.get()
+    }
+
+    /// Whether LSD is on (and its sockets are open).
+    pub fn lsd_on(&self) -> bool {
+        self.lsd_on.get() && self.lsd.borrow().is_some()
+    }
+
+    /// Whether the caller banned `ip` (`Session::ban_ip`).
+    pub fn is_banned_ip(&self, ip: IpAddr) -> bool {
+        self.banned_ips.borrow().contains(&ip)
     }
 
     /// A fresh queue position at the back of the queue.
@@ -696,9 +755,10 @@ pub fn run(
                     return;
                 }
             };
-        let utp_host = if cfg.transports.utp_outgoing()
-            && (udp_demux.supports(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-                || udp_demux.supports(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
+        // The uTP host exists whenever there is a UDP socket; the transport
+        // policy (changeable at runtime) decides whether it is used.
+        let utp_host = if udp_demux.supports(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            || udp_demux.supports(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
         {
             Some(utp::UtpHost::new(
                 utp::default_config(),
@@ -742,6 +802,11 @@ pub fn run(
             max_connections: Cell::new(cfg.max_connections),
             max_peers: Cell::new(cfg.max_peers),
             active_limits: Cell::new(cfg.active_limits),
+            encryption: Cell::new(cfg.encryption),
+            transports: Cell::new(cfg.transports),
+            pex: Cell::new(cfg.pex),
+            lsd_on: Cell::new(cfg.lsd),
+            banned_ips: RefCell::new(HashSet::new()),
             next_queue_position: Cell::new(0),
             copied: Cell::new(0),
             own_ips: RefCell::new(HashSet::new()),
@@ -838,7 +903,7 @@ async fn accept_loop(ctx: Rc<Ctx>, listener: TcpListener) {
     loop {
         match select2(listener.accept(), ctx.closing.wait()).await {
             Either::Left(Ok(stream)) => {
-                if !ctx.cfg.transports.tcp_incoming() {
+                if !ctx.transports().tcp_incoming() {
                     // libtorrent accepts and drops (`enable_incoming_tcp`).
                     drop(stream);
                     continue;
@@ -1136,6 +1201,86 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             }
             let _ = reply.send(());
         }
+        Command::SetEncryption(mode, reply) => {
+            ctx.encryption.set(mode);
+            let _ = reply.send(());
+        }
+        Command::SetTransports(policy, reply) => {
+            ctx.transports.set(policy);
+            if let Some(h) = &ctx.utp {
+                h.set_incoming(policy.utp_incoming());
+            }
+            let _ = reply.send(());
+        }
+        Command::SetPex(on, reply) => {
+            ctx.pex.set(on);
+            let _ = reply.send(());
+        }
+        Command::SetLsd(on, reply) => {
+            ctx.lsd_on.set(on);
+            if on && ctx.lsd.borrow().is_none() {
+                // Opened on first use; the sockets then stay for the session.
+                let opened = lsd::Lsd::open(
+                    if ctx.families.v4 {
+                        ctx.cfg.listen_v4
+                    } else {
+                        None
+                    },
+                    if ctx.families.v6 {
+                        ctx.cfg.listen_v6
+                    } else {
+                        None
+                    },
+                    (ctx.rng.next_u64() >> 33) as u32,
+                );
+                if let Some(l) = opened {
+                    l.spawn(ctx.clone());
+                    *ctx.lsd.borrow_mut() = Some(l);
+                }
+            }
+            let _ = reply.send(());
+        }
+        Command::BanIp(ip, on, reply) => {
+            if on {
+                ctx.banned_ips.borrow_mut().insert(ip);
+                // Drop what is connected from there, on every torrent.
+                for t in ctx.torrents.borrow().values() {
+                    let t = t.borrow();
+                    for p in t.peers.values() {
+                        if p.addr.ip() == ip {
+                            p.close("banned");
+                        }
+                    }
+                }
+            } else {
+                ctx.banned_ips.borrow_mut().remove(&ip);
+            }
+            let _ = reply.send(());
+        }
+        Command::BannedIps(reply) => {
+            let mut v: Vec<IpAddr> = ctx.banned_ips.borrow().iter().copied().collect();
+            v.sort();
+            let _ = reply.send(v);
+        }
+        Command::Settings(reply) => {
+            let _ = reply.send(crate::api::SessionSettings {
+                listen_port: ctx.listen_port,
+                listen_v4: ctx.cfg.listen_v4,
+                listen_v6: ctx.cfg.listen_v6,
+                profile: ctx.cfg.profile.name.to_string(),
+                dht: ctx.dht.is_some(),
+                upload_limit: ctx.up_limit.rate(),
+                download_limit: ctx.down_limit.rate(),
+                max_connections: ctx.max_connections(),
+                max_peers_per_torrent: ctx.default_max_peers(),
+                unchoke_slots: ctx.slots.get(),
+                active_limits: ctx.active_limits(),
+                encryption: ctx.encryption(),
+                transports: ctx.transports(),
+                pex: ctx.pex(),
+                lsd: ctx.lsd_on(),
+            });
+        }
         Command::SetActiveLimits(limits, reply) => {
             ctx.active_limits.set(limits);
             queue::recalculate(ctx, Instant::now());
@@ -1203,7 +1348,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 .torrent(id)
                 .map(|t| {
                     t.borrow()
-                        .status(Instant::now(), queue_index(&positions, id))
+                        .status(Instant::now(), queue_index(&positions, id), true)
                 })
                 .ok_or(Error::NoSuchTorrent);
             let _ = reply.send(r);
@@ -1217,12 +1362,74 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 .values()
                 .map(|t| {
                     let t = t.borrow();
-                    t.status(now, queue_index(&positions, t.id))
+                    t.status(now, queue_index(&positions, t.id), false)
                 })
                 .collect();
             v.sort_by_key(|s| s.id);
             let _ = reply.send(v);
         }
+        Command::Files(id, reply) => {
+            let r = ctx
+                .torrent(id)
+                .map(|t| t.borrow().files())
+                .ok_or(Error::NoSuchTorrent);
+            let _ = reply.send(r);
+        }
+        Command::Trackers(id, reply) => {
+            let r = ctx
+                .torrent(id)
+                .map(|t| t.borrow().trackers(Instant::now()))
+                .ok_or(Error::NoSuchTorrent);
+            let _ = reply.send(r);
+        }
+        Command::Pieces(id, reply) => {
+            let r = ctx
+                .torrent(id)
+                .map(|t| t.borrow().pieces())
+                .ok_or(Error::NoSuchTorrent);
+            let _ = reply.send(r);
+        }
+        Command::TorrentFile(id, reply) => {
+            let r = ctx
+                .torrent(id)
+                .map(|t| t.borrow().torrent_file())
+                .ok_or(Error::NoSuchTorrent);
+            let _ = reply.send(r);
+        }
+        Command::RenameFile(id, index, path, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let ctx2 = ctx.clone();
+                uring::spawn(async move {
+                    let r = torrent::rename_file(&ctx2, &t, index, &path).await;
+                    let _ = reply.send(r);
+                });
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::WebSeed(id, url, add, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                {
+                    let mut tb = t.borrow_mut();
+                    if add {
+                        if !tb.web_seeds.contains(&url) {
+                            tb.web_seeds.push(url);
+                        }
+                    } else {
+                        tb.web_seeds.retain(|u| *u != url);
+                    }
+                    tb.resume_dirty = true;
+                }
+                if add {
+                    webseed::start(ctx, &t);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
         Command::Peers(id, reply) => {
             let r = ctx
                 .torrent(id)
@@ -1356,7 +1563,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
                     tracker_task::scrape_all(&ctx2, &t).await;
-                    let st = t.borrow().status(Instant::now(), 0);
+                    let st = t.borrow().status(Instant::now(), 0, true);
                     let _ = reply.send(Ok(st.trackers));
                 });
             }

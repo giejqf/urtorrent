@@ -24,8 +24,10 @@ use metainfo::Bitfield;
 /// Current resume-data format version. Version 2 added `file_priorities`
 /// (optional; version-1 files read as "all default"), version 3 the time
 /// counters, version 4 the queue fields (`auto_managed`, `queue_position`;
-/// absent in older files: managed, appended).
-pub const FORMAT_VERSION: i64 = 4;
+/// absent in older files: managed, appended), version 5 the per-torrent
+/// settings (`sequential`, rate limits, `max_peers`, `max_uploads`) and the
+/// renamed file paths (`mapped_files`); all optional on read.
+pub const FORMAT_VERSION: i64 = 5;
 
 /// Decoded resume data for one torrent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,19 @@ pub struct ResumeData {
     pub auto_managed: bool,
     /// Queue order key (v4; `None` when absent: appended on load).
     pub queue_position: Option<u64>,
+    /// Sequential download (v5).
+    pub sequential: bool,
+    /// Upload limit in bytes/s, 0 = unlimited (v5).
+    pub upload_limit: u64,
+    /// Download limit in bytes/s, 0 = unlimited (v5).
+    pub download_limit: u64,
+    /// Per-torrent connection cap (v5).
+    pub max_peers: Option<u32>,
+    /// Per-torrent upload slot cap (v5).
+    pub max_uploads: Option<u32>,
+    /// Renamed file paths per `info.files` entry, `/`-separated; an empty
+    /// string means the metainfo's path (v5; empty list = none renamed).
+    pub mapped_files: Vec<String>,
 }
 
 impl ResumeData {
@@ -78,6 +93,12 @@ impl ResumeData {
             seeding_time: 0,
             auto_managed: true,
             queue_position: None,
+            sequential: false,
+            upload_limit: 0,
+            download_limit: 0,
+            max_peers: None,
+            max_uploads: None,
+            mapped_files: Vec::new(),
         }
     }
 
@@ -90,7 +111,13 @@ impl ResumeData {
         let pieces = self.have.len() as i64;
         let active = self.active_time.min(i64::MAX as u64) as i64;
         let seeding = self.seeding_time.min(i64::MAX as u64) as i64;
-        // Keys in sorted order (canonical bencode).
+        let mapped: Vec<Value<'_>> = self
+            .mapped_files
+            .iter()
+            .map(|p| Value::Bytes(p.as_bytes()))
+            .collect();
+        // The encoder sorts the keys (canonical bencode); optional keys are
+        // simply left out.
         let mut entries: Vec<(&[u8], Value)> = vec![
             (b"active_time", Value::Int(active)),
             (b"auto_managed", Value::Int(i64::from(self.auto_managed))),
@@ -105,19 +132,36 @@ impl ResumeData {
             (b"uploaded", Value::Int(up)),
         ];
         if !self.file_priorities.is_empty() {
-            // `file_priorities` sorts between `downloaded` and `format`.
-            entries.insert(3, (b"file_priorities", Value::Bytes(&self.file_priorities)));
+            entries.push((b"file_priorities", Value::Bytes(&self.file_priorities)));
         }
         if let Some(q) = self.queue_position {
-            // `queue_position` sorts between `pieces` and `seeding_time`.
-            let at = entries
-                .iter()
-                .position(|(k, _)| *k == b"seeding_time")
-                .unwrap_or(entries.len());
-            entries.insert(
-                at,
-                (b"queue_position", Value::Int(q.min(i64::MAX as u64) as i64)),
-            );
+            entries.push((b"queue_position", Value::Int(q.min(i64::MAX as u64) as i64)));
+        }
+        if self.format_version >= 5 {
+            entries.push((b"sequential", Value::Int(i64::from(self.sequential))));
+            entries.push((
+                b"upload_limit",
+                Value::Int(self.upload_limit.min(i64::MAX as u64) as i64),
+            ));
+            entries.push((
+                b"download_limit",
+                Value::Int(self.download_limit.min(i64::MAX as u64) as i64),
+            ));
+            if let Some(m) = self.max_peers {
+                entries.push((b"max_peers", Value::Int(i64::from(m))));
+            }
+            if let Some(m) = self.max_uploads {
+                entries.push((b"max_uploads", Value::Int(i64::from(m))));
+            }
+            if !mapped.is_empty() {
+                entries.push((
+                    b"mapped_files",
+                    Value::List {
+                        items: mapped,
+                        raw: b"",
+                    },
+                ));
+            }
         }
         bencode::to_bytes(&Value::Dict { entries, raw: b"" })
     }
@@ -202,6 +246,40 @@ impl ResumeData {
                 .and_then(Value::as_int)
                 .filter(|q| *q >= 0)
                 .map(|q| q as u64),
+            // v5 fields.
+            sequential: v
+                .get_str("sequential")
+                .and_then(Value::as_int)
+                .is_some_and(|x| x != 0),
+            upload_limit: secs("upload_limit"),
+            download_limit: secs("download_limit"),
+            max_peers: v
+                .get_str("max_peers")
+                .and_then(Value::as_int)
+                .filter(|m| *m >= 0)
+                .map(|m| m.min(i64::from(u32::MAX)) as u32),
+            max_uploads: v
+                .get_str("max_uploads")
+                .and_then(Value::as_int)
+                .filter(|m| *m >= 0)
+                .map(|m| m.min(i64::from(u32::MAX)) as u32),
+            mapped_files: v
+                .get_str("mapped_files")
+                .and_then(|l| match l {
+                    Value::List { items, .. } => Some(
+                        items
+                            .iter()
+                            .take(1 << 20)
+                            .map(|it| {
+                                it.as_bytes()
+                                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                                    .unwrap_or_default()
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -273,7 +351,31 @@ mod tests {
             seeding_time: 1200,
             auto_managed: false,
             queue_position: Some(7),
+            sequential: true,
+            upload_limit: 1234,
+            download_limit: 0,
+            max_peers: Some(30),
+            max_uploads: None,
+            mapped_files: vec![String::new(), "renamed/b.bin".into(), String::new()],
         }
+    }
+
+    /// A version-4 file (no per-torrent settings) still loads with the
+    /// defaults.
+    #[test]
+    fn reads_format_version_4() {
+        let mut v4 = sample();
+        v4.format_version = 4;
+        let bytes = v4.encode();
+        assert!(!bytes.windows(10).any(|w| w == b"sequential"));
+        let back = ResumeData::decode(&bytes).unwrap();
+        assert_eq!(back.format_version, 4);
+        assert!(!back.sequential);
+        assert_eq!((back.upload_limit, back.download_limit), (0, 0));
+        assert_eq!(back.max_peers, None);
+        assert!(back.mapped_files.is_empty());
+        assert_eq!(back.queue_position, Some(7));
+        assert!(!back.auto_managed);
     }
 
     /// A version-3 file (no queue fields) still loads: managed, no position.

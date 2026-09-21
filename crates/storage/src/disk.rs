@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use metainfo::{Bitfield, Info};
+use metainfo::{Bitfield, Info, SafePath};
 use uring::{Bridge, Completer, Notifier, NotifyHandle, Runtime, Ticket};
 
 use crate::hash::HashPool;
@@ -36,6 +36,14 @@ enum Job {
         info: Arc<Info>,
         root: PathBuf,
         prios: Option<Vec<u8>>,
+        /// Renamed file paths (from resume data), per `info.files` entry.
+        mapped: Vec<Option<SafePath>>,
+    },
+    RenameFile {
+        id: u64,
+        index: usize,
+        path: SafePath,
+        done: Done,
     },
     CreateFiles {
         id: u64,
@@ -332,6 +340,18 @@ impl DiskRing {
         root: PathBuf,
         prios: Option<Vec<u8>>,
     ) -> DiskStore {
+        self.open_mapped(info, root, prios, Vec::new())
+    }
+
+    /// [`DiskRing::open`] with renamed file paths restored from resume data
+    /// (per `info.files` entry, `None` = the metainfo's path).
+    pub fn open_mapped(
+        self: &Rc<Self>,
+        info: Arc<Info>,
+        root: PathBuf,
+        prios: Option<Vec<u8>>,
+        mapped: Vec<Option<SafePath>>,
+    ) -> DiskStore {
         let id = {
             let mut n = self.next_id.borrow_mut();
             let v = *n;
@@ -368,11 +388,14 @@ impl DiskRing {
                 .collect(),
         };
         debug_assert_eq!(priorities.len(), n);
+        let mut mapped = mapped;
+        mapped.resize(n, None);
         self.submit(Job::Open {
             id,
             info: info.clone(),
             root: root.clone(),
             prios,
+            mapped: mapped.clone(),
         });
         DiskStore {
             ring: self.clone(),
@@ -381,6 +404,7 @@ impl DiskRing {
             root: RefCell::new(root),
             have: RefCell::new(Bitfield::new(info.piece_count())),
             priorities: RefCell::new(priorities),
+            mapped: RefCell::new(mapped),
         }
     }
 }
@@ -409,6 +433,8 @@ pub struct DiskStore {
     have: RefCell<Bitfield>,
     /// Mirror of the file priorities (per `info.files` entry).
     priorities: RefCell<Vec<u8>>,
+    /// Mirror of the renamed paths (per `info.files` entry).
+    mapped: RefCell<Vec<Option<SafePath>>>,
 }
 
 impl DiskStore {
@@ -464,6 +490,48 @@ impl DiskStore {
     /// Current file priorities (per `info.files` entry).
     pub fn file_priorities(&self) -> Vec<u8> {
         self.priorities.borrow().clone()
+    }
+
+    /// Where file `index` lives, relative to the save path (the metainfo's
+    /// path unless renamed).
+    pub fn rel_path(&self, index: usize) -> Option<SafePath> {
+        let f = self.info.files.get(index)?;
+        Some(
+            self.mapped
+                .borrow()
+                .get(index)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| f.path.clone()),
+        )
+    }
+
+    /// Where file `index` lives on disk now.
+    pub fn file_path(&self, index: usize) -> Option<PathBuf> {
+        self.rel_path(index).map(|p| p.to_path(&self.root.borrow()))
+    }
+
+    /// The renamed paths (per `info.files` entry) for resume data.
+    pub fn mapped_files(&self) -> Vec<Option<SafePath>> {
+        self.mapped.borrow().clone()
+    }
+
+    /// Rename file `index` to `path` (see [`Storage::rename_file`]).
+    pub async fn rename_file(&self, index: usize, path: SafePath) -> Result<(), Error> {
+        let (t, done) = self.ticket();
+        self.ring.submit(Job::RenameFile {
+            id: self.id,
+            index,
+            path: path.clone(),
+            done,
+        });
+        let r = unit(t.await);
+        if r.is_ok()
+            && let Some(slot) = self.mapped.borrow_mut().get_mut(index)
+        {
+            *slot = Some(path);
+        }
+        r
     }
 
     /// Piece priorities derived from the file priorities.
@@ -691,6 +759,7 @@ fn is_barrier(j: &Job) -> bool {
             | Job::SetHave { .. }
             | Job::SetPriorities { .. }
             | Job::MoveTo { .. }
+            | Job::RenameFile { .. }
             | Job::SyncAll { .. }
             | Job::CreateFiles { .. }
             | Job::DeleteFiles { .. }
@@ -776,8 +845,10 @@ fn dispatch(stores: &Stores, pool: &Rc<HashPool>, res: &Rc<DiskResources>, job: 
             info,
             root,
             prios,
+            mapped,
         } => {
             let storage = Storage::with_resources(info, root, pool.clone(), res.clone());
+            storage.set_mapped_files(mapped);
             if let Some(p) = prios {
                 storage.init_priorities(&p);
             }
@@ -824,6 +895,7 @@ fn job_id(j: &Job) -> u64 {
         | Job::SetHave { id, .. }
         | Job::SetPriorities { id, .. }
         | Job::MoveTo { id, .. }
+        | Job::RenameFile { id, .. }
         | Job::SyncAll { id, .. }
         | Job::Close { id } => *id,
         Job::Shutdown => 0,
@@ -839,6 +911,7 @@ fn fail(job: Job, why: &str) {
         | Job::Write { done, .. }
         | Job::SetPriorities { done, .. }
         | Job::MoveTo { done, .. }
+        | Job::RenameFile { done, .. }
         | Job::SyncAll { done, .. } => done.complete(Reply::Unit(Err(err()))),
         Job::ReadBlock { done, .. } => done.complete(Reply::Bytes(Err(err()))),
         Job::VerifyPiece { done, .. } => done.complete(Reply::Bool(Err(err()))),
@@ -975,6 +1048,11 @@ async fn run_job(entry: Rc<RefCell<Entry>>, job: Job) {
         }
         Job::MoveTo { root, done, .. } => {
             done.complete(Reply::Unit(storage.move_to(root).await));
+        }
+        Job::RenameFile {
+            index, path, done, ..
+        } => {
+            done.complete(Reply::Unit(storage.rename_file(index, path).await));
         }
         Job::SyncAll { done, .. } => {
             done.complete(Reply::Unit(storage.sync_all().await));
