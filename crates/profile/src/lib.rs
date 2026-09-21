@@ -138,6 +138,13 @@ pub enum AnnounceParam {
     Redundant,
     /// `trackerid` (only when the tracker returned one).
     TrackerId,
+    /// BEP 7 `ipv4=<addr>`, once per address in
+    /// `AnnounceRequest::ipv4_hints` (libtorrent: the explicitly bound,
+    /// public IPv4 listen addresses, private torrents only).
+    Ipv4Hints,
+    /// BEP 7 `ipv6=<addr>` (percent-escaped), once per address in
+    /// `AnnounceRequest::ipv6_hints`.
+    Ipv6Hints,
 }
 
 /// How the announce `key` is rendered.
@@ -414,8 +421,14 @@ const QBT_ANNOUNCE_PARAMS: &[AnnounceParam] = &[
     AnnounceParam::NoPeerId,
     AnnounceParam::SupportCrypto,
     AnnounceParam::Redundant,
-    // UNVERIFIED position: no golden capture has a tracker id yet (M4).
+    // The tail follows libtorrent 2.0.14 http_tracker_connection.cpp (no
+    // capture shows it: the lab's addresses are RFC 1918 / ULA, which
+    // libtorrent treats as local, and no tap tracker returns a tracker id):
+    // `&trackerid=` when the tracker gave one, then `&ipv4=` / `&ipv6=` for
+    // private torrents (docs/quirks.md Q22).
     AnnounceParam::TrackerId,
+    AnnounceParam::Ipv4Hints,
+    AnnounceParam::Ipv6Hints,
 ];
 
 /// Headers in the order the oracle emits them (same captures).
@@ -524,13 +537,13 @@ impl Profile {
         Profile {
             name: "native",
             peer_id: PeerIdShape {
-                prefix: "-UR0040-",
+                prefix: "-UR0410-",
                 tail_alphabet: NATIVE_TAIL_ALPHABET,
                 lifetime: PeerIdLifetime::PerSession,
                 handshake: HandshakePeerId::SameAsAnnounce,
             },
-            user_agent: "urtorrent/0.4.0",
-            ltep_version: "urtorrent 0.4.0",
+            user_agent: "urtorrent/0.4.1",
+            ltep_version: "urtorrent 0.4.1",
             http: HttpAnnounceShape {
                 params: QBT_ANNOUNCE_PARAMS,
                 headers: QBT_ANNOUNCE_HEADERS,
@@ -704,7 +717,7 @@ mod tests {
         }
         assert_eq!(p.peer_id.lifetime, PeerIdLifetime::PerTorrent);
         let n = Profile::native().peer_id.generate(&mut Counter(2));
-        assert_eq!(&n[..8], b"-UR0040-");
+        assert_eq!(&n[..8], b"-UR0410-");
         assert!(n[8..].iter().all(u8::is_ascii_alphanumeric));
     }
 

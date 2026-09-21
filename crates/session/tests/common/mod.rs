@@ -153,6 +153,7 @@ pub fn spawn_seeder(info_hash: [u8; 20], data: Arc<Vec<u8>>, piece_len: usize) -
                     our_peer_id: *b"-TS0001-seederseeder",
                     profile: profile::Profile::native(),
                     piece_count: Some(pieces),
+                    piece_length: Some(16 * 1024),
                     our_have: Bitfield::all_set(pieces),
                     listen_port: addr.port(),
                     peer_ip: stream.peer_addr().ok().map(|a| a.ip()),

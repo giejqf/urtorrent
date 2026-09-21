@@ -383,3 +383,61 @@ Accepted differences: the number of floor-sized packets between two probe
 steps and the ack cadence depend on how fast the application drains its
 buffers (L3 timing); a burst's exact pacing differs (we submit 32 datagrams
 per ring round trip, libtorrent one per `sendto`).
+
+## Q22. BEP 7 `ipv4=` / `ipv6=` announce hints: private torrents, explicit public listen addresses only
+
+Source: libtorrent 2.0.14 `torrent.cpp` (`announce_with_tracker`) and
+`http_tracker_connection.cpp`. No lab capture can show it: the hints are
+emitted only for listen sockets bound to a *specific* address that is
+neither loopback nor "local" (RFC 1918 / link-local / ULA), and the lab's
+addresses are all RFC 1918 or ULA. The rule, mirrored in
+`session::engine::tracker_task::build_request` and rendered by
+`AnnounceParam::{Ipv4Hints, Ipv6Hints}`:
+
+- only for **private** torrents (`priv()`), and never in anonymous mode;
+- one `&ipv4=<dotted>` per IPv4 listen address and one `&ipv6=<text>`
+  (percent-escaped, so `%3a`) per IPv6 listen address, in that order;
+- placed after `&redundant=` and `&trackerid=`, i.e. at the very end of the
+  query;
+- nothing for a wildcard listen address (the common case), so most peers
+  never send them.
+
+libtorrent's `announce_ip` setting (`&ip=`) is not implemented: qBittorrent
+leaves it empty by default.
+
+## Q23. Fast extension (BEP 6) leniencies
+
+Source: libtorrent 2.0.14 `peer_connection.cpp` (`incoming_piece`,
+`incoming_reject_request`, `incoming_cancel`, `incoming_request`,
+`send_choke`); confirmed in every lab transfer with the oracle. Where BEP 6
+says MUST/SHOULD close and libtorrent does not, the oracle wins:
+
+- **A piece that was never requested** is counted as redundant and the
+  connection kept (BEP 6: MUST close). Blocks for requests *we cancelled*
+  are accepted as data: BEP 6 promises exactly one response per request
+  and a cancelled request's response may well be the piece.
+- **A reject for a request we never made** is ignored (BEP 6: SHOULD
+  close); one for a cancelled request is its expected single response.
+- **A cancel** of a request still in our queue is answered with a reject
+  (libtorrent `incoming_cancel`); a request already handed to the disk is
+  no longer in the queue, so the piece is its one response.
+- **Choking** rejects every queued request except those for pieces in the
+  peer's allowed-fast set, which stay queued and are served (BEP 6 SHOULD
+  NOT reject them; libtorrent `send_choke`).
+- **Requests while choked** are rejected; a peer that keeps asking is
+  dropped (libtorrent gives it two seconds after the choke, we count 300
+  rejects: the state machine has no clock), and one that pulls more than
+  three pieces' worth of blocks from one allowed-fast piece while choked
+  is dropped too (`too_many_requests_when_choked`).
+- **Suggest piece** is honoured as a preference (libtorrent keeps the last
+  16 suggestions per peer and requests them first); we never *send*
+  suggestions, like the oracle at its default `suggest_mode`.
+
+## Q24. Announce `downloaded` excludes corrupt and redundant bytes
+
+Source: libtorrent 2.0.14 `torrent.cpp` (`announce_with_tracker`):
+`downloaded = total_payload_download - failed_bytes - redundant_bytes`
+(`report_true_downloaded` is off by default), so the figure never exceeds the
+torrent size, "which upsets some trackers". `corrupt=` and `redundant=`
+carry the excluded bytes. `TorrentStatus::downloaded` stays the gross count
+of payload received; `build_request` subtracts.

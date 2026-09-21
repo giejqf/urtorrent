@@ -286,6 +286,8 @@ mod tests {
             event: AnnounceEvent::Started,
             tracker_id: None,
             crypto_supported: true,
+            ipv4_hints: Vec::new(),
+            ipv6_hints: Vec::new(),
         }
     }
 

@@ -51,6 +51,9 @@ pub struct PeerHandle {
     pub downloaded: Cell<u64>,
     pub uploaded: Cell<u64>,
     client: RefCell<Option<String>>,
+    /// Pieces the peer suggested (BEP 6), newest last; requested first while
+    /// the peer has them and we want them.
+    suggested: RefCell<Vec<u32>>,
     peer_id: Cell<Option<[u8; 20]>>,
     last_recv: Cell<Instant>,
     last_send: Cell<Instant>,
@@ -125,6 +128,7 @@ impl PeerHandle {
             downloaded: Cell::new(0),
             uploaded: Cell::new(0),
             client: RefCell::new(None),
+            suggested: RefCell::new(Vec::new()),
             peer_id: Cell::new(None),
             last_recv: Cell::new(now),
             last_send: Cell::new(now),
@@ -173,8 +177,17 @@ impl PeerHandle {
 
     /// The metadata became known (BEP 9): size the connection, announce our
     /// have-state, refresh availability and interest.
-    pub fn on_metadata(&self, torrent: &Rc<RefCell<Torrent>>, pieces: usize, have: &Bitfield) {
-        let r = self.conn.borrow_mut().set_metadata(pieces, have.clone());
+    pub fn on_metadata(
+        &self,
+        torrent: &Rc<RefCell<Torrent>>,
+        pieces: usize,
+        piece_length: u32,
+        have: &Bitfield,
+    ) {
+        let r = self
+            .conn
+            .borrow_mut()
+            .set_metadata(pieces, piece_length, have.clone());
         match r {
             Ok(_) => {}
             Err(e) => {
@@ -343,7 +356,20 @@ impl PeerHandle {
         }
         let have = conn.peer_have().clone();
         let has = |i: usize| have.has(i) && (!choking || allowed.contains(&(i as u32)));
-        let blocks = torrent::pick_blocks(ctx, &mut t.picker, self.key, &has, depth - outstanding);
+        let preferred: Vec<usize> = self
+            .suggested
+            .borrow()
+            .iter()
+            .map(|&i| i as usize)
+            .collect();
+        let blocks = torrent::pick_blocks(
+            ctx,
+            &mut t.picker,
+            self.key,
+            &has,
+            depth - outstanding,
+            &preferred,
+        );
         if blocks.is_empty() {
             return;
         }
@@ -421,6 +447,7 @@ fn connection_params(
         our_peer_id: ctx.handshake_peer_id(t),
         profile: ctx.cfg.profile.clone(),
         piece_count: t.info.as_ref().map(|i| i.piece_count()),
+        piece_length: t.info.as_ref().map(|i| i.piece_length),
         our_have: t
             .storage
             .as_ref()
@@ -992,6 +1019,9 @@ enum Outbound {
 /// batch's writes go out; the ring size bounds it anyway).
 const MAX_RECV_BATCH: usize = 32;
 
+/// Suggested pieces remembered per peer (libtorrent `max_suggest_pieces`).
+const MAX_SUGGESTED: usize = 16;
+
 /// Tear a connection down: bookkeeping in the torrent, then the socket closes
 /// through the ring when the last `Rc<Transport>` drops.
 async fn finish_connection(
@@ -1022,32 +1052,36 @@ async fn finish_connection(
         // A connection dropped as a duplicate says nothing about the address:
         // no backoff (if both ends tossed the coin the wrong way, the next
         // tick dials again).
-        // An outgoing TCP connection the peer closed before any handshake
-        // (a uTP-only peer accepts and drops TCP): try uTP next, at once.
-        let tcp_dead_before_handshake = !incoming
+        let died_before_handshake = !incoming
             && handle.peer_id.get().is_none()
+            && (reason == "peer closed the connection" || reason.starts_with("recv:"));
+        // Q3: under `Enabled` a plaintext attempt the peer closed before the
+        // handshake is retried encrypted, at once, on the same transport
+        // (the peer may simply require encryption).
+        let plaintext_refused = died_before_handshake
+            && ctx.cfg.encryption == EncryptionMode::Enabled
+            && !handle.encrypted.get();
+        // Otherwise an outgoing TCP connection the peer closed before any
+        // handshake (a uTP-only peer accepts and drops TCP) gets one uTP
+        // attempt next, at once.
+        let tcp_dead_before_handshake = died_before_handshake
+            && !plaintext_refused
             && handle.transport.get() == TransportKind::Tcp
-            && (reason == "peer closed the connection" || reason.starts_with("recv:"))
             && tcp_closed_before_handshake(&mut t, &ctx, addr);
         if reason.starts_with("duplicate") {
             t.allow_reconnect_now(addr);
-        } else if tcp_dead_before_handshake {
-            if ctx.cfg.encryption == EncryptionMode::Enabled && !handle.encrypted.get() {
-                t.mse_retry.insert(addr); // Q3 still applies to the retry
-            }
+        } else if plaintext_refused {
+            t.mse_retry.insert(addr);
             t.allow_reconnect_now(addr);
-        } else if !incoming && ctx.cfg.encryption == EncryptionMode::Enabled {
-            // Q3: a plaintext attempt that died before the handshake completed
-            // makes the next attempt to this address encrypted (and soon).
-            if handle.peer_id.get().is_none() && !handle.encrypted.get() {
-                t.mse_retry.insert(addr);
-                t.allow_reconnect_now(addr);
-            } else if handle.peer_id.get().is_none() {
-                t.mse_retry.remove(&addr);
-                t.note_disconnect(addr, Instant::now());
-            } else {
-                t.note_disconnect(addr, Instant::now());
-            }
+        } else if tcp_dead_before_handshake {
+            t.allow_reconnect_now(addr);
+        } else if !incoming
+            && ctx.cfg.encryption == EncryptionMode::Enabled
+            && handle.peer_id.get().is_none()
+        {
+            // The encrypted retry died too: back to plaintext next time.
+            t.mse_retry.remove(&addr);
+            t.note_disconnect(addr, Instant::now());
         } else {
             // Do not dial this address again right away (libtorrent's
             // `min_reconnect_time`).
@@ -1202,6 +1236,11 @@ async fn handle_event(
                 t.id
             };
             handle.peer_id.set(Some(peer_id));
+            // BEP 20: the peer id names the client until (unless) the LTEP
+            // handshake's `v` says more.
+            if handle.client.borrow().is_none() {
+                *handle.client.borrow_mut() = wire::identify::client_name(&peer_id);
+            }
             tracing::debug!(
                 addr = %handle.addr,
                 peer_id = %String::from_utf8_lossy(&peer_id),
@@ -1226,7 +1265,9 @@ async fn handle_event(
             }
         }
         WireEvent::ExtHandshake(ext) => {
-            *handle.client.borrow_mut() = ext.v.clone();
+            if ext.v.is_some() {
+                *handle.client.borrow_mut() = ext.v.clone();
+            }
             handle.listen_port.set(ext.p);
             // `yourip`: the peer's view of our address is a vote for this
             // listen family's external address (libtorrent
@@ -1273,7 +1314,20 @@ async fn handle_event(
             }
             handle.fill_requests_locked(&mut t, ctx);
         }
-        WireEvent::Unchoked | WireEvent::AllowedFast(_) | WireEvent::Suggest(_) => {
+        WireEvent::Suggest(i) => {
+            // BEP 6 suggest piece: an advisory preference (libtorrent keeps
+            // the last `max_suggest_pieces` = 16 per peer).
+            {
+                let mut s = handle.suggested.borrow_mut();
+                s.retain(|&x| x != i);
+                if s.len() >= MAX_SUGGESTED {
+                    s.remove(0);
+                }
+                s.push(i);
+            }
+            handle.fill_requests(torrent, ctx);
+        }
+        WireEvent::Unchoked | WireEvent::AllowedFast(_) => {
             handle.fill_requests(torrent, ctx);
         }
         WireEvent::Choked { dropped } => {

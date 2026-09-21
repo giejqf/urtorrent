@@ -1097,6 +1097,8 @@ mod tests {
             event: tracker::AnnounceEvent::Started,
             tracker_id: None,
             crypto_supported: true,
+            ipv4_hints: Vec::new(),
+            ipv6_hints: Vec::new(),
         };
         let url = tracker::Url::parse("http://10.0.0.1:7070/announce").unwrap();
         let bytes = req.http_request(&url, &profile);

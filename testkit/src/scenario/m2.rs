@@ -107,11 +107,15 @@ fn leech_from_oracle(ctx: &mut Ctx) -> Result<()> {
     // Ground truth: the bytes on disk.
     fx.verify_data(&client.save_path)?
         .map_err(|e| anyhow::anyhow!("client data mismatch: {e}"))?;
-    // Truthful accounting (AGENTS.md rule 1).
+    // Truthful accounting (AGENTS.md rule 1): every received byte is counted
+    // once; the useful ones add up to the torrent (a second connection to
+    // the same seeder in end-game can bring a few duplicate blocks).
     ensure!(
-        st.downloaded == fx.total_len,
-        "downloaded {} != {}",
+        st.downloaded - st.redundant - st.corrupt == fx.total_len,
+        "downloaded {} - redundant {} - corrupt {} != {}",
         st.downloaded,
+        st.redundant,
+        st.corrupt,
         fx.total_len
     );
     ensure!(st.left == 0, "left {} != 0", st.left);
@@ -126,9 +130,10 @@ fn leech_from_oracle(ctx: &mut Ctx) -> Result<()> {
         st.peers_seen
     );
     ensure!(
-        st.peers_seen.iter().map(|p| p.downloaded).sum::<u64>() == fx.total_len,
-        "per-peer downloaded does not add up: {:?}",
-        st.peers_seen
+        st.peers_seen.iter().map(|p| p.downloaded).sum::<u64>() == st.downloaded,
+        "per-peer downloaded does not add up: {:?} vs {}",
+        st.peers_seen,
+        st.downloaded
     );
 
     // `completed` must reach the tracker, exactly once.

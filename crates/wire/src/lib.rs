@@ -23,6 +23,7 @@ pub mod ext;
 mod fast;
 mod framer;
 mod handshake;
+pub mod identify;
 mod ltep;
 mod message;
 mod priority;

@@ -749,7 +749,69 @@ impl Picker {
         rng: &mut dyn Rng,
     ) -> Vec<Block> {
         let sequential = self.sequential;
-        self.pick_mode(peer, has, want, rng, sequential)
+        self.pick_mode(peer, has, want, rng, sequential, Vec::new())
+    }
+
+    /// [`Picker::pick`] that first takes free blocks from `preferred` (in
+    /// order; pieces the peer suggested, BEP 6 `suggest piece`), skipping
+    /// pieces the peer lacks or we do not want, then falls back to the
+    /// normal strategy for the rest.
+    pub fn pick_preferring(
+        &mut self,
+        peer: PeerKey,
+        has: &dyn Fn(usize) -> bool,
+        want: usize,
+        preferred: &[usize],
+        rng: &mut dyn Rng,
+    ) -> Vec<Block> {
+        let mut out = Vec::with_capacity(want);
+        let mut used: Vec<usize> = Vec::new();
+        for &piece in preferred {
+            if out.len() >= want || used.len() >= MAX_PIECES_PER_PICK {
+                break;
+            }
+            if piece >= self.pieces.len()
+                || used.contains(&piece)
+                || !self.pieces[piece].wanted()
+                || !has(piece)
+            {
+                continue;
+            }
+            used.push(piece);
+            if self.pieces[piece].blocks.is_none() {
+                self.record_downloading_piece(piece);
+            }
+            self.ensure_blocks(piece);
+            self.take_free_blocks(piece, peer, want, &mut out);
+        }
+        if out.len() < want {
+            let sequential = self.sequential;
+            let rest = want - out.len();
+            out.extend(self.pick_mode(peer, has, rest, rng, sequential, used));
+        }
+        out
+    }
+
+    /// Append the free blocks of `piece` to `out` (up to `want` in total),
+    /// marking them requested by `peer`.
+    fn take_free_blocks(&mut self, piece: usize, peer: PeerKey, want: usize, out: &mut Vec<Block>) {
+        let n = self.blocks_in(piece);
+        for b in 0..n {
+            if out.len() >= want {
+                break;
+            }
+            let free = matches!(
+                self.pieces[piece]
+                    .blocks
+                    .as_ref()
+                    .and_then(|v| v.get(b as usize)),
+                Some(BlockState::Free)
+            );
+            if free {
+                out.push(self.block_at(piece, b));
+                self.mark_requested(piece, b, peer);
+            }
+        }
     }
 
     /// [`Picker::pick`] preferring the lowest-index pieces regardless of the
@@ -762,7 +824,7 @@ impl Picker {
         want: usize,
         rng: &mut dyn Rng,
     ) -> Vec<Block> {
-        self.pick_mode(peer, has, want, rng, true)
+        self.pick_mode(peer, has, want, rng, true, Vec::new())
     }
 
     /// The best partial (open) piece for the peer: highest priority, then
@@ -855,9 +917,9 @@ impl Picker {
         want: usize,
         rng: &mut dyn Rng,
         sequential: bool,
+        mut used: Vec<usize>,
     ) -> Vec<Block> {
         let mut out = Vec::with_capacity(want);
-        let mut used: Vec<usize> = Vec::new();
         let end_game = self.end_game();
         while out.len() < want && used.len() < MAX_PIECES_PER_PICK {
             let c = PickCtx {
@@ -910,25 +972,9 @@ impl Picker {
                 self.record_downloading_piece(piece);
             }
             self.ensure_blocks(piece);
-            let n = self.blocks_in(piece);
             // First pass: free blocks. Second pass (end-game): duplicates,
             // fewest requesters first.
-            for b in 0..n {
-                if out.len() >= want {
-                    break;
-                }
-                let free = matches!(
-                    self.pieces[piece]
-                        .blocks
-                        .as_ref()
-                        .and_then(|v| v.get(b as usize)),
-                    Some(BlockState::Free)
-                );
-                if free {
-                    out.push(self.block_at(piece, b));
-                    self.mark_requested(piece, b, peer);
-                }
-            }
+            self.take_free_blocks(piece, peer, want, &mut out);
             if end_game && out.len() < want {
                 let mut dups: Vec<(usize, u32)> = Vec::new();
                 if let Some(blocks) = &self.pieces[piece].blocks {
@@ -1256,6 +1302,29 @@ mod tests {
         assert!(more.iter().all(|b| b.piece != 2));
         assert!(p.pick(1, &all, 10, &mut rng).is_empty());
         assert_eq!(p.outstanding_for(1).len(), 8);
+    }
+
+    /// BEP 6 `suggest piece`: suggested pieces the peer has come first, then
+    /// the normal strategy; pieces the peer lacks or we have are skipped.
+    #[test]
+    fn preferred_pieces_come_first() {
+        let mut p = Picker::new(6, BLOCK_SIZE * 2, u64::from(BLOCK_SIZE) * 12);
+        let mut rng = Lcg(3);
+        let bf = Bitfield::all_set(6);
+        p.peer_joined(&bf);
+        // Piece 4 is suggested but the peer lacks it; 3 is suggested and
+        // available; 5 we already have.
+        let has = |i: usize| i != 4;
+        let mut have = Bitfield::new(6);
+        have.set(5);
+        p.set_have(&have);
+        let got = p.pick_preferring(1, &has, 3, &[4, 5, 3], &mut rng);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].piece, 3);
+        assert_eq!(got[1].piece, 3);
+        assert_ne!(got[2].piece, 4);
+        assert_ne!(got[2].piece, 5);
+        p.check_invariants().unwrap();
     }
 
     #[test]

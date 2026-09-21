@@ -26,6 +26,7 @@ fuzz_target!(|data: &[u8]| {
         our_peer_id: *b"-UR0010-fuzzfuzzfuzz",
         profile: profile::Profile::qbt_5_2_3_lt2_0_14(),
         piece_count: if flags & 2 == 0 { Some(pieces) } else { None },
+        piece_length: if flags & 2 == 0 { Some(32 * 1024) } else { None },
         our_have: Bitfield::new(pieces),
         listen_port: 6881,
         peer_ip: None,

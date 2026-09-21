@@ -68,6 +68,12 @@ pub struct AnnounceRequest {
     /// Whether encryption (MSE) is not disabled on our side: drives
     /// `supportcrypto=1` (docs/quirks.md Q8).
     pub crypto_supported: bool,
+    /// BEP 7 `ipv4=` hints: our IPv4 listen addresses worth telling the
+    /// tracker (libtorrent sends them for private torrents when the listen
+    /// address is explicit and public; empty otherwise).
+    pub ipv4_hints: Vec<std::net::Ipv4Addr>,
+    /// BEP 7 `ipv6=` hints, same rule.
+    pub ipv6_hints: Vec<std::net::Ipv6Addr>,
 }
 
 impl AnnounceRequest {
@@ -113,6 +119,18 @@ impl AnnounceRequest {
                     Some(id) => format!("trackerid={}", esc.escape(id)),
                     None => continue,
                 },
+                AnnounceParam::Ipv4Hints => {
+                    for a in &self.ipv4_hints {
+                        parts.push(format!("ipv4={a}"));
+                    }
+                    continue;
+                }
+                AnnounceParam::Ipv6Hints => {
+                    for a in &self.ipv6_hints {
+                        parts.push(format!("ipv6={}", esc.escape(a.to_string().as_bytes())));
+                    }
+                    continue;
+                }
             };
             parts.push(kv);
         }
@@ -298,6 +316,8 @@ mod tests {
             event,
             tracker_id: None,
             crypto_supported: true,
+            ipv4_hints: Vec::new(),
+            ipv6_hints: Vec::new(),
         }
     }
 
@@ -331,7 +351,7 @@ mod tests {
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.starts_with("GET /abc123/announce.php?x=1&info_hash="));
         assert!(s.contains("\r\nHost: pt.example\r\n"));
-        assert!(s.contains("\r\nUser-Agent: urtorrent/0.4.0\r\n"));
+        assert!(s.contains("\r\nUser-Agent: urtorrent/0.4.1\r\n"));
     }
 
     #[test]
@@ -350,6 +370,26 @@ mod tests {
         let mut r = req(AnnounceEvent::None);
         r.tracker_id = Some(b"t k".to_vec());
         assert!(r.query(&p).ends_with("&redundant=0&trackerid=t%20k"));
+    }
+
+    /// BEP 7 hints (private torrents, libtorrent's rule): after `redundant`
+    /// and any tracker id, one `ipv4=` / `ipv6=` per listen address, the v6
+    /// text percent-escaped.
+    #[test]
+    fn ipv4_ipv6_hints_trail_the_query() {
+        let p = Profile::qbt_5_2_3_lt2_0_14();
+        let mut r = req(AnnounceEvent::Started);
+        r.tracker_id = Some(b"tid".to_vec());
+        r.ipv4_hints = vec!["203.0.113.7".parse().unwrap()];
+        r.ipv6_hints = vec!["2001:db8::7".parse().unwrap()];
+        let q = r.query(&p);
+        assert!(
+            q.ends_with("&redundant=0&trackerid=tid&ipv4=203.0.113.7&ipv6=2001%3adb8%3a%3a7"),
+            "{q}"
+        );
+        // Nothing for a public torrent (the caller leaves the hints empty).
+        let r = req(AnnounceEvent::Started);
+        assert!(r.query(&p).ends_with("&redundant=0"));
     }
 
     #[test]

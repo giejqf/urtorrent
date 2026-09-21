@@ -206,7 +206,10 @@ pub struct TorrentStatus {
     pub pieces_total: usize,
     /// Total content size in bytes.
     pub total_size: u64,
-    /// Payload bytes downloaded (this run plus resume data).
+    /// Payload bytes received (this run plus resume data), including the
+    /// [`corrupt`](Self::corrupt) and [`redundant`](Self::redundant) ones;
+    /// announces report `downloaded - corrupt - redundant`, as libtorrent
+    /// does.
     pub downloaded: u64,
     /// Payload bytes uploaded.
     pub uploaded: u64,

@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-09-20
+
+Conformance pass over BEP 6 (fast extension), BEP 7 (IPv6 tracker
+extension), BEP 20 (peer-id conventions), BEP 23 (compact peers) and BEP 48
+(scrape), checked against the BEP texts and libtorrent 2.0.14.
+
+### Fixed
+
+- BEP 6: a cancel of a still-queued request is answered with a reject, and
+  a piece or reject that answers a request *we* cancelled is recognised
+  (exactly one response per request); choking no longer rejects requests
+  for pieces in the peer's allowed-fast set; a peer that keeps requesting
+  while choked, or pulls more than three pieces' worth of blocks from one
+  allowed-fast piece while choked, is dropped (libtorrent's limits); the
+  peer's `suggest piece` messages are requested first (last 16 per peer).
+  `docs/quirks.md` Q23 records where libtorrent's leniency is kept over
+  the BEP's MUST.
+- BEP 48: the scrape URL replaces `announce` in the URL's *path* only (a
+  host such as `announce.example.org` no longer breaks it); the
+  `flags.min_request_interval` extension is honoured between scrapes of
+  the same tracker and per-file `name` is parsed.
+- BEP 7: `ipv4=` / `ipv6=` hints are sent as libtorrent sends them, for
+  private torrents from explicitly bound public listen addresses
+  (`docs/quirks.md` Q22); the announce parameter order's tail
+  (`trackerid`, `ipv4`, `ipv6`) is now source-verified.
+- Announces report `downloaded` as libtorrent does: payload received minus
+  corrupt and redundant bytes, so the figure never exceeds the torrent
+  (`docs/quirks.md` Q24). `TorrentStatus::downloaded` stays the gross count.
+- A plaintext attempt refused by a peer that requires encryption (Q3) is
+  retried encrypted on the same transport, not treated as a TCP failure.
+- BEP 20: the `native` profile's peer id carries the version digits in
+  Azureus order (`-UR0410-` for 0.4.1; 0.4.0 had shipped `-UR0040-`, which
+  decodes as 0.0.4). User-Agent / LTEP `v` are `urtorrent/0.4.1`.
+
+### Added
+
+- `wire::identify::client_name`: BEP 20 client identification from the
+  peer id (Azureus, Shadow, Mainline and the one-off schemes the BEP
+  lists, plus the codes in use today); `PeerInfo::client` falls back to it
+  when a peer sends no LTEP `v`. Fuzz target `identify_client`.
+- `picker::Picker::pick_preferring` (preferred pieces first).
+
 ## [0.4.0] - 2026-09-20
 
 uTP (BEP 29). TCP stays the default transport; uTP accepts incoming

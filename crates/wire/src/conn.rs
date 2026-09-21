@@ -82,6 +82,9 @@ pub struct ConnectionParams {
     pub profile: profile::Profile,
     /// Number of pieces, if the metadata is known.
     pub piece_count: Option<usize>,
+    /// Piece length in bytes, if the metadata is known (bounds the number of
+    /// blocks a choked peer may pull from an allowed-fast piece).
+    pub piece_length: Option<u32>,
     /// Our have-set at connection time (for the first-messages sequence).
     pub our_have: Bitfield,
     /// Our listen port (LTEP `p`).
@@ -185,6 +188,12 @@ const MAX_OUTSTANDING: usize = 2048;
 /// Upper bound on queued requests from a peer before we start rejecting /
 /// disconnecting (libtorrent disconnects above `max_allowed_in_request_queue`).
 const MAX_INCOMING_HARD: usize = 4096;
+/// Cancelled requests remembered (so a late piece or reject is recognised).
+const MAX_CANCELLED: usize = 64;
+/// Requests while choked (outside the allowed-fast set) tolerated after a
+/// choke before the peer is dropped; libtorrent gives peers two seconds,
+/// this is the count-based equivalent for a clockless state machine.
+const MAX_CHOKED_REQUESTS: u32 = 300;
 
 /// The connection state machine.
 pub struct Connection {
@@ -210,7 +219,17 @@ pub struct Connection {
     peer_interested: bool,
     peer_have: PeerHave,
     outstanding: Vec<Request>,
+    /// Requests we cancelled and the peer has not answered yet (BEP 6: a
+    /// cancelled request still gets exactly one response, a reject or the
+    /// piece). Bounded; oldest forgotten first.
+    cancelled: std::collections::VecDeque<Request>,
     incoming: Vec<Request>,
+    /// Requests rejected because we are choking, since our last choke
+    /// (BEP 6 lets us close a peer that keeps asking).
+    choked_requests: u32,
+    /// Blocks requested per allowed-fast piece while we choke: `(piece,
+    /// count)`; libtorrent drops a peer past three pieces' worth.
+    fast_piece_requests: Vec<(u32, u32)>,
     allowed_fast_in: Vec<u32>,
     allowed_fast_out: Vec<u32>,
     /// The allowed-fast set goes out once, on the peer's first `interested`
@@ -247,7 +266,10 @@ impl Connection {
             peer_interested: false,
             peer_have: PeerHave::Unknown,
             outstanding: Vec::new(),
+            cancelled: std::collections::VecDeque::new(),
             incoming: Vec::new(),
+            choked_requests: 0,
+            fast_piece_requests: Vec::new(),
             allowed_fast_in: Vec::new(),
             allowed_fast_out: Vec::new(),
             sent_allowed_fast: false,
@@ -408,13 +430,16 @@ impl Connection {
     }
 
     /// Choke or unchoke the peer. Choking with the fast extension rejects
-    /// every queued request (BEP 6); without it the queue is simply dropped
-    /// (the peer knows to re-request).
+    /// every queued request except those for pieces in the peer's
+    /// allowed-fast set, which stay queued and are still served (BEP 6);
+    /// without the extension the queue is simply dropped (the peer knows to
+    /// re-request).
     pub fn choke(&mut self, choke: bool) {
         if self.am_choking == choke {
             return;
         }
         self.am_choking = choke;
+        self.choked_requests = 0;
         self.push(if choke {
             &Message::Choke
         } else {
@@ -422,8 +447,10 @@ impl Connection {
         });
         if choke {
             let queued = std::mem::take(&mut self.incoming);
-            if self.fast {
-                for r in queued {
+            for r in queued {
+                if self.fast && self.allowed_fast_out.contains(&r.index) {
+                    self.incoming.push(r);
+                } else if self.fast {
                     self.push(&Message::Reject(r));
                 }
             }
@@ -463,11 +490,28 @@ impl Connection {
         true
     }
 
-    /// Cancel an outstanding request.
+    /// Cancel an outstanding request. With the fast extension the peer still
+    /// answers it (reject or piece), so it is remembered as cancelled.
     pub fn cancel(&mut self, r: Request) {
         if let Some(pos) = self.outstanding.iter().position(|x| *x == r) {
             self.outstanding.remove(pos);
             self.push(&Message::Cancel(r));
+            if self.fast {
+                if self.cancelled.len() >= MAX_CANCELLED {
+                    self.cancelled.pop_front();
+                }
+                self.cancelled.push_back(r);
+            }
+        }
+    }
+
+    /// A queued request is being served (the disk read is under way): it
+    /// leaves the request queue, so a cancel that arrives from now on finds
+    /// nothing to reject and the piece is the request's one response
+    /// (libtorrent erases the entry when it issues the disk job).
+    pub fn serving(&mut self, r: Request) {
+        if let Some(pos) = self.incoming.iter().position(|x| *x == r) {
+            self.incoming.remove(pos);
         }
     }
 
@@ -684,12 +728,14 @@ impl Connection {
     pub fn set_metadata(
         &mut self,
         piece_count: usize,
+        piece_length: u32,
         our_have: Bitfield,
     ) -> Result<Option<Event>, Error> {
         if self.params.piece_count.is_some() {
             return Ok(None);
         }
         self.params.piece_count = Some(piece_count);
+        self.params.piece_length = Some(piece_length);
         self.params.our_have = our_have;
         self.metadata_known = true;
         let mut ev = None;
@@ -862,11 +908,46 @@ impl Connection {
             Message::Request(r) => {
                 self.check_block(&r)?;
                 if self.am_choking && !self.allowed_fast_out.contains(&r.index) {
-                    // Requests while choked: reject with fast, ignore without.
+                    // Requests while choked: reject with fast, ignore without;
+                    // a peer that never stops asking is dropped (BEP 6 "MAY
+                    // close the connection", libtorrent
+                    // `too_many_requests_when_choked`).
+                    self.choked_requests = self.choked_requests.saturating_add(1);
+                    if self.choked_requests > MAX_CHOKED_REQUESTS {
+                        return Err(Error::Protocol("too many requests while choked"));
+                    }
                     if self.fast {
                         self.push(&Message::Reject(r));
                     }
                     return Ok(());
+                }
+                if self.am_choking {
+                    // An allowed-fast piece while choked: served, but a peer
+                    // that pulls more than three pieces' worth of blocks from
+                    // one is abusing the grant (libtorrent
+                    // `too_many_requests_when_choked`).
+                    if let Some(len) = self.params.piece_length {
+                        let blocks_per_piece = len.div_ceil(16 * 1024).max(1);
+                        let n = match self
+                            .fast_piece_requests
+                            .iter_mut()
+                            .find(|(i, _)| *i == r.index)
+                        {
+                            Some((_, n)) => {
+                                *n = n.saturating_add(1);
+                                *n
+                            }
+                            None => {
+                                self.fast_piece_requests.push((r.index, 1));
+                                1
+                            }
+                        };
+                        if n > 3 * blocks_per_piece {
+                            return Err(Error::Protocol(
+                                "too many allowed-fast requests while choked",
+                            ));
+                        }
+                    }
                 }
                 if self.incoming.len() >= MAX_INCOMING_HARD {
                     return Err(Error::Protocol("request queue overflow"));
@@ -888,7 +969,15 @@ impl Connection {
                     self.outstanding.remove(pos);
                     self.payload_in += u64::from(length);
                     events.push(Event::Block { request: r, data });
+                } else if let Some(pos) = self.cancelled.iter().position(|x| *x == r) {
+                    // The one response to a request we cancelled: it was in
+                    // flight, and the data is as good as any (BEP 6).
+                    self.cancelled.remove(pos);
+                    self.payload_in += u64::from(length);
+                    events.push(Event::Block { request: r, data });
                 } else {
+                    // Never requested. BEP 6 says close; libtorrent counts it
+                    // as redundant and carries on, and so do we (Q23).
                     self.wasted_in += u64::from(length);
                     events.push(Event::UnexpectedBlock {
                         index,
@@ -901,6 +990,11 @@ impl Connection {
                 self.check_block(&r)?;
                 if let Some(pos) = self.incoming.iter().position(|x| *x == r) {
                     self.incoming.remove(pos);
+                    // BEP 6: every request gets exactly one response; a
+                    // cancelled one that was still queued is rejected.
+                    if self.fast {
+                        self.push(&Message::Reject(r));
+                    }
                     events.push(Event::Cancel(r));
                 }
             }
@@ -926,7 +1020,12 @@ impl Connection {
                 if let Some(pos) = self.outstanding.iter().position(|x| *x == r) {
                     self.outstanding.remove(pos);
                     events.push(Event::Rejected(r));
+                } else if let Some(pos) = self.cancelled.iter().position(|x| *x == r) {
+                    // The answer to our cancel.
+                    self.cancelled.remove(pos);
                 }
+                // A reject for something never requested: BEP 6 says the
+                // peer SHOULD be dropped; libtorrent ignores it (Q23).
             }
             Message::AllowedFast(i) => {
                 self.need_fast()?;
@@ -967,6 +1066,7 @@ mod tests {
             our_peer_id: *b"-UR0030-000000000000",
             profile: profile::Profile::native(),
             piece_count: Some(pieces),
+            piece_length: Some(32 * 1024),
             our_have: if have_all {
                 Bitfield::all_set(pieces)
             } else {
@@ -1185,7 +1285,7 @@ mod tests {
         );
         let mut have = Bitfield::new(16);
         have.set(9);
-        let ev = c.set_metadata(16, have).unwrap();
+        let ev = c.set_metadata(16, 32 * 1024, have).unwrap();
         assert!(matches!(ev, Some(Event::HaveChanged { .. })));
         assert_eq!(c.peer_have().to_bitfield(16).count(), 8);
         let msgs = decode_all(&c.take_outbound(), false);
@@ -1327,6 +1427,155 @@ mod tests {
         c.choke(true);
         let msgs = decode_all(&c.take_outbound(), false);
         assert_eq!(msgs, vec![Message::Choke, Message::Reject(r)]);
+    }
+
+    /// BEP 6: choking keeps (and still serves) requests for pieces in the
+    /// peer's allowed-fast set; a cancel of a queued request is answered
+    /// with a reject; a request already being served is not.
+    #[test]
+    fn choke_spares_allowed_fast_and_cancel_is_rejected() {
+        let mut c = Connection::new(params(Role::Initiator, 4, true));
+        c.take_outbound();
+        c.receive(&peer_hs(FULL)).unwrap();
+        c.take_outbound();
+        c.receive(&Message::Interested.to_bytes()).unwrap();
+        let granted = c.allowed_fast_granted().to_vec();
+        assert!(!granted.is_empty());
+        c.take_outbound();
+        c.choke(false);
+        c.take_outbound();
+        let fast = Request {
+            index: granted[0],
+            begin: 0,
+            length: 16384,
+        };
+        let other_index = (0..4u32).find(|i| !granted.contains(i)).unwrap_or(3);
+        let plain = Request {
+            index: other_index,
+            begin: 0,
+            length: 16384,
+        };
+        c.receive(&Message::Request(fast).to_bytes()).unwrap();
+        c.receive(&Message::Request(plain).to_bytes()).unwrap();
+        c.take_outbound();
+        c.choke(true);
+        let msgs = decode_all(&c.take_outbound(), false);
+        if granted.contains(&other_index) {
+            assert_eq!(msgs, vec![Message::Choke]);
+        } else {
+            assert_eq!(msgs, vec![Message::Choke, Message::Reject(plain)]);
+        }
+        assert!(c.incoming_requests().contains(&fast));
+        // A cancel of the still-queued allowed-fast request: rejected.
+        let ev = c.receive(&Message::Cancel(fast).to_bytes()).unwrap();
+        assert_eq!(ev, vec![Event::Cancel(fast)]);
+        assert_eq!(
+            decode_all(&c.take_outbound(), false),
+            vec![Message::Reject(fast)]
+        );
+        // Served request: the cancel finds nothing, the piece is the answer.
+        c.choke(false);
+        c.receive(&Message::Request(plain).to_bytes()).unwrap();
+        c.take_outbound();
+        c.serving(plain);
+        let ev = c.receive(&Message::Cancel(plain).to_bytes()).unwrap();
+        assert!(ev.is_empty());
+        assert!(c.take_outbound().is_empty());
+        c.piece(plain, vec![0; 16384]);
+        assert_eq!(c.payload_out(), 16384);
+    }
+
+    /// BEP 6: a request we cancelled still gets its one response; a piece
+    /// for it is data, a reject for it is silence.
+    #[test]
+    fn cancelled_requests_are_answered_once() {
+        let mut c = established(4);
+        c.receive(&Message::Bitfield(vec![0xf0]).to_bytes())
+            .unwrap();
+        c.receive(&Message::Unchoke.to_bytes()).unwrap();
+        let a = Request {
+            index: 0,
+            begin: 0,
+            length: 16384,
+        };
+        let b = Request {
+            index: 1,
+            begin: 0,
+            length: 16384,
+        };
+        assert!(c.request(a) && c.request(b));
+        c.cancel(a);
+        c.cancel(b);
+        assert!(c.outstanding().is_empty());
+        let ev = c
+            .receive(
+                &Message::Piece {
+                    index: 0,
+                    begin: 0,
+                    data: vec![7; 16384],
+                }
+                .to_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(ev[0], Event::Block { request, .. } if request == a));
+        assert_eq!(c.payload_in(), 16384);
+        let ev = c.receive(&Message::Reject(b).to_bytes()).unwrap();
+        assert!(ev.is_empty());
+        // Truly unrequested: counted as wasted, connection kept (Q23).
+        let ev = c
+            .receive(
+                &Message::Piece {
+                    index: 2,
+                    begin: 0,
+                    data: vec![7; 16384],
+                }
+                .to_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(ev[0], Event::UnexpectedBlock { index: 2, .. }));
+    }
+
+    /// A choked peer may pull an allowed-fast piece, but not the same piece
+    /// over and over (libtorrent: three pieces' worth of blocks).
+    #[test]
+    fn allowed_fast_abuse_while_choked_ends_the_connection() {
+        let mut c = Connection::new(params(Role::Initiator, 4, true));
+        c.take_outbound();
+        c.receive(&peer_hs(FULL)).unwrap();
+        c.receive(&Message::Interested.to_bytes()).unwrap();
+        let piece = c.allowed_fast_granted()[0];
+        c.take_outbound();
+        // 32 KiB pieces: 2 blocks each, so 6 requests pass and the 7th fails.
+        let mut ok = 0;
+        for i in 0..7u32 {
+            let r = Request {
+                index: piece,
+                begin: (i % 2) * 16384,
+                length: 16384,
+            };
+            match c.receive(&Message::Request(r).to_bytes()) {
+                Ok(_) => ok += 1,
+                Err(_) => break,
+            }
+            c.piece(r, vec![0; 16384]);
+        }
+        assert_eq!(ok, 6);
+    }
+
+    /// BEP 6 "MAY close": a peer that keeps requesting while choked is
+    /// dropped after `MAX_CHOKED_REQUESTS` rejects.
+    #[test]
+    fn endless_requests_while_choked_end_the_connection() {
+        let mut c = established(2);
+        let r = Request {
+            index: 0,
+            begin: 0,
+            length: 16384,
+        };
+        for _ in 0..MAX_CHOKED_REQUESTS {
+            c.receive(&Message::Request(r).to_bytes()).unwrap();
+        }
+        assert!(c.receive(&Message::Request(r).to_bytes()).is_err());
     }
 
     #[test]

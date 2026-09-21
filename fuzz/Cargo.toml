@@ -146,3 +146,10 @@ path = "fuzz_targets/utp_packet.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "identify_client"
+path = "fuzz_targets/identify_client.rs"
+test = false
+doc = false
+bench = false

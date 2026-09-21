@@ -114,6 +114,7 @@ fn replay_oracle_leeching_from_us() {
         our_peer_id: *b"-TP0001-784722000000",
         profile: profile::Profile::qbt_5_2_3_lt2_0_14(),
         piece_count: Some(pieces),
+        piece_length: Some(16 * 1024),
         our_have: Bitfield::all_set(pieces),
         listen_port: 6890,
         peer_ip: c["remote"]
@@ -425,6 +426,7 @@ fn qbt_magnet_mode_matches_capture() {
         our_peer_id: *b"-qB5230-000000000000",
         profile: profile.clone(),
         piece_count: None,
+        piece_length: None,
         our_have: Bitfield::new(0),
         listen_port: 6881,
         peer_ip: oracle_ext.yourip,

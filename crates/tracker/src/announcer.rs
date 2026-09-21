@@ -108,6 +108,10 @@ struct Tracker {
     tracker_id: Option<Vec<u8>>,
     /// Completed downloads from a scrape.
     downloaded: Option<u32>,
+    /// When the last scrape was answered and the interval it asked us to
+    /// keep (`flags.min_request_interval`).
+    last_scrape: Option<Instant>,
+    scrape_min_interval: Option<Duration>,
     endpoints: Vec<Endpoint>,
 }
 
@@ -165,6 +169,8 @@ impl Announcer {
                             url,
                             tracker_id: None,
                             downloaded: None,
+                            last_scrape: None,
+                            scrape_min_interval: None,
                             endpoints: (0..endpoints).map(|_| Endpoint::new()).collect(),
                         })
                         .collect()
@@ -383,6 +389,8 @@ impl Announcer {
             url: url.to_string(),
             tracker_id: None,
             downloaded: None,
+            last_scrape: None,
+            scrape_min_interval: None,
             endpoints: (0..self.endpoints).map(|_| Endpoint::new()).collect(),
         };
         let tier = tier.min(self.tiers.len());
@@ -482,17 +490,42 @@ impl Announcer {
         self.tiers.iter().flatten().map(|t| t.url.clone()).collect()
     }
 
-    /// Record a scrape result for `url`.
-    pub fn record_scrape(&mut self, url: &str, complete: u32, incomplete: u32, downloaded: u32) {
+    /// Record a scrape result for `url` at `now`; `min_interval` is the
+    /// tracker's `flags.min_request_interval`, if it sent one.
+    pub fn record_scrape(
+        &mut self,
+        url: &str,
+        complete: u32,
+        incomplete: u32,
+        downloaded: u32,
+        now: Instant,
+        min_interval: Option<Duration>,
+    ) {
         for t in self.tiers.iter_mut().flatten() {
             if t.url == url {
                 t.downloaded = Some(downloaded);
+                t.last_scrape = Some(now);
+                t.scrape_min_interval = min_interval;
                 for e in &mut t.endpoints {
                     e.complete = Some(complete);
                     e.incomplete = Some(incomplete);
                 }
             }
         }
+    }
+
+    /// Whether `url` may be scraped again at `now`: not before the interval
+    /// its last scrape reply asked for (BEP 48 trackers' de-facto
+    /// `min_request_interval`).
+    pub fn scrape_allowed(&self, url: &str, now: Instant) -> bool {
+        self.tiers
+            .iter()
+            .flatten()
+            .find(|t| t.url == url)
+            .is_none_or(|t| match (t.last_scrape, t.scrape_min_interval) {
+                (Some(at), Some(min)) => now.saturating_duration_since(at) >= min,
+                _ => true,
+            })
     }
 
     /// Snapshot of every tracker, tier by tier.
@@ -819,5 +852,26 @@ mod tests {
         a.start();
         assert!(a.poll(Instant::now()).is_empty());
         assert!(a.stop().is_empty());
+    }
+
+    #[test]
+    fn scrape_min_request_interval_is_honoured() {
+        let now = Instant::now();
+        let mut a = Announcer::new(vec![vec!["http://t/announce".to_string()]], 1);
+        assert!(a.scrape_allowed("http://t/announce", now));
+        a.record_scrape(
+            "http://t/announce",
+            1,
+            2,
+            3,
+            now,
+            Some(Duration::from_secs(60)),
+        );
+        assert!(!a.scrape_allowed("http://t/announce", now + Duration::from_secs(30)));
+        assert!(a.scrape_allowed("http://t/announce", now + Duration::from_secs(60)));
+        // No interval given: always allowed. Unknown URL: allowed.
+        a.record_scrape("http://t/announce", 1, 2, 3, now, None);
+        assert!(a.scrape_allowed("http://t/announce", now));
+        assert!(a.scrape_allowed("http://other/announce", now));
     }
 }

@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 urtorrent contributors
 
-//! BEP 48 HTTP scrape: URL derivation (the first `announce` in the URL becomes
-//! `scrape`, as libtorrent does), the request, and the `files` response.
+//! BEP 48 HTTP scrape: URL derivation (the first `announce` in the URL's
+//! *path* becomes `scrape`; libtorrent searches the whole URL, which breaks
+//! hosts named `announce.*`, so the BEP's rule is followed), the request,
+//! and the `files` response with the common `flags.min_request_interval`
+//! and per-file `name` extras.
 
 use std::collections::BTreeMap;
 
@@ -14,7 +17,7 @@ use crate::Error;
 use crate::url::Url;
 
 /// Per-torrent scrape counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScrapeEntry {
     /// Seeders (`complete`).
     pub complete: u32,
@@ -22,12 +25,34 @@ pub struct ScrapeEntry {
     pub downloaded: u32,
     /// Leechers (`incomplete`).
     pub incomplete: u32,
+    /// The torrent's name, when the tracker includes one (an extension many
+    /// trackers add; not in BEP 48).
+    pub name: Option<String>,
 }
 
-/// The scrape URL for an announce URL, or `None` if the tracker offers none
-/// (no `announce` in the URL).
+/// A parsed scrape response.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScrapeResponse {
+    /// Entries by info-hash.
+    pub files: BTreeMap<InfoHash, ScrapeEntry>,
+    /// `flags.min_request_interval`: seconds the tracker asks clients to
+    /// wait between scrapes (the de-facto extension BEP 48 omits).
+    pub min_request_interval: Option<u32>,
+}
+
+/// The scrape URL for an announce URL, or `None` if the tracker offers none:
+/// BEP 48 replaces the first `announce` in the URL's path with `scrape`.
 pub fn scrape_url(announce: &str) -> Option<String> {
-    let pos = announce.find("announce")?;
+    // The path starts at the first `/` after the authority.
+    let after_scheme = announce.find("://").map_or(0, |i| i + 3);
+    let path_start = announce[after_scheme..]
+        .find('/')
+        .map(|i| after_scheme + i)?;
+    let query_start = announce[path_start..]
+        .find(['?', '#'])
+        .map_or(announce.len(), |i| path_start + i);
+    let rel = announce[path_start..query_start].find("announce")?;
+    let pos = path_start + rel;
     let mut s = announce.to_string();
     s.replace_range(pos..pos + 8, "scrape");
     Some(s)
@@ -75,7 +100,7 @@ pub fn http_request(url: &Url, hashes: &[InfoHash], profile: &Profile) -> Vec<u8
 }
 
 /// Parse a scrape response body.
-pub fn parse_response(body: &[u8]) -> Result<BTreeMap<InfoHash, ScrapeEntry>, Error> {
+pub fn parse_response(body: &[u8]) -> Result<ScrapeResponse, Error> {
     let root = Decoder::new(body)
         .decode_all()
         .map_err(|_| Error::Response("not bencode"))?;
@@ -105,10 +130,23 @@ pub fn parse_response(body: &[u8]) -> Result<BTreeMap<InfoHash, ScrapeEntry>, Er
                 complete: get("complete"),
                 downloaded: get("downloaded"),
                 incomplete: get("incomplete"),
+                name: v
+                    .get_str("name")
+                    .and_then(Value::as_bytes)
+                    .map(|b| String::from_utf8_lossy(&b[..b.len().min(256)]).into_owned()),
             },
         );
     }
-    Ok(out)
+    let min_request_interval = root
+        .get_str("flags")
+        .and_then(|f| f.get_str("min_request_interval"))
+        .and_then(Value::as_int)
+        .filter(|n| *n >= 0)
+        .map(|n| n.min(i64::from(u32::MAX)) as u32);
+    Ok(ScrapeResponse {
+        files: out,
+        min_request_interval,
+    })
 }
 
 #[cfg(test)]
@@ -130,6 +168,18 @@ mod tests {
             scrape_url("udp://t:6969/announce").as_deref(),
             Some("udp://t:6969/scrape")
         );
+        // BEP 48: only the path section counts.
+        assert_eq!(
+            scrape_url("http://announce.example.org/announce").as_deref(),
+            Some("http://announce.example.org/scrape")
+        );
+        assert_eq!(scrape_url("http://announce.example.org/tracker"), None);
+        assert_eq!(scrape_url("http://t/x?announce=1"), None);
+        assert_eq!(scrape_url("http://t"), None);
+        assert_eq!(
+            scrape_url("https://t:443/pk/announce/?x=announce").as_deref(),
+            Some("https://t:443/pk/scrape/?x=announce")
+        );
     }
 
     #[test]
@@ -142,17 +192,27 @@ mod tests {
         assert!(s.contains("&info_hash=aaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\nHost: 10.0.0.1:7070\r\nUser-Agent: qBittorrent/5.2.3\r\n"));
         let mut body = b"d5:filesd20:".to_vec();
         body.extend_from_slice(&[0xAA; 20]);
-        body.extend_from_slice(b"d8:completei3e10:downloadedi9e10:incompletei1eeee");
+        body.extend_from_slice(
+            b"d8:completei3e10:downloadedi9e10:incompletei1e4:name3:fooee5:flagsd20:min_request_intervali1800eee",
+        );
         let r = parse_response(&body).unwrap();
         assert_eq!(
-            r.get(&[0xAA; 20]),
+            r.files.get(&[0xAA; 20]),
             Some(&ScrapeEntry {
                 complete: 3,
                 downloaded: 9,
-                incomplete: 1
+                incomplete: 1,
+                name: Some("foo".into()),
             })
         );
+        assert_eq!(r.min_request_interval, Some(1800));
         assert!(parse_response(b"d14:failure reason3:bade").is_err());
         assert!(parse_response(b"de").is_err());
+        // The BEP 48 example, verbatim.
+        let ex = b"d5:filesd20:xxxxxxxxxxxxxxxxxxxxd8:completei11e10:downloadedi13772e10:incompletei19ee20:yyyyyyyyyyyyyyyyyyyyd8:completei21e10:downloadedi206e10:incompletei20eeee";
+        let r = parse_response(ex).unwrap();
+        assert_eq!(r.files.len(), 2);
+        assert_eq!(r.files[&[b'y'; 20]].downloaded, 206);
+        assert_eq!(r.min_request_interval, None);
     }
 }

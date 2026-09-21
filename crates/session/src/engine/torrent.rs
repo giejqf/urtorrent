@@ -836,12 +836,16 @@ pub async fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec
     };
     tracing::info!(torrent = id.0, private, "metadata received");
     ctx.emit(Event::MetadataReceived { id });
-    let (n, have) = {
+    let (n, plen, have) = {
         let t = torrent.borrow();
-        (t.piece_count(), Bitfield::new(t.piece_count()))
+        (
+            t.piece_count(),
+            t.info.as_ref().map_or(0, |i| i.piece_length),
+            Bitfield::new(t.piece_count()),
+        )
     };
     for p in peers {
-        p.on_metadata(torrent, n, &have);
+        p.on_metadata(torrent, n, plen, &have);
     }
     uring::spawn(initial_check(
         ctx.clone(),
@@ -967,9 +971,15 @@ fn finish_check(
         // Peers connected during the metadata fetch learn our have-set and
         // get requests; trackers hear the real `left`.
         let peers: Vec<Rc<PeerHandle>> = torrent.borrow().peers.values().cloned().collect();
-        let n = torrent.borrow().piece_count();
+        let (n, plen) = {
+            let t = torrent.borrow();
+            (
+                t.piece_count(),
+                t.info.as_ref().map_or(0, |i| i.piece_length),
+            )
+        };
         for p in &peers {
-            p.on_metadata(torrent, n, &have);
+            p.on_metadata(torrent, n, plen, &have);
         }
         kick.notify();
         on_new_candidates(ctx, torrent);
@@ -1727,9 +1737,14 @@ pub fn pick_blocks(
     peer: u32,
     has: &dyn Fn(usize) -> bool,
     want: usize,
+    preferred: &[usize],
 ) -> Vec<picker::Block> {
     let mut rng = RngRef(&ctx.rng);
-    picker.pick(peer, has, want, &mut rng)
+    if preferred.is_empty() {
+        picker.pick(peer, has, want, &mut rng)
+    } else {
+        picker.pick_preferring(peer, has, want, preferred, &mut rng)
+    }
 }
 
 /// Pick contiguous blocks (web seeds).

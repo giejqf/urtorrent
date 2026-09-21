@@ -74,7 +74,13 @@ fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
         peer_id: t.peer_id,
         port: ctx.listen_port,
         uploaded: t.stats.uploaded,
-        downloaded: t.stats.downloaded,
+        // libtorrent (`report_true_downloaded` off): the useful payload,
+        // without the bytes that failed hashing or arrived twice, so the
+        // figure never exceeds the torrent (Q24).
+        downloaded: t
+            .stats
+            .downloaded
+            .saturating_sub(t.stats.corrupt.saturating_add(t.stats.redundant)),
         left: t.left(),
         corrupt: t.stats.corrupt,
         redundant: t.stats.redundant,
@@ -83,6 +89,31 @@ fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
         tracker_id: job.tracker_id.clone(),
         // Q8: `supportcrypto=1` unless encryption is disabled.
         crypto_supported: ctx.cfg.encryption != crate::api::EncryptionMode::Disabled,
+        ipv4_hints: if t.private {
+            ctx.cfg
+                .listen_v4
+                .filter(|a| {
+                    !a.is_unspecified() && !a.is_loopback() && !a.is_private() && !a.is_link_local()
+                })
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        },
+        ipv6_hints: if t.private {
+            ctx.cfg
+                .listen_v6
+                .filter(|a| {
+                    !a.is_unspecified()
+                        && !a.is_loopback()
+                        && !a.is_unique_local()
+                        && !a.is_unicast_link_local()
+                })
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -235,7 +266,16 @@ pub async fn scrape_all(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
         let Some(scrape_url) = tracker::scrape::scrape_url(&announce_url) else {
             continue;
         };
-        let result: Result<(u32, u32, u32), String> = async {
+        // Honour the interval the tracker asked for after its last reply.
+        if !torrent
+            .borrow()
+            .announcer
+            .scrape_allowed(&announce_url, Instant::now())
+        {
+            tracing::debug!(url = %scrape_url, "scrape skipped: tracker's min_request_interval");
+            continue;
+        }
+        let result: Result<(u32, u32, u32, Option<u32>), String> = async {
             let url = Url::parse(&scrape_url).map_err(|e| e.to_string())?;
             if url.scheme == "udp" {
                 let addrs = ctx
@@ -250,7 +290,7 @@ pub async fn scrape_all(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
                 let entries = ctx.udp.scrape(to, &[hash]).await?;
                 return entries
                     .first()
-                    .copied()
+                    .map(|&(c, d, i)| (c, d, i, None))
                     .ok_or_else(|| "empty scrape reply".to_string());
             }
             let profile = &ctx.cfg.profile;
@@ -261,21 +301,28 @@ pub async fn scrape_all(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
             if !(200..300).contains(&resp.status) {
                 return Err(tracker::Error::Status(resp.status).to_string());
             }
-            let files = tracker::scrape::parse_response(&resp.body).map_err(|e| e.to_string())?;
-            let e = files
+            let reply = tracker::scrape::parse_response(&resp.body).map_err(|e| e.to_string())?;
+            let e = reply
+                .files
                 .get(&hash)
-                .copied()
                 .ok_or_else(|| "scrape reply lacks our hash".to_string())?;
-            Ok((e.complete, e.downloaded, e.incomplete))
+            Ok((
+                e.complete,
+                e.downloaded,
+                e.incomplete,
+                reply.min_request_interval,
+            ))
         }
         .await;
         match result {
-            Ok((complete, downloaded, incomplete)) => {
+            Ok((complete, downloaded, incomplete, min_interval)) => {
                 torrent.borrow_mut().announcer.record_scrape(
                     &announce_url,
                     complete,
                     incomplete,
                     downloaded,
+                    Instant::now(),
+                    min_interval.map(|s| std::time::Duration::from_secs(u64::from(s))),
                 );
                 ctx.emit(Event::ScrapeReply {
                     id,
