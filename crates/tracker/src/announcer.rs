@@ -188,6 +188,18 @@ impl Announcer {
         self.endpoints
     }
 
+    /// The listen sockets were replaced: every tracker gets `endpoints`
+    /// fresh endpoint states (never announced; `start` makes them due).
+    /// Tracker ids and scrape data are kept. The caller sends the old
+    /// endpoints' `stopped` announces (`stop`) first.
+    pub fn reset_endpoints(&mut self, endpoints: usize) {
+        let endpoints = endpoints.max(1);
+        self.endpoints = endpoints;
+        for t in self.tiers.iter_mut().flatten() {
+            t.endpoints = (0..endpoints).map(|_| Endpoint::new()).collect();
+        }
+    }
+
     /// Whether there is any tracker at all.
     pub fn has_trackers(&self) -> bool {
         !self.tiers.is_empty()

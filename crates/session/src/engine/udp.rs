@@ -31,8 +31,9 @@ use super::utp::UtpHost;
 const UDP_RING_ENTRIES: u16 = 256;
 const UDP_BUF_SIZE: usize = 2048;
 /// Buffer group ids for the UDP rings (`RECV_RING_GROUP` is 1).
-const UDP_RING_GROUP_V4: u16 = 2;
-const UDP_RING_GROUP_V6: u16 = 3;
+/// First buffer-ring group id for the UDP sockets (group 1 is the peer
+/// receive ring); each socket lifetime takes the next one.
+const UDP_RING_GROUP_FIRST: u16 = 2;
 /// Datagrams handled per wakeup before yielding.
 const MAX_UDP_BATCH: usize = 64;
 
@@ -63,6 +64,8 @@ struct Sock {
     v6: bool,
     queue: RefCell<std::collections::VecDeque<Queued>>,
     kick: Rc<super::local::Notify>,
+    /// Set when the socket is replaced (`rebind`): its loops exit.
+    gone: Rc<Flag>,
 }
 
 /// Datagrams submitted together.
@@ -77,7 +80,16 @@ pub type UtpAccept = Box<dyn Fn(utp::Key)>;
 
 /// The demultiplexer.
 pub struct UdpDemux {
-    socks: Vec<Sock>,
+    /// The sockets in use (replaced whole by `rebind`).
+    socks: RefCell<Vec<Rc<Sock>>>,
+    /// Buffer-ring group ids handed out so far (a replaced socket's ring
+    /// may still be registered while its loop winds down).
+    next_group: Cell<u16>,
+    /// Set at shutdown; every loop watches it.
+    closing: RefCell<Option<Rc<Flag>>>,
+    /// Loops (send and receive) running over the current or retired
+    /// sockets; a socket's fd closes when its last loop exits.
+    live_loops: Cell<usize>,
     waiters: RefCell<Waiters>,
     cache: RefCell<ConnectionCache>,
     next_tid: Cell<u32>,
@@ -97,12 +109,33 @@ impl UdpDemux {
         v6: Option<std::net::Ipv6Addr>,
         seed: u32,
     ) -> UdpDemux {
+        UdpDemux {
+            socks: RefCell::new(Self::open_sockets(port, v4, v6)),
+            next_group: Cell::new(UDP_RING_GROUP_FIRST),
+            closing: RefCell::new(None),
+            live_loops: Cell::new(0),
+            waiters: RefCell::new(HashMap::new()),
+            cache: RefCell::new(ConnectionCache::default()),
+            next_tid: Cell::new(seed | 1),
+            dht: RefCell::new(None),
+            utp: RefCell::new(None),
+        }
+    }
+
+    fn open_sockets(
+        port: u16,
+        v4: Option<std::net::Ipv4Addr>,
+        v6: Option<std::net::Ipv6Addr>,
+    ) -> Vec<Rc<Sock>> {
         let mut socks = Vec::new();
-        let sock = |s: UdpSocket, v6: bool| Sock {
-            socket: Rc::new(s),
-            v6,
-            queue: RefCell::new(std::collections::VecDeque::new()),
-            kick: super::local::Notify::new(),
+        let sock = |s: UdpSocket, v6: bool| {
+            Rc::new(Sock {
+                socket: Rc::new(s),
+                v6,
+                queue: RefCell::new(std::collections::VecDeque::new()),
+                kick: super::local::Notify::new(),
+                gone: Flag::new(),
+            })
         };
         if let Some(a) = v4 {
             match UdpSocket::bind(SocketAddr::new(IpAddr::V4(a), port)) {
@@ -116,23 +149,55 @@ impl UdpDemux {
                 Err(e) => tracing::warn!("udp v6 bind on {port} failed: {e}"),
             }
         }
-        UdpDemux {
-            socks,
-            waiters: RefCell::new(HashMap::new()),
-            cache: RefCell::new(ConnectionCache::default()),
-            next_tid: Cell::new(seed | 1),
-            dht: RefCell::new(None),
-            utp: RefCell::new(None),
+        socks
+    }
+
+    /// Replace the sockets (a listen port / address change): the old ones'
+    /// loops exit and their queued datagrams are dropped, new sockets are
+    /// bound and served. Tracker exchanges in flight fail; the DHT and uTP
+    /// hooks stay (the DHT node carries on over the new sockets, uTP
+    /// connections were bound to the old ones and are the caller's to
+    /// abort). Returns whether any socket bound.
+    pub async fn rebind(
+        self: &Rc<Self>,
+        port: u16,
+        v4: Option<std::net::Ipv4Addr>,
+        v6: Option<std::net::Ipv6Addr>,
+    ) -> bool {
+        let old = std::mem::take(&mut *self.socks.borrow_mut());
+        for s in &old {
+            s.gone.set();
+            s.kick.notify();
         }
+        drop(old);
+        self.waiters.borrow_mut().clear();
+        *self.cache.borrow_mut() = ConnectionCache::default();
+        // The old fds close when their loops exit; the new sockets may need
+        // the very same port.
+        for _ in 0..500 {
+            if self.live_loops.get() == 0 {
+                break;
+            }
+            uring::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        *self.socks.borrow_mut() = Self::open_sockets(port, v4, v6);
+        if let Some(closing) = self.closing.borrow().clone() {
+            self.spawn_loops(closing);
+        }
+        !self.socks.borrow().is_empty()
     }
 
     /// Whether a socket exists for `ip`'s family.
     pub fn supports(&self, ip: IpAddr) -> bool {
-        self.socks.iter().any(|s| s.v6 == ip.is_ipv6())
+        self.socks.borrow().iter().any(|s| s.v6 == ip.is_ipv6())
     }
 
-    fn sock_for(&self, ip: IpAddr) -> Option<&Sock> {
-        self.socks.iter().find(|s| s.v6 == ip.is_ipv6())
+    fn sock_for(&self, ip: IpAddr) -> Option<Rc<Sock>> {
+        self.socks
+            .borrow()
+            .iter()
+            .find(|s| s.v6 == ip.is_ipv6())
+            .cloned()
     }
 
     /// The local address of the socket serving `ip`'s family.
@@ -153,23 +218,35 @@ impl UdpDemux {
     /// own provided buffer ring, draining every queued datagram per wakeup)
     /// and the send loops.
     pub fn spawn(self: &Rc<Self>, closing: Rc<Flag>) {
-        for i in 0..self.socks.len() {
-            uring::spawn(Self::send_loop(self.clone(), i, closing.clone()));
-        }
-        for (i, s) in self.socks.iter().enumerate() {
+        *self.closing.borrow_mut() = Some(closing.clone());
+        self.spawn_loops(closing);
+    }
+
+    /// Loops for every socket that has none yet (all of them: sockets are
+    /// only ever added whole by `bind` / `rebind`).
+    fn spawn_loops(self: &Rc<Self>, closing: Rc<Flag>) {
+        let socks: Vec<Rc<Sock>> = self.socks.borrow().clone();
+        for (i, s) in socks.into_iter().enumerate() {
+            self.live_loops.set(self.live_loops.get() + 1);
+            let me0 = self.clone();
+            let s0 = s.clone();
+            let closing0 = closing.clone();
+            uring::spawn(async move {
+                Self::send_loop(s0, i, closing0).await;
+                me0.live_loops.set(me0.live_loops.get() - 1);
+            });
+            self.live_loops.set(self.live_loops.get() + 1);
             let me = self.clone();
             let socket = s.socket.clone();
             let v6 = s.v6;
+            let gone = s.gone.clone();
             let closing = closing.clone();
-            let ring = match BufRing::new(
-                if v6 {
-                    UDP_RING_GROUP_V6
-                } else {
-                    UDP_RING_GROUP_V4
-                },
-                UDP_RING_ENTRIES,
-                UDP_BUF_SIZE,
-            ) {
+            // A fresh group id per socket lifetime: a replaced socket's ring
+            // may still be registered while its loop winds down.
+            let group = self.next_group.get();
+            self.next_group
+                .set(group.wrapping_add(1).max(UDP_RING_GROUP_FIRST));
+            let ring = match BufRing::new(group, UDP_RING_ENTRIES, UDP_BUF_SIZE) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(socket = i, "udp buffer ring: {e}");
@@ -179,7 +256,7 @@ impl UdpDemux {
             uring::spawn(async move {
                 let mut rx = socket.recv_multi(&ring);
                 loop {
-                    match select2(rx.next(), closing.wait()).await {
+                    match select2(rx.next(), select2(closing.wait(), gone.wait())).await {
                         Either::Left(Ok((from, buf))) => {
                             let now = Instant::now();
                             me.dispatch(from, buf.as_slice(), v6, now);
@@ -197,10 +274,13 @@ impl UdpDemux {
                             tracing::warn!(socket = i, "udp recv failed: {e}");
                             uring::sleep(std::time::Duration::from_millis(100)).await;
                         }
-                        Either::Right(()) => break,
+                        Either::Right(_) => break,
                     }
                 }
+                drop(rx);
                 drop(ring);
+                drop(socket);
+                me.live_loops.set(me.live_loops.get() - 1);
             });
         }
     }
@@ -256,15 +336,17 @@ impl UdpDemux {
         sock.kick.notify();
     }
 
-    /// The send loop of socket `i`.
-    async fn send_loop(me: Rc<Self>, i: usize, closing: Rc<Flag>) {
-        let Some(sock) = me.socks.get(i) else { return };
+    /// The send loop of one socket (`i` labels it in logs).
+    async fn send_loop(sock: Rc<Sock>, i: usize, closing: Rc<Flag>) {
         let socket = sock.socket.clone();
         loop {
+            if sock.gone.is_set() {
+                break;
+            }
             if sock.queue.borrow().is_empty() {
-                match select2(sock.kick.wait(), closing.wait()).await {
+                match select2(sock.kick.wait(), select2(closing.wait(), sock.gone.wait())).await {
                     Either::Left(()) => {}
-                    Either::Right(()) => break,
+                    Either::Right(_) => break,
                 }
             }
             // Plain datagrams up to the batch size, stopping at a probe.

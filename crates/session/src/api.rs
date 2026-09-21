@@ -1048,7 +1048,7 @@ impl SessionBuilder {
             inner: Arc::new(Inner {
                 cmd_tx,
                 notify: boot.notify,
-                listen_port: boot.listen_port,
+                listen_port: std::sync::atomic::AtomicU16::new(boot.listen_port),
                 thread: Mutex::new(Some(thread)),
             }),
         })
@@ -1058,7 +1058,9 @@ impl SessionBuilder {
 struct Inner {
     cmd_tx: mpsc::UnboundedSender<Command>,
     notify: uring::NotifyHandle,
-    listen_port: u16,
+    /// The port in use, kept current by `set_listen` (shared by every
+    /// clone of the handle).
+    listen_port: std::sync::atomic::AtomicU16,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -1092,9 +1094,55 @@ impl Session {
         Reply { rx, ok }
     }
 
-    /// The TCP port the engine listens on (useful when 0 was requested).
+    /// The TCP (and UDP) port the engine listens on (useful when 0 was
+    /// requested); kept current across [`Session::set_listen`].
     pub fn listen_port(&self) -> u16 {
-        self.inner.listen_port
+        self.inner
+            .listen_port
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Replace the listen sockets: `port` (0 = ephemeral) on `v4` / `v6`
+    /// (`None` = that family off, as for the builder). The new sockets are
+    /// bound first; if that fails the error is returned and nothing
+    /// changes. Otherwise every running torrent announces `stopped` on the
+    /// old sockets and `started` on the new ones (trackers see the new
+    /// port), the DHT node carries on over the new UDP sockets, LSD rejoins
+    /// its groups, established TCP connections stay, uTP connections (bound
+    /// to the old UDP sockets) drop, and peers of a family that went away
+    /// are disconnected. Returns the port in use.
+    pub async fn set_listen(
+        &self,
+        port: u16,
+        v4: Option<Ipv4Addr>,
+        v6: Option<Ipv6Addr>,
+    ) -> Result<u16, Error> {
+        let port = self
+            .send(|tx| Command::SetListen(port, v4, v6, tx))
+            .await??;
+        self.inner
+            .listen_port
+            .store(port, std::sync::atomic::Ordering::Relaxed);
+        Ok(port)
+    }
+
+    /// Start or stop the DHT node (`SessionBuilder::dht`). Starting restores
+    /// the tables of a node stopped earlier in the session (or the
+    /// builder's `dht_state`); stopping keeps them for the next start and
+    /// ends all DHT traffic. Fails when the listen port has no UDP socket.
+    pub async fn set_dht(&self, on: bool) -> Result<(), Error> {
+        self.send(|tx| Command::SetDht(on, tx)).await?
+    }
+
+    /// Replace the identity profile (`SessionBuilder::profile`): connections
+    /// made from now on carry the new identity (connections already
+    /// handshaked keep theirs), every torrent gets a fresh announce peer id
+    /// and key, trackers hear `stopped` under the old identity and
+    /// `started` under the new, and the DHT node restarts with its tables
+    /// under the new version tag.
+    pub async fn set_profile(&self, profile: Profile) -> Result<(), Error> {
+        self.send(|tx| Command::SetProfile(Box::new(profile), tx))
+            .await?
     }
 
     /// Add a torrent.

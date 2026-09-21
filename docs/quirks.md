@@ -532,3 +532,27 @@ What differs (L3, deliberate):
   `min_reconnect_time`** (60 s counted from when the connection was made,
   like any other disconnect; a connection older than that is redialled at
   once); `Session::add_peer` dials at once.
+
+## Q27. Listen sockets and identity replaced at runtime
+
+Source: libtorrent 2.0.14 `session_impl.cpp` (`reopen_listen_sockets`,
+`reopen_network_sockets`, `apply_settings`), `torrent.cpp`
+(`enable_all_trackers`, per-listen-socket announce entries).
+
+- **Trackers hear the change as `stopped` then `started`.** libtorrent keeps
+  one announce entry per listen socket; a socket that goes away has its
+  entries dropped (no `stopped` is sent for them), and the new socket's
+  entries announce `started`. We send `stopped` under the old port (or the
+  old identity, for `set_profile`) before the new `started`, so a tracker
+  never keeps a ghost entry: a behavioural difference in favour of the
+  tracker, and the one place the oracle's behaviour would leave a stale
+  peer entry.
+- **uTP connections drop, TCP connections stay**, as in libtorrent (uTP
+  sockets are bound to the replaced UDP socket).
+- **The DHT node keeps its tables across a listen change**; libtorrent
+  restarts the node with the same id and routing table on a socket change.
+- **`set_profile` changes what new connections say**; connections already
+  handshaked keep their negotiated identity. libtorrent has no equivalent
+  (its fingerprint is fixed at construction); a session with two identities
+  in flight is a state the oracle never shows a tracker or a peer, which is
+  why `set_profile` re-announces every torrent under one identity at once.

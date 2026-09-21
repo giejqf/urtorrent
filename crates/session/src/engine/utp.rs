@@ -106,6 +106,14 @@ impl UtpHost {
         self.mgr.borrow_mut().set_incoming_enabled(on);
     }
 
+    /// Drop every connection (the UDP sockets they were bound to are gone).
+    pub fn abort_all(&self) {
+        self.mgr.borrow_mut().abort_all();
+        for w in self.wakers.borrow_mut().values_mut() {
+            w.wake_all();
+        }
+    }
+
     /// Payload bytes copied in user space on the uTP data path (see
     /// [`utp::Stats::copied_bytes`]).
     pub fn copied_bytes(&self) -> u64 {

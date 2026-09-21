@@ -26,7 +26,7 @@ use metainfo::InfoHash;
 use uring::{Buffer, UdpSocket};
 
 use super::Ctx;
-use super::local::{Either, select2};
+use super::local::{Either, Flag, select2};
 use super::torrent::{self, Torrent};
 use crate::api::{Event, PeerSource};
 
@@ -41,6 +41,9 @@ pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub struct Lsd {
     sockets: Vec<Rc<UdpSocket>>,
     cookie: u32,
+    /// Set when this instance is replaced (a listen change): its receive
+    /// loops exit.
+    gone: Rc<Flag>,
 }
 
 impl Lsd {
@@ -67,6 +70,7 @@ impl Lsd {
         Some(Lsd {
             sockets,
             cookie: cookie & 0x7fff_ffff,
+            gone: Flag::new(),
         })
     }
 
@@ -78,8 +82,13 @@ impl Lsd {
     /// Start the receive loops.
     pub fn spawn(&self, ctx: Rc<Ctx>) {
         for s in &self.sockets {
-            uring::spawn(receive_loop(ctx.clone(), s.clone()));
+            uring::spawn(receive_loop(ctx.clone(), s.clone(), self.gone.clone()));
         }
+    }
+
+    /// End the receive loops (this instance is being replaced).
+    pub fn retire(&self) {
+        self.gone.set();
     }
 }
 
@@ -116,7 +125,7 @@ pub fn announce_now(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
                     .lsd
                     .borrow()
                     .as_ref()
-                    .map(|l| l.packet(v6, ctx.listen_port, &info_hash));
+                    .map(|l| l.packet(v6, ctx.listen_port(), &info_hash));
                 let Some(pkt) = pkt else { return };
                 let to = if v6 {
                     SocketAddr::new(IpAddr::V6(GROUP_V6), PORT)
@@ -133,10 +142,15 @@ pub fn announce_now(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
 }
 
 /// Receive announces and turn them into candidates.
-async fn receive_loop(ctx: Rc<Ctx>, socket: Rc<UdpSocket>) {
+async fn receive_loop(ctx: Rc<Ctx>, socket: Rc<UdpSocket>, gone: Rc<Flag>) {
     loop {
         let buf = Buffer::from_vec(vec![0u8; 1500]);
-        match select2(socket.recv_from(buf), ctx.closing.wait()).await {
+        match select2(
+            socket.recv_from(buf),
+            select2(ctx.closing.wait(), gone.wait()),
+        )
+        .await
+        {
             Either::Left((Ok(n), b, Some(from))) => {
                 on_datagram(&ctx, &b.as_slice()[..n as usize], from);
             }
@@ -145,7 +159,7 @@ async fn receive_loop(ctx: Rc<Ctx>, socket: Rc<UdpSocket>) {
                 tracing::warn!("lsd recv failed: {e}");
                 uring::sleep(Duration::from_millis(500)).await;
             }
-            Either::Right(()) => break,
+            Either::Right(_) => break,
         }
     }
 }

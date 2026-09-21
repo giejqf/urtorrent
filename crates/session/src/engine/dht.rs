@@ -9,7 +9,7 @@
 //! finds go to torrents, its address votes to the external-address voter,
 //! its announces run round-robin over the (non-private) torrents.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
@@ -39,7 +39,7 @@ struct Family {
 pub struct Dht {
     families: RefCell<Vec<Family>>,
     /// Our UDP port (the listen port).
-    port: u16,
+    port: Cell<u16>,
     /// Bootstrap routers as configured (`host:port`).
     routers: Vec<String>,
     /// Torrents to announce soon (new / finished), then the round-robin.
@@ -52,8 +52,11 @@ pub struct Dht {
 impl Dht {
     /// Create the nodes (one per listen family). `state` restores saved
     /// ids / nodes (see [`Dht::state`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        ctx_cfg: &super::EngineConfig,
+        profile: &profile::Profile,
+        read_only: bool,
+        bootstrap: Option<&[String]>,
         v4: bool,
         v6: bool,
         port: u16,
@@ -62,8 +65,8 @@ impl Dht {
         now: Instant,
     ) -> Dht {
         let cfg = dht::Config {
-            version: Some(ctx_cfg.profile.dht.version.to_vec()),
-            read_only: ctx_cfg.dht_read_only,
+            version: Some(profile.dht.version.to_vec()),
+            read_only,
             restrict_search_ips: true,
         };
         let saved = state.and_then(SavedState::decode);
@@ -86,10 +89,9 @@ impl Dht {
                 lookups: HashMap::new(),
             });
         }
-        let routers = match &ctx_cfg.dht_bootstrap_nodes {
-            Some(list) => list.clone(),
-            None => ctx_cfg
-                .profile
+        let routers = match bootstrap {
+            Some(list) => list.to_vec(),
+            None => profile
                 .dht
                 .bootstrap_nodes
                 .iter()
@@ -98,7 +100,7 @@ impl Dht {
         };
         let d = Dht {
             families: RefCell::new(families),
-            port,
+            port: Cell::new(port),
             routers,
             pending: RefCell::new(VecDeque::new()),
             next_announce: RefCell::new(now),
@@ -150,7 +152,13 @@ impl Dht {
 
     /// Our DHT port.
     pub fn port(&self) -> u16 {
-        self.port
+        self.port.get()
+    }
+
+    /// The listen port changed (the sockets under the node were replaced;
+    /// its tables carry on).
+    pub fn set_port(&self, port: u16) {
+        self.port.set(port);
     }
 
     /// A datagram from the listen port's UDP socket that looks like KRPC.
@@ -296,11 +304,16 @@ impl Dht {
         let mut rng = RngRef(&ctx.rng);
         // `implied_port` whenever incoming uTP is on (libtorrent: the DHT node
         // then records our UDP source port, the one uTP is reachable on).
-        let implied_port = ctx.transports().utp_incoming() && ctx.utp.is_some();
+        let implied_port = ctx.transports().utp_incoming() && ctx.utp().is_some();
         for f in fams.iter_mut() {
-            let l = f
-                .node
-                .announce(info_hash, self.port, seed, implied_port, now, &mut rng);
+            let l = f.node.announce(
+                info_hash,
+                self.port.get(),
+                seed,
+                implied_port,
+                now,
+                &mut rng,
+            );
             f.lookups.insert(l, id);
         }
     }
@@ -353,9 +366,9 @@ impl Dht {
         }
         for (v6, ip, from) in votes {
             let local = if v6 {
-                ctx.cfg.listen_v6.map(IpAddr::V6)
+                ctx.listen_v6().map(IpAddr::V6)
             } else {
-                ctx.cfg.listen_v4.map(IpAddr::V4)
+                ctx.listen_v4().map(IpAddr::V4)
             };
             if let Some(local) = local {
                 ctx.cast_external_vote(local, ip, Source::Dht, from);

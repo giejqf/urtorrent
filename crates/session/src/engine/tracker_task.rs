@@ -72,7 +72,7 @@ fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
     AnnounceRequest {
         info_hash: t.info_hash,
         peer_id: t.peer_id,
-        port: ctx.listen_port,
+        port: ctx.listen_port(),
         uploaded: t.stats.uploaded,
         // libtorrent (`report_true_downloaded` off): the useful payload,
         // without the bytes that failed hashing or arrived twice, so the
@@ -90,8 +90,7 @@ fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
         // Q8: `supportcrypto=1` unless encryption is disabled.
         crypto_supported: ctx.encryption() != crate::api::EncryptionMode::Disabled,
         ipv4_hints: if t.private {
-            ctx.cfg
-                .listen_v4
+            ctx.listen_v4()
                 .filter(|a| {
                     !a.is_unspecified() && !a.is_loopback() && !a.is_private() && !a.is_link_local()
                 })
@@ -101,8 +100,7 @@ fn build_request(ctx: &Ctx, t: &Torrent, job: &AnnounceJob) -> AnnounceRequest {
             Vec::new()
         },
         ipv6_hints: if t.private {
-            ctx.cfg
-                .listen_v6
+            ctx.listen_v6()
                 .filter(|a| {
                     !a.is_unspecified()
                         && !a.is_loopback()
@@ -128,7 +126,7 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
     // tracker of the other family can never be reached from it: disable that
     // endpoint silently, as the oracle does (no error, no retries).
     let v6 = ctx
-        .families
+        .families()
         .endpoints()
         .get(job.endpoint)
         .copied()
@@ -149,7 +147,8 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
     let permit = ctx.announce_gate.acquire().await;
     let result: Result<(AnnounceResponse, Option<(SocketAddr, SocketAddr)>), String> = async {
         let url = Url::parse(&job.url).map_err(|e| e.to_string())?;
-        let profile = &ctx.cfg.profile;
+        let profile_v = ctx.profile();
+        let profile = &profile_v;
         if url.scheme == "udp" {
             return announce_udp(ctx, &url, &request, v6)
                 .await
@@ -240,7 +239,8 @@ async fn announce_udp(
         .into_iter()
         .find(|a| a.ip().is_ipv6() == v6 && ctx.udp.supports(a.ip()))
         .ok_or_else(|| format!("no usable address for {}", url.host))?;
-    let shape = &ctx.cfg.profile.http;
+    let profile_v = ctx.profile();
+    let shape = &profile_v.http;
     let numwant = if request.event == tracker::AnnounceEvent::Stopped {
         shape.numwant_stopped
     } else {
@@ -293,8 +293,9 @@ pub async fn scrape_all(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
                     .map(|&(c, d, i)| (c, d, i, None))
                     .ok_or_else(|| "empty scrape reply".to_string());
             }
-            let profile = &ctx.cfg.profile;
-            let resp = http::get(&ctx.dns, &ctx.tls, ctx.families, &url, &|u| {
+            let profile_v = ctx.profile();
+            let profile = &profile_v;
+            let resp = http::get(&ctx.dns, &ctx.tls, ctx.families(), &url, &|u| {
                 tracker::scrape::http_request(u, &[hash], profile)
             })
             .await?;

@@ -784,14 +784,14 @@ fn usable_peer_addr(ctx: &Ctx, a: SocketAddr) -> bool {
                 || v6.to_ipv4_mapped().is_some()
         }
     };
-    if bad || !ctx.families.allows(ip) {
+    if bad || !ctx.families().allows(ip) {
         return false;
     }
     let own = match ip {
-        IpAddr::V4(v4) => ctx.cfg.listen_v4 == Some(v4) && !v4.is_unspecified(),
-        IpAddr::V6(v6) => ctx.cfg.listen_v6 == Some(v6) && !v6.is_unspecified(),
+        IpAddr::V4(v4) => ctx.listen_v4() == Some(v4) && !v4.is_unspecified(),
+        IpAddr::V6(v6) => ctx.listen_v6() == Some(v6) && !v6.is_unspecified(),
     } || ctx.is_own_ip(ip);
-    !(own && a.port() == ctx.listen_port)
+    !(own && a.port() == ctx.listen_port())
 }
 
 fn resume_file(dir: &std::path::Path, h: &InfoHash) -> PathBuf {
@@ -845,7 +845,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
     if let Some(dir) = &params.resume_dir {
         std::fs::create_dir_all(dir)?;
     }
-    let announcer = Announcer::new(tiers, ctx.families.endpoints().len());
+    let announcer = Announcer::new(tiers, ctx.families().endpoints().len());
     let torrent = Rc::new(RefCell::new(Torrent {
         id,
         info_hash,
@@ -1422,7 +1422,7 @@ fn start_tasks(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
     ctx.schedule_tick(torrent);
     super::lsd::announce_now(ctx, torrent);
     super::webseed::start(ctx, torrent);
-    if let Some(d) = &ctx.dht {
+    if let Some(d) = ctx.dht() {
         let t = torrent.borrow();
         if !t.private {
             d.announce_soon(t.id);
@@ -1729,15 +1729,15 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
         // listen address.
         let ours_v4 = SocketAddr::new(
             ctx.external_address(false).unwrap_or(IpAddr::V4(
-                ctx.cfg.listen_v4.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                ctx.listen_v4().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
             )),
-            ctx.listen_port,
+            ctx.listen_port(),
         );
         let ours_v6 = SocketAddr::new(
             ctx.external_address(true).unwrap_or(IpAddr::V6(
-                ctx.cfg.listen_v6.unwrap_or(std::net::Ipv6Addr::UNSPECIFIED),
+                ctx.listen_v6().unwrap_or(std::net::Ipv6Addr::UNSPECIFIED),
             )),
-            ctx.listen_port,
+            ctx.listen_port(),
         );
         let mut v: Vec<SocketAddr> = t.candidates.drain(..).collect();
         v.sort_by_key(|a| {
@@ -1759,6 +1759,7 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
         t.candidates.push_back(addr);
         if t.banned.contains(&addr.ip())
             || ctx.is_banned_ip(addr.ip())
+            || !ctx.families().allows(addr.ip()) // a family switched off since
             || t.has_peer_ip(addr.ip()) // one connection per IP, as the oracle
             || t.connecting.contains(&addr)
             || t.failed
@@ -1972,7 +1973,7 @@ fn maybe_finished(ctx: &Ctx, t: &mut Torrent, now: Instant) -> bool {
         t.announcer.completed(now);
         t.tracker_kick.notify();
         // The oracle re-announces to the DHT as a seed right after finishing.
-        if let Some(d) = &ctx.dht
+        if let Some(d) = ctx.dht()
             && !t.private
         {
             d.announce_soon(t.id);

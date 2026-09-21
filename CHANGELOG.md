@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-21
+
+The last settings that needed a session rebuild change live.
+
+### Added
+
+- `Session::set_listen(port, v4, v6)`: replaces the listen sockets. The
+  new TCP sockets bind first (a failure returns the error and changes
+  nothing; keeping the port while changing addresses closes the old
+  sockets first and restores them if the new bind fails); every running
+  torrent announces `stopped` on the old port and `started` on the new
+  one; the UDP sockets (UDP trackers, DHT, uTP) move with the port, the
+  DHT node carrying on over them; LSD rejoins its groups; established TCP
+  connections stay; uTP connections drop; peers of a family switched off
+  are disconnected and its addresses are no longer dialled.
+  `Session::listen_port()` follows.
+- `Session::set_dht(on)`: starts a node (restoring the tables of one
+  stopped earlier in the session, or the builder's `dht_state`) or stops
+  it, keeping its tables.
+- `Session::set_profile(profile)`: connections made from now on carry the
+  new identity, every torrent gets a fresh announce peer id and key,
+  trackers hear `stopped` under the old identity and `started` under the
+  new, the DHT node restarts with its tables under the new version tag.
+- `crates/session/tests/listen.rs` gates all three (tracker request lines
+  inspected for the `stopped` / `started` pairs and the ids and ports they
+  carry).
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0900-` / `urtorrent/0.9.0`
+  / DHT `UR\x00\x09`.
+
 ## [0.8.0] - 2026-09-21
 
 Gap check before the daemon (an HTTP API in front of the library, then a

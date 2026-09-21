@@ -12,21 +12,30 @@ snapshots and the public operations is the frontend's, and stays out.
 
 | Area | Session (`SessionBuilder` / runtime) | Per torrent (`AddTorrent` / runtime) |
 |---|---|---|
-| Listening | `listen_port`, `listen_v4`, `listen_v6` (a family off = never dialled either) | |
-| Identity | `profile` (`native`, `qbt_5_2_3_lt2_0_14`) | |
+| Listening | `listen_port`, `listen_v4`, `listen_v6` (a family off = never dialled either; + `set_listen`) | |
+| Identity | `profile` (`native`, `qbt_5_2_3_lt2_0_14`; + `set_profile`) | |
 | Connections | `max_connections` (+ `set_max_connections`), `max_peers_per_torrent` (+ `set_max_peers_per_torrent`) | `max_peers` (+ `set_max_peers`) |
 | Upload slots | `unchoke_slots` (+ `set_unchoke_slots`) | `max_uploads` (+ `set_max_uploads`) |
 | Rates | `upload_limit`, `download_limit` (+ `set_rate_limits`) | `upload_limit`, `download_limit` (+ `set_torrent_rate_limits`) |
 | Queue | `active_limits` (`downloads` / `seeds` / `total` / `count_slow`, + `set_active_limits`) | `auto_managed` (+ `set_auto_managed`, `force_resume`, `move_in_queue`); `pause` leaves the queue, `resume` rejoins it |
 | Transports | `transports` (`TcpOnly` / `PreferTcp` / `PreferUtp` / `UtpOnly`, + `set_transports`), `encryption` (`Disabled` / `Enabled` / `Forced`, + `set_encryption`) | |
-| Discovery | `pex` (+ `set_pex`), `lsd` (+ `set_lsd`), `dht`, `dht_bootstrap_nodes`, `dht_read_only`, `dht_state` | `add_peer`, `add_tracker` / `remove_tracker`, `add_web_seed` / `remove_web_seed`, `force_reannounce`, `scrape` |
+| Discovery | `pex` (+ `set_pex`), `lsd` (+ `set_lsd`), `dht` (+ `set_dht`), `dht_bootstrap_nodes`, `dht_read_only`, `dht_state` | `add_peer`, `add_tracker` / `remove_tracker`, `add_web_seed` / `remove_web_seed`, `force_reannounce`, `scrape` |
 | Peers | `ban_ip` / `unban_ip` / `banned_ips` (session-wide) | |
 | Storage | `max_open_files`, `disk_thread`, `max_checking`, `piece_extent_affinity` | `save_path`, `resume_dir`, `preallocate`, `file_priorities` (+ `set_file_priorities`), `sequential` (+ `set_sequential`), `rename_file`, `move_storage`, `force_recheck`, `save_resume_data` |
 | Engine | `hash_threads`, `recv_ring`, `zero_copy_send`, `max_concurrent_announces`, `root_certificate_pem` | `paused` |
 
-`Session::settings()` returns the values in force. Fixed for a session's
-lifetime (build a new one to change them): the listen port and addresses,
-the profile, whether a DHT node runs, and the engine tuning row.
+`Session::settings()` returns the values in force. Everything a
+preferences page exposes changes live; only the engine tuning row
+(`hash_threads`, `recv_ring`, `zero_copy_send`, `disk_thread`, ...) is fixed
+for a session's lifetime. `set_listen` binds the new sockets before touching
+anything (a failure changes nothing), then trackers hear `stopped` on the
+old port and `started` on the new; TCP connections stay, uTP connections
+drop with their UDP sockets, the DHT node carries on over the new ones, and
+peers of a family switched off are disconnected. `set_profile` gives every
+torrent a fresh announce identity (with the same `stopped` / `started`
+pair) and restarts the DHT node with its tables; connections already
+handshaked keep the identity they were made with. `set_dht(false)` keeps
+the tables for the next `set_dht(true)`.
 
 Snapshots carry what the policies above need: `TorrentStatus` (rates,
 counters, `active_time` / `seeding_time`, `queue_position`, `auto_managed`,
@@ -78,7 +87,6 @@ categories, tags, ...). `Session::dht_state()` persists the DHT.
 | `connection_speed` / half-open limit | engine constant (10) |
 | peer / request / inactivity timeouts | libtorrent's defaults as constants (L3) |
 | `min_reconnect_time` | libtorrent's 60 s; `add_peer` bypasses it |
-| listen port / addresses, DHT on/off, profile at runtime | rebuild the session |
 | piece priorities / first-and-last-piece first | candidate: `set_piece_priorities` |
 | IP block list by range (`ip_filter`) | `ban_ip` bans single addresses; ranges are a candidate |
 | `seed_mode` / "skip hash check" on add | not offered: advertising unverified pieces would break rule 1; a lazy per-piece verify is the honest form and a candidate |

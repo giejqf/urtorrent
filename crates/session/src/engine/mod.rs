@@ -14,6 +14,7 @@ mod dht;
 mod dns;
 mod external_ip;
 mod http;
+mod listen;
 mod local;
 mod lsd;
 mod metadata;
@@ -40,7 +41,7 @@ use metainfo::InfoHash;
 use profile::Profile;
 use storage::DiskRing;
 use tokio::sync::{mpsc, oneshot};
-use uring::{Notifier, NotifyHandle, Runtime, TcpListener};
+use uring::{Notifier, NotifyHandle, Runtime};
 
 use crate::Error;
 use crate::api::{
@@ -194,6 +195,14 @@ pub enum Command {
     BanIp(IpAddr, bool, oneshot::Sender<()>),
     BannedIps(oneshot::Sender<Vec<IpAddr>>),
     Settings(oneshot::Sender<crate::api::SessionSettings>),
+    SetListen(
+        u16,
+        Option<Ipv4Addr>,
+        Option<Ipv6Addr>,
+        oneshot::Sender<Result<u16, Error>>,
+    ),
+    SetDht(bool, oneshot::Sender<Result<(), Error>>),
+    SetProfile(Box<Profile>, oneshot::Sender<Result<(), Error>>),
     Files(
         TorrentId,
         oneshot::Sender<Result<Vec<crate::api::FileStatus>, Error>>,
@@ -254,9 +263,26 @@ struct Subscriber {
 /// Shared engine state (one per ring thread, behind an `Rc`).
 pub struct Ctx {
     pub cfg: EngineConfig,
-    pub peer_id: [u8; 20],
-    pub listen_port: u16,
-    pub families: http::Families,
+    /// The session peer id (profiles with a per-session id); regenerated
+    /// by `set_profile`.
+    peer_id: Cell<[u8; 20]>,
+    /// The listen port in use (`set_listen` changes it).
+    listen_port: Cell<u16>,
+    /// The listen families in use.
+    families: Cell<http::Families>,
+    /// The listen addresses in use (`None` = family off).
+    listen_v4: Cell<Option<Ipv4Addr>>,
+    listen_v6: Cell<Option<Ipv6Addr>>,
+    /// The identity profile in force (`set_profile`).
+    profile: RefCell<Profile>,
+    /// Set when the listen sockets are replaced: the accept loops of the
+    /// old sockets exit.
+    listen_gen: RefCell<Rc<Flag>>,
+    /// Accept loops running (a listener's fd closes when its loop exits).
+    accept_loops: Cell<usize>,
+    /// Saved DHT state of a node switched off (`set_dht`), restored when
+    /// it is switched on again.
+    dht_saved: RefCell<Option<Vec<u8>>>,
     /// The disk thread (torrent file I/O and hashing).
     pub disk: Rc<DiskRing>,
     pub dns: Dns,
@@ -265,9 +291,9 @@ pub struct Ctx {
     /// Local Service Discovery sockets (`None` when disabled or unavailable).
     pub lsd: RefCell<Option<lsd::Lsd>>,
     /// The DHT node(s), `None` when disabled.
-    pub dht: Option<Rc<dht::Dht>>,
+    dht: RefCell<Option<Rc<dht::Dht>>>,
     /// The uTP endpoint, `None` when both directions are disabled.
-    pub utp: Option<Rc<utp::UtpHost>>,
+    utp: RefCell<Option<Rc<utp::UtpHost>>>,
     /// External-address voters, one per listen family (`[v4, v6]`).
     pub external: RefCell<[external_ip::IpVoter; 2]>,
     pub rng: Rc<rng::Rng>,
@@ -426,6 +452,46 @@ impl Ctx {
         self.connections.set(self.connections.get() + 1);
     }
 
+    /// The listen port in use.
+    pub fn listen_port(&self) -> u16 {
+        self.listen_port.get()
+    }
+
+    /// The listen families in use.
+    pub fn families(&self) -> http::Families {
+        self.families.get()
+    }
+
+    /// The IPv4 listen address in use.
+    pub fn listen_v4(&self) -> Option<Ipv4Addr> {
+        self.listen_v4.get()
+    }
+
+    /// The IPv6 listen address in use.
+    pub fn listen_v6(&self) -> Option<Ipv6Addr> {
+        self.listen_v6.get()
+    }
+
+    /// The identity profile in force.
+    pub fn profile(&self) -> Profile {
+        self.profile.borrow().clone()
+    }
+
+    /// The DHT node, if one runs.
+    pub fn dht(&self) -> Option<Rc<dht::Dht>> {
+        self.dht.borrow().clone()
+    }
+
+    /// The uTP host, if the listen port has a UDP socket.
+    pub fn utp(&self) -> Option<Rc<utp::UtpHost>> {
+        self.utp.borrow().clone()
+    }
+
+    /// The flag the current accept loops watch.
+    pub fn listen_gen(&self) -> Rc<Flag> {
+        self.listen_gen.borrow().clone()
+    }
+
     /// Session-wide connection limit.
     pub fn max_connections(&self) -> usize {
         self.max_connections.get()
@@ -530,12 +596,13 @@ impl Ctx {
     /// The peer id for a new torrent: fresh per torrent or the session's,
     /// as the profile dictates (L1: lifetime is part of the identity).
     pub fn new_torrent_peer_id(&self) -> [u8; 20] {
-        match self.cfg.profile.peer_id.lifetime {
+        let profile = self.profile.borrow();
+        match profile.peer_id.lifetime {
             profile::PeerIdLifetime::PerTorrent => {
                 let mut r = rng::RngRef(&self.rng);
-                self.cfg.profile.peer_id.generate(&mut r)
+                profile.peer_id.generate(&mut r)
             }
-            profile::PeerIdLifetime::PerSession => self.peer_id,
+            profile::PeerIdLifetime::PerSession => self.peer_id.get(),
         }
     }
 
@@ -563,7 +630,7 @@ impl Ctx {
 
     /// The DHT node of that family adopts a BEP 42 id for the new address.
     fn dht_external_ip_changed(&self, ip: IpAddr) {
-        if let Some(d) = &self.dht {
+        if let Some(d) = self.dht() {
             d.external_ip(self, ip);
         }
     }
@@ -582,11 +649,12 @@ impl Ctx {
     /// The peer id a new connection of `torrent` shakes hands with: the
     /// torrent's announce id, or a fresh one per connection (L1, Q19).
     pub fn handshake_peer_id(&self, torrent: &Torrent) -> [u8; 20] {
-        match self.cfg.profile.peer_id.handshake {
+        let profile = self.profile.borrow();
+        match profile.peer_id.handshake {
             profile::HandshakePeerId::SameAsAnnounce => torrent.peer_id,
             profile::HandshakePeerId::PerConnection => {
                 let mut r = rng::RngRef(&self.rng);
-                self.cfg.profile.peer_id.generate(&mut r)
+                profile.peer_id.generate(&mut r)
             }
         }
     }
@@ -642,46 +710,20 @@ pub fn run(
         let kick = notifier.handle();
 
         // Listen sockets: one per family, `IPV6_V6ONLY` on the v6 one.
-        let mut listeners: Vec<TcpListener> = Vec::new();
-        let mut port = cfg.listen_port;
-        let mut bind_err: Option<uring::Error> = None;
-        if let Some(v4) = cfg.listen_v4 {
-            match TcpListener::bind(SocketAddr::new(IpAddr::V4(v4), port)) {
-                Ok(l) => {
-                    port = l.local_addr().port();
-                    listeners.push(l);
-                }
-                Err(e) => bind_err = Some(e),
+        let bound = match listen::bind_tcp(cfg.listen_port, cfg.listen_v4, cfg.listen_v6) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
             }
-        }
-        if let Some(v6) = cfg.listen_v6 {
-            match TcpListener::bind(SocketAddr::new(IpAddr::V6(v6), port)) {
-                Ok(l) => {
-                    port = l.local_addr().port();
-                    listeners.push(l);
-                }
-                Err(e) => {
-                    // A host without IPv6 is fine as long as v4 bound.
-                    if listeners.is_empty() {
-                        bind_err = Some(e);
-                    } else {
-                        tracing::warn!("ipv6 listen failed: {e}");
-                    }
-                }
-            }
-        }
-        if listeners.is_empty() {
-            let e = bind_err.map_or_else(
-                || Error::Io("no listen address configured".into()),
-                Error::from,
-            );
-            let _ = ready.send(Err(e));
-            return;
-        }
-        let families = http::Families {
-            v4: listeners.iter().any(|l| l.local_addr().is_ipv4()),
-            v6: listeners.iter().any(|l| l.local_addr().is_ipv6()),
         };
+        let listen::Bound {
+            listeners,
+            port,
+            families,
+            v4: bound_v4,
+            v6: bound_v6,
+        } = bound;
 
         let mut roots = tls::TlsClient::env_roots();
         roots.extend(cfg.extra_roots.iter().cloned());
@@ -700,8 +742,8 @@ pub fn run(
         // The listen port's UDP sockets (UDP trackers now; DHT/uTP demux later).
         let udp_demux = Rc::new(udp::UdpDemux::bind(
             port,
-            if families.v4 { cfg.listen_v4 } else { None },
-            if families.v6 { cfg.listen_v6 } else { None },
+            bound_v4,
+            bound_v6,
             (rng.next_u64() >> 32) as u32,
         ));
         let disk = if cfg.disk_thread {
@@ -720,11 +762,7 @@ pub fn run(
             ))
         };
         let lsd = if cfg.lsd {
-            lsd::Lsd::open(
-                if families.v4 { cfg.listen_v4 } else { None },
-                if families.v6 { cfg.listen_v6 } else { None },
-                (rng.next_u64() >> 33) as u32,
-            )
+            lsd::Lsd::open(bound_v4, bound_v6, (rng.next_u64() >> 33) as u32)
         } else {
             None
         };
@@ -734,7 +772,9 @@ pub fn run(
                 || udp_demux.supports(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
         {
             Some(Rc::new(dht::Dht::new(
-                &cfg,
+                &cfg.profile,
+                cfg.dht_read_only,
+                cfg.dht_bootstrap_nodes.as_deref(),
                 udp_demux.supports(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
                 udp_demux.supports(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
                 port,
@@ -775,8 +815,14 @@ pub fn run(
             tls,
             udp: udp_demux.clone(),
             lsd: RefCell::new(lsd),
-            dht: dht_service,
-            utp: utp_host,
+            dht: RefCell::new(dht_service),
+            utp: RefCell::new(utp_host),
+            listen_v4: Cell::new(bound_v4),
+            listen_v6: Cell::new(bound_v6),
+            profile: RefCell::new(cfg.profile.clone()),
+            listen_gen: RefCell::new(Flag::new()),
+            accept_loops: Cell::new(0),
+            dht_saved: RefCell::new(None),
             external: RefCell::new([
                 external_ip::IpVoter::new(now),
                 external_ip::IpVoter::new(now),
@@ -785,9 +831,9 @@ pub fn run(
             down_limit: rate::Limiter::new(cfg.download_rate, now),
             slots: Cell::new(cfg.unchoke_slots),
             optimistic: Cell::new(None),
-            peer_id,
-            listen_port: port,
-            families,
+            peer_id: Cell::new(peer_id),
+            listen_port: Cell::new(port),
+            families: Cell::new(families),
             disk,
             rng,
             kick: kick.clone(),
@@ -824,7 +870,7 @@ pub fn run(
         tracing::info!(
             port,
             peer_id = %String::from_utf8_lossy(&peer_id),
-            profile = ctx.cfg.profile.name,
+            profile = ctx.profile.borrow().name,
             "engine up"
         );
         let _ = ready.send(Ok(Boot {
@@ -832,37 +878,28 @@ pub fn run(
             listen_port: port,
         }));
 
+        let generation = ctx.listen_gen();
         for l in listeners {
-            uring::spawn(accept_loop(ctx.clone(), l));
+            listen::spawn_accept(&ctx, l, generation.clone());
         }
-        if let Some(h) = ctx.utp.clone() {
+        if let Some(h) = ctx.utp() {
             // uTP datagrams on the listen port; SYNs become incoming peers.
-            let weak = Rc::downgrade(&ctx);
-            ctx.udp.set_utp(
-                h.clone(),
-                Box::new(move |key| {
-                    if let Some(ctx) = weak.upgrade()
-                        && let Some(h) = ctx.utp.clone()
-                    {
-                        uring::spawn(peer::run_incoming(
-                            ctx.clone(),
-                            transport::Transport::Utp(Rc::new(h.stream(key))),
-                        ));
-                    }
-                }),
-            );
+            listen::install_utp(&ctx, h);
         }
         udp_demux.spawn(ctx.closing.clone());
-        if let Some(d) = ctx.dht.clone() {
-            // KRPC datagrams on the listen port go to the DHT.
+        // KRPC datagrams on the listen port go to the DHT node, whichever
+        // runs at the time (`set_dht`).
+        {
             let weak = Rc::downgrade(&ctx);
             ctx.udp.set_dht_hook(Box::new(move |from, pkt, v6| {
                 if let Some(ctx) = weak.upgrade()
-                    && let Some(d) = ctx.dht.clone()
+                    && let Some(d) = ctx.dht()
                 {
                     d.incoming(&ctx, from, pkt, v6);
                 }
             }));
+        }
+        if let Some(d) = ctx.dht() {
             let ctx2 = ctx.clone();
             uring::spawn(async move {
                 d.start(&ctx2).await;
@@ -899,29 +936,6 @@ pub fn run(
     });
 }
 
-async fn accept_loop(ctx: Rc<Ctx>, listener: TcpListener) {
-    loop {
-        match select2(listener.accept(), ctx.closing.wait()).await {
-            Either::Left(Ok(stream)) => {
-                if !ctx.transports().tcp_incoming() {
-                    // libtorrent accepts and drops (`enable_incoming_tcp`).
-                    drop(stream);
-                    continue;
-                }
-                uring::spawn(peer::run_incoming(
-                    ctx.clone(),
-                    transport::Transport::Tcp(stream),
-                ));
-            }
-            Either::Left(Err(e)) => {
-                tracing::warn!("accept failed: {e}");
-                uring::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            Either::Right(()) => break,
-        }
-    }
-}
-
 /// The session's 100 ms heartbeat: refills the rate limiters and runs the
 /// choker every `UNCHOKE_INTERVAL` (rotating the optimistic slot every
 /// `OPTIMISTIC_INTERVAL`).
@@ -943,12 +957,12 @@ async fn ticker(ctx: Rc<Ctx>) {
         }
         let now = Instant::now();
         ctx.run_due_ticks(now);
-        if let Some(h) = ctx.utp.clone() {
+        if let Some(h) = ctx.utp() {
             h.tick(now);
         }
         if now.duration_since(last_dht) >= std::time::Duration::from_secs(1) {
             last_dht = now;
-            if let Some(d) = ctx.dht.clone() {
+            if let Some(d) = ctx.dht() {
                 d.tick(&ctx, now);
             }
             queue::recalculate(&ctx, now);
@@ -1176,10 +1190,10 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             }
         },
         Command::DhtState(reply) => {
-            let _ = reply.send(ctx.dht.as_ref().map(|d| d.state()));
+            let _ = reply.send(ctx.dht().map(|d| d.state()));
         }
         Command::AddDhtNode(addr, reply) => {
-            if let Some(d) = ctx.dht.clone() {
+            if let Some(d) = ctx.dht() {
                 d.add_node(ctx, addr);
             }
             let _ = reply.send(());
@@ -1207,7 +1221,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         }
         Command::SetTransports(policy, reply) => {
             ctx.transports.set(policy);
-            if let Some(h) = &ctx.utp {
+            if let Some(h) = ctx.utp() {
                 h.set_incoming(policy.utp_incoming());
             }
             let _ = reply.send(());
@@ -1221,13 +1235,13 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             if on && ctx.lsd.borrow().is_none() {
                 // Opened on first use; the sockets then stay for the session.
                 let opened = lsd::Lsd::open(
-                    if ctx.families.v4 {
-                        ctx.cfg.listen_v4
+                    if ctx.families().v4 {
+                        ctx.listen_v4()
                     } else {
                         None
                     },
-                    if ctx.families.v6 {
-                        ctx.cfg.listen_v6
+                    if ctx.families().v6 {
+                        ctx.listen_v6()
                     } else {
                         None
                     },
@@ -1262,13 +1276,30 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             v.sort();
             let _ = reply.send(v);
         }
+        Command::SetListen(port, v4, v6, reply) => {
+            let ctx2 = ctx.clone();
+            uring::spawn(async move {
+                let r = listen::set_listen(&ctx2, port, v4, v6).await;
+                let _ = reply.send(r);
+            });
+        }
+        Command::SetDht(on, reply) => {
+            let _ = reply.send(listen::set_dht(ctx, on));
+        }
+        Command::SetProfile(profile, reply) => {
+            let ctx2 = ctx.clone();
+            uring::spawn(async move {
+                let r = listen::set_profile(&ctx2, *profile).await;
+                let _ = reply.send(r);
+            });
+        }
         Command::Settings(reply) => {
             let _ = reply.send(crate::api::SessionSettings {
-                listen_port: ctx.listen_port,
-                listen_v4: ctx.cfg.listen_v4,
-                listen_v6: ctx.cfg.listen_v6,
-                profile: ctx.cfg.profile.name.to_string(),
-                dht: ctx.dht.is_some(),
+                listen_port: ctx.listen_port(),
+                listen_v4: ctx.listen_v4(),
+                listen_v6: ctx.listen_v6(),
+                profile: ctx.profile.borrow().name.to_string(),
+                dht: ctx.dht().is_some(),
                 upload_limit: ctx.up_limit.rate(),
                 download_limit: ctx.down_limit.rate(),
                 max_connections: ctx.max_connections(),
@@ -1464,13 +1495,13 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 .load(std::sync::atomic::Ordering::Relaxed);
             s.recv_buffers_free = ctx.recv_ring.free();
             s.recv_buffers = usize::from(ctx.cfg.recv_ring_entries);
-            if let Some(d) = &ctx.dht {
+            if let Some(d) = ctx.dht() {
                 let ds = d.stats();
                 s.dht_nodes = ds.nodes;
                 s.dht_lookups = ds.lookups;
                 s.dht_stored_peers = ds.peers;
             }
-            if let Some(h) = &ctx.utp {
+            if let Some(h) = ctx.utp() {
                 s.utp_connections = h.connections();
                 s.copied_bytes += h.copied_bytes();
             }

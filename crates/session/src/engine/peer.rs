@@ -455,21 +455,21 @@ fn connection_params(
         role,
         info_hash: t.info_hash,
         our_peer_id: ctx.handshake_peer_id(t),
-        profile: ctx.cfg.profile.clone(),
+        profile: ctx.profile(),
         piece_count: t.info.as_ref().map(|i| i.piece_count()),
         piece_length: t.info.as_ref().map(|i| i.piece_length),
         our_have: t
             .storage
             .as_ref()
             .map_or_else(|| Bitfield::new(0), |s| s.have()),
-        listen_port: ctx.listen_port,
+        listen_port: ctx.listen_port(),
         peer_ip: Some(peer_ip),
         metadata_size: t.has_metadata().then_some(t.metadata_size),
         // Q6: `p` only when the listen family's external address matches our
         // end of this connection (v4 matches while nothing is voted).
         advertise_port: ctx.advertise_port_for(local_ip),
         private: t.private,
-        dht_port: ctx.dht.as_ref().map(|d| d.port()),
+        dht_port: ctx.dht().map(|d| d.port()),
     }
 }
 
@@ -560,7 +560,7 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
     let use_utp = {
         let t = torrent.borrow();
         let utp_possible =
-            ctx.utp.is_some() && policy.utp_outgoing() && ctx.udp.supports(addr.ip());
+            ctx.utp().is_some() && policy.utp_outgoing() && ctx.udp.supports(addr.ip());
         utp_possible
             && (!policy.tcp_outgoing()
                 || if policy.utp_first() {
@@ -577,9 +577,9 @@ pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: Soc
         t.note_disconnect(addr, Instant::now());
         return;
     }
-    let connected = match (&ctx.utp, use_utp) {
+    let connected = match (ctx.utp(), use_utp) {
         (Some(h), true) => {
-            uring::timeout(UTP_CONNECT_TIMEOUT, Transport::connect_utp(h, addr)).await
+            uring::timeout(UTP_CONNECT_TIMEOUT, Transport::connect_utp(&h, addr)).await
         }
         _ => uring::timeout(CONNECT_TIMEOUT, Transport::connect_tcp(local, addr)).await,
     };
@@ -695,7 +695,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
     }
     let local_addr = stream
         .local_addr()
-        .unwrap_or_else(|_| SocketAddr::new(addr.ip(), ctx.listen_port));
+        .unwrap_or_else(|_| SocketAddr::new(addr.ip(), ctx.listen_port()));
     let mut raw: Vec<u8> = Vec::with_capacity(wire::HANDSHAKE_LEN);
     let mut cipher = Cipher::default();
     // Read until we can tell plaintext from MSE (20 bytes), then finish the
@@ -745,7 +745,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
         let mut resp = mse::Responder::new(
             ctx.dh_private(),
             allowed_mask(&ctx),
-            ctx.cfg.profile.mse.prefer_rc4,
+            ctx.profile().mse.prefer_rc4,
         );
         let mut pending = std::mem::take(&mut raw);
         let outcome = loop {
@@ -972,7 +972,7 @@ async fn run_connection(
 /// address for a uTP dial and say so (the caller reconnects right away).
 fn tcp_closed_before_handshake(t: &mut Torrent, ctx: &Ctx, addr: SocketAddr) -> bool {
     let fallback = ctx.transports().utp_outgoing()
-        && ctx.utp.is_some()
+        && ctx.utp().is_some()
         && ctx.udp.supports(addr.ip())
         && !t.utp_failed.contains(&addr)
         && !t.tcp_failed.contains(&addr);
@@ -996,7 +996,7 @@ fn dial_failed(t: &mut Torrent, ctx: &Ctx, addr: SocketAddr, was_utp: bool) {
     } else {
         t.tcp_failed.insert(addr);
         policy.utp_outgoing()
-            && ctx.utp.is_some()
+            && ctx.utp().is_some()
             && ctx.udp.supports(addr.ip())
             && !t.utp_failed.contains(&addr)
     };
@@ -1073,7 +1073,7 @@ async fn finish_connection(
             // listen port on it again, for any torrent (libtorrent bans the
             // peer entry).
             ctx.note_own_ip(addr.ip());
-            t.forget_candidate(SocketAddr::new(addr.ip(), ctx.listen_port));
+            t.forget_candidate(SocketAddr::new(addr.ip(), ctx.listen_port()));
         }
         t.picker.peer_gone(key);
         let last = handle.last_have.borrow().clone();
@@ -1283,7 +1283,7 @@ async fn handle_event(
                     if other.incoming == handle.incoming {
                         return Err("duplicate connection".into());
                     }
-                    let our_port = ctx.listen_port;
+                    let our_port = ctx.listen_port();
                     let other_port = if handle.incoming {
                         other.addr.port()
                     } else {
@@ -1479,7 +1479,7 @@ async fn handle_event(
         }
         WireEvent::Port(port) => {
             // BEP 5: the peer's DHT node (libtorrent `incoming_dht_port`).
-            if let Some(d) = ctx.dht.clone()
+            if let Some(d) = ctx.dht()
                 && port != 0
             {
                 d.add_node(ctx, SocketAddr::new(handle.addr.ip(), port));

@@ -169,7 +169,7 @@ async fn run_inner(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, url: &str, key
         t.webseed.failures.insert(url.to_string(), MAX_FAILURES);
         return format!("bad url: {e}");
     }
-    let user_agent = ctx.cfg.profile.user_agent;
+    let user_agent = ctx.profile().user_agent;
     // One connection per (redirect-resolved) target URL, kept across rounds.
     let mut conn: Option<(String, super::http::HttpConn)> = None;
     loop {
@@ -359,7 +359,7 @@ async fn fetch(
     for attempt in 0..2 {
         let reuse = matches!(conn, Some((t, c)) if t == target && c.reusable());
         if !reuse {
-            let c = super::http::HttpConn::open(&ctx.dns, &ctx.tls, ctx.families, url).await?;
+            let c = super::http::HttpConn::open(&ctx.dns, &ctx.tls, ctx.families(), url).await?;
             *conn = Some((target.to_string(), c));
         }
         let Some((_, c)) = conn.as_mut() else {
