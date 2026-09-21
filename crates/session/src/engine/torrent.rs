@@ -95,6 +95,11 @@ pub struct Torrent {
     /// Requested file priorities (content-file order) until the metadata
     /// exists; afterwards the live ones are in `storage`.
     pending_priorities: Option<Vec<u8>>,
+    /// BEP 53 `so=` from a magnet link: content-file indices to download;
+    /// applied when the metadata arrives unless explicit priorities were
+    /// given. Indices past the end are ignored.
+    select_only: Option<Vec<u32>>,
+
     /// `move_storage` in progress: block writes/reads wait on `move_gate`.
     pub moving: bool,
     pub move_gate: Rc<Notify>,
@@ -589,8 +594,12 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         TorrentSource::Magnet(uri) => {
             let m = metainfo::MagnetLink::parse(uri).map_err(|e| Error::Metainfo(e.to_string()))?;
             let name = m.name.clone().unwrap_or_else(|| bencode::hex(&m.info_hash));
-            (m.info_hash, name, m.tiers(), Vec::new(), None)
+            (m.info_hash, name, m.tiers(), m.web_seeds.clone(), None)
         }
+    };
+    let magnet = match &params.source {
+        TorrentSource::Magnet(uri) => metainfo::MagnetLink::parse(uri).ok(),
+        TorrentSource::Metainfo(_) => None,
     };
     if ctx.by_hash.borrow().contains_key(&info_hash) {
         return Err(Error::Duplicate);
@@ -619,6 +628,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         save_path: params.save_path.clone(),
         sequential: params.sequential,
         pending_priorities: params.file_priorities.clone(),
+        select_only: magnet.as_ref().and_then(|m| m.select_only.clone()),
         moving: false,
         move_gate: Notify::new(),
         writes_in_flight: 0,
@@ -692,9 +702,32 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         }
         None => {
             // A magnet: nothing to check yet; announce and find peers to
-            // fetch the metadata from.
+            // fetch the metadata from. BEP 9 `x.pe` peers are dialled right
+            // away (host names through the DNS helper).
             if !params.paused {
                 start_tasks(&ctx, &torrent);
+            }
+            if let Some(m) = &magnet {
+                for peer in m.peers.clone() {
+                    let ctx2 = ctx.clone();
+                    let torrent2 = torrent.clone();
+                    uring::spawn(async move {
+                        let Some((host, port)) = split_host_port(&peer) else {
+                            return;
+                        };
+                        match ctx2.dns.resolve(&host, port).await {
+                            Ok(addrs) => {
+                                let mut t = torrent2.borrow_mut();
+                                let n =
+                                    t.add_candidates(&ctx2, &addrs, crate::api::PeerSource::Manual);
+                                if n > 0 {
+                                    t.tracker_kick.notify();
+                                }
+                            }
+                            Err(e) => tracing::debug!(peer, "magnet x.pe: {e}"),
+                        }
+                    });
+                }
             }
         }
     }
@@ -752,7 +785,18 @@ fn attach_metadata(
 ) -> Result<(), Error> {
     let mut t = torrent.borrow_mut();
     let info = Arc::new(info);
-    let requested = t.pending_priorities.take();
+    let requested = t.pending_priorities.take().or_else(|| {
+        // BEP 53: only the selected content files, the rest skipped.
+        let so = t.select_only.take()?;
+        let n = Torrent::content_indices(&info).len();
+        let mut prios = vec![0u8; n];
+        for i in so {
+            if let Some(p) = prios.get_mut(i as usize) {
+                *p = storage::DEFAULT_PRIORITY;
+            }
+        }
+        Some(prios)
+    });
     let initial: Option<Vec<u8>> = match requested {
         Some(p) => match expand_priorities(&info, &p) {
             Some(e) => Some(e),
@@ -1756,4 +1800,17 @@ pub fn pick_contiguous(
 ) -> Vec<picker::Block> {
     let mut rng = RngRef(&ctx.rng);
     picker.pick_contiguous(peer, &|_| true, want, &mut rng)
+}
+
+/// `host:port`, `ipv4:port` or `[ipv6]:port` (BEP 9 `x.pe`).
+fn split_host_port(s: &str) -> Option<(String, u16)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:")?;
+        return Some((host.to_string(), port.parse().ok()?));
+    }
+    let (host, port) = s.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    Some((host.to_string(), port.parse().ok()?))
 }

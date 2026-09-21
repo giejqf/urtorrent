@@ -39,6 +39,18 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             run: capture_peer_private,
         },
         ScenarioDef {
+            name: "capture_magnet_private",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It, Tag::Capture],
+            run: capture_magnet_private,
+        },
+        ScenarioDef {
+            name: "magnet_private_shape",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It, Tag::Diff],
+            run: magnet_private_shape,
+        },
+        ScenarioDef {
             name: "capture_magnet",
             shapes: &[Shape::V4],
             tags: &[Tag::Capture],
@@ -208,6 +220,206 @@ fn capture_peer_private(ctx: &mut Ctx) -> Result<()> {
 /// The oracle adds a magnet link and fetches the metadata from a tap seeder
 /// that serves `ut_metadata`: what libtorrent sends before and after it
 /// knows the metadata is the spec for our magnet mode.
+/// A *private* torrent added by magnet link: libtorrent registers `ut_pex`
+/// and `ut_metadata` before it can know the torrent is private, so what does
+/// its LTEP `m` look like once the metadata is in? Captured from a tap peer
+/// that connects afterwards (docs/quirks.md Q11).
+fn capture_magnet_private(ctx: &mut Ctx) -> Result<()> {
+    let tracker = tap_tracker(ctx)?;
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("pmagnet.bin")
+            .with_size(1 << 20)
+            .with_piece_length(64 << 10)
+            .private(true)
+            .with_tracker(&tracker.http_url(0)),
+    ));
+    let seed_ip = ctx.host_alias(2)?;
+    let peer_addr = SocketAddr::new(seed_ip, 6890);
+    tracker.inject_peer(fx.info_hash, peer_addr, 0);
+    let tap_seed = TapPeer::start(
+        TapPeerConfig::new(fx.info_hash, Role::Seeder)
+            .listen(vec![peer_addr])
+            .fixture(fx.clone())
+            .encryption(TapEncryption::Disabled)
+            .linger(Duration::from_secs(8)),
+    )?;
+    let oracle = ctx.oracle(
+        "oracle",
+        OracleConfig::primary().encryption(Encryption::Disable),
+    )?;
+    let h = fx.info_hash_hex();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{h}&dn=pmagnet.bin&tr={}",
+        crate::http::percent_encode(tracker.http_url(0).as_bytes())
+    );
+    oracle.api.add_torrent(
+        &AddTorrent::magnet(&magnet).save_path(&oracle.save_path.to_string_lossy()),
+        &h,
+    )?;
+    oracle.api.wait_for(
+        &h,
+        Duration::from_secs(120),
+        "oracle to fetch the private metadata and download",
+        |t| t.is_complete(),
+    )?;
+    // A fresh tap peer connects now that the oracle knows the torrent is
+    // private: its `m` is the observation.
+    let probe = TapPeer::start(
+        TapPeerConfig::new(fx.info_hash, Role::Silent)
+            .fixture(fx.clone())
+            .encryption(TapEncryption::Disabled)
+            .bind_addr(ctx.host_alias(3)?)
+            .linger(Duration::from_secs(5)),
+    )?;
+    ensure!(
+        connect_retry(&probe, SocketAddr::new(oracle.actor.addr(), 6881), 10),
+        "probe could not connect to the oracle"
+    );
+    ensure!(
+        probe.wait_for(Duration::from_secs(10), |c| c
+            .iter()
+            .any(|c| c.ext_handshake().is_some())),
+        "no LTEP handshake from the oracle"
+    );
+    for c in probe.captures() {
+        ctx.note(format!(
+            "oracle LTEP handshake after metadata (private, via magnet): {:?}",
+            c.ext_handshake()
+        ));
+    }
+    for c in tap_seed.captures() {
+        ctx.note(format!(
+            "oracle LTEP handshake before metadata: {:?}",
+            c.ext_handshake()
+        ));
+    }
+    let p = ctx.file("tap-peer-pmagnet-probe.jsonl");
+    probe.save_jsonl(&p)?;
+    ctx.artifact("tap-peer-pmagnet-probe.jsonl", &p);
+    let p = ctx.file("tap-peer-pmagnet-seed.jsonl");
+    tap_seed.save_jsonl(&p)?;
+    ctx.artifact("tap-peer-pmagnet-seed.jsonl", &p);
+    Ok(())
+}
+
+/// Differential for the private-magnet case (Q11): our LTEP `m` before
+/// and after the metadata must match the oracle's captured in
+/// `capture_magnet_private`.
+fn magnet_private_shape(ctx: &mut Ctx) -> Result<()> {
+    let tracker = tap_tracker(ctx)?;
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("pmagnet.bin")
+            .with_size(1 << 20)
+            .with_piece_length(64 << 10)
+            .private(true)
+            .with_tracker(&tracker.http_url(0)),
+    ));
+    let seed_ip = ctx.host_alias(2)?;
+    let peer_addr = SocketAddr::new(seed_ip, 6890);
+    tracker.inject_peer(fx.info_hash, peer_addr, 0);
+    let tap_seed = TapPeer::start(
+        TapPeerConfig::new(fx.info_hash, Role::Seeder)
+            .listen(vec![peer_addr])
+            .fixture(fx.clone())
+            .encryption(TapEncryption::Disabled)
+            .linger(Duration::from_secs(8)),
+    )?;
+    let h = fx.info_hash_hex();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{h}&dn=pmagnet.bin&tr={}",
+        crate::http::percent_encode(tracker.http_url(0).as_bytes())
+    );
+    let actor = ctx.actor("urt")?;
+    let mut client = UrtClient::launch_magnet(
+        &actor,
+        ClientConfig::default()
+            .profile("qbt")
+            .encryption("disabled"),
+        &magnet,
+    )?;
+    let st = client.wait_for(Duration::from_secs(120), "our download via magnet", |s| {
+        s.complete
+    })?;
+    ensure!(st.private, "the torrent did not come out private");
+    let probe = TapPeer::start(
+        TapPeerConfig::new(fx.info_hash, Role::Silent)
+            .fixture(fx.clone())
+            .encryption(TapEncryption::Disabled)
+            .bind_addr(ctx.host_alias(3)?)
+            .linger(Duration::from_secs(5)),
+    )?;
+    let port = st.listen_port;
+    ensure!(
+        connect_retry(&probe, SocketAddr::new(client.actor.addr(), port), 10),
+        "probe could not connect to us"
+    );
+    ensure!(
+        probe.wait_for(Duration::from_secs(10), |c| c
+            .iter()
+            .any(|c| c.ext_handshake().is_some())),
+        "no LTEP handshake from us"
+    );
+    let m_keys = |v: Option<&serde_json::Value>| -> Vec<String> {
+        v.and_then(|d| d.get("m"))
+            .and_then(|m| m.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let ours_after = probe
+        .captures()
+        .iter()
+        .find_map(|c| c.ext_handshake().map(|v| m_keys(Some(v))))
+        .unwrap_or_default();
+    let ours_before: Vec<Vec<String>> = tap_seed
+        .captures()
+        .iter()
+        .filter_map(|c| c.ext_handshake().map(|v| m_keys(Some(v))))
+        .collect();
+    client.shutdown()?;
+    let load = |name: &str| -> Result<Vec<Vec<String>>> {
+        let Some(p) = crate::scenario::golden_file("capture_magnet_private", Shape::V4, name)
+        else {
+            anyhow::bail!("no golden {name}; run `cargo xtask capture capture_magnet_private`");
+        };
+        let caps: Vec<crate::tap::peer::PeerCapture> = std::fs::read_to_string(p)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        Ok(caps
+            .iter()
+            .filter_map(|c| c.ext_handshake().map(|v| m_keys(Some(v))))
+            .collect())
+    };
+    let oracle_after = load("tap-peer-pmagnet-probe.jsonl")?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let oracle_before = load("tap-peer-pmagnet-seed.jsonl")?;
+    ctx.note(format!(
+        "m after metadata: oracle {oracle_after:?} us {ours_after:?}; before: oracle {oracle_before:?} us {ours_before:?}"
+    ));
+    ensure!(
+        ours_after == oracle_after,
+        "L2 ltep m after private metadata: oracle {oracle_after:?} vs us {ours_after:?}"
+    );
+    // The first connection to the seeder (metadata unknown) advertises the
+    // full map on both sides.
+    let full_oracle = oracle_before
+        .iter()
+        .find(|k| k.iter().any(|x| x == "ut_metadata"))
+        .cloned();
+    let full_ours = ours_before
+        .iter()
+        .find(|k| k.iter().any(|x| x == "ut_metadata"))
+        .cloned();
+    ensure!(
+        full_ours == full_oracle,
+        "L2 ltep m before metadata: oracle {full_oracle:?} vs us {full_ours:?}"
+    );
+    Ok(())
+}
+
 fn capture_magnet(ctx: &mut Ctx) -> Result<()> {
     let tracker = tap_tracker(ctx)?;
     let fx = Arc::new(Fixture::generate(

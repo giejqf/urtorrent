@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-21
+
+Magnet links and the extension protocol, checked against BEP 9, 10, 11 and
+27 and the oracle (new capture `capture_magnet_private`).
+
+### Added
+
+- Magnet links (BEP 9): `x.pe=` peer hints are dialled right away (host
+  names through the DNS helper, `PeerSource::Manual`), `ws=` web seeds are
+  added, and BEP 53 `so=` selects the files to download once the metadata
+  arrives (explicit `AddTorrent::file_priorities` win). `MagnetLink` gained
+  `peers`, `web_seeds` and `select_only` (breaking for struct literals,
+  hence the minor bump).
+- A tracker-less magnet link is looked up in the DHT before any metadata
+  is known (BEP 9 "SHOULD use the DHT"); lab scenario
+  `magnet_dht_from_oracle`, in-process test in `crates/session/tests/dht.rs`.
+- Scenarios `capture_magnet_private` (the oracle's LTEP `m` before and after
+  a private torrent's metadata arrives via magnet) and
+  `magnet_private_shape` (differential on the same).
+
+### Fixed
+
+- BEP 10: a repeated extension handshake is merged (its `m` is additive, 0
+  disables, unmentioned extensions keep their ids); the peer's `reqq` now
+  caps our request pipeline.
+- BEP 9: unknown `ut_metadata` message types are ignored instead of ending
+  the connection.
+- BEP 11: the `seed` flag (0x02) follows libtorrent — a complete have-set,
+  not BEP 21 upload-only alone.
+- The `native` profile's identity strings are `-UR0500-` / `urtorrent/0.5.0`.
+
 ## [0.4.1] - 2026-09-20
 
 Conformance pass over BEP 6 (fast extension), BEP 7 (IPv6 tracker

@@ -305,6 +305,8 @@ pub async fn on_message(
             st.limit = Some(st.limit.map_or(limit, |l| l.max(limit)));
             st.sent.retain(|p| *p != piece);
         }
+        // BEP 9: "an unrecognized message ID MUST be ignored".
+        Metadata::Unknown { .. } => {}
     }
     Ok(())
 }

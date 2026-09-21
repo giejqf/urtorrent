@@ -281,12 +281,16 @@ impl Dht {
         let Some(t) = ctx.torrent(id) else { return };
         let (info_hash, seed) = {
             let t = t.borrow();
-            // Never for private torrents (BEP 27), paused ones, or before
-            // the metadata has been checked; `seed` only for a true seed.
-            if t.private || !t.is_running() || !t.has_metadata() || t.checking {
+            // Never for private torrents (BEP 27) or paused ones, nor while
+            // the files are being checked; a magnet link without metadata
+            // announces (as a leecher) so the lookup finds the peers to
+            // fetch it from (BEP 9: "SHOULD use the DHT"), as libtorrent
+            // does. `seed` only for a true seed.
+            if t.private || !t.is_running() || t.checking {
                 return;
             }
-            (NodeId(t.info_hash()), t.picker.is_seed())
+            let seed = t.has_metadata() && t.picker.is_seed();
+            (NodeId(t.info_hash()), seed)
         };
         let mut fams = self.families.borrow_mut();
         let mut rng = RngRef(&ctx.rng);

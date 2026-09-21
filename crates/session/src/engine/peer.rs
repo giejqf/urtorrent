@@ -54,6 +54,10 @@ pub struct PeerHandle {
     /// Pieces the peer suggested (BEP 6), newest last; requested first while
     /// the peer has them and we want them.
     suggested: RefCell<Vec<u32>>,
+    /// The peer's `reqq` (BEP 10): outstanding requests it accepts; our
+    /// pipeline never exceeds it (libtorrent caps `max_out_request_queue`
+    /// the same way).
+    reqq: Cell<Option<u32>>,
     peer_id: Cell<Option<[u8; 20]>>,
     last_recv: Cell<Instant>,
     last_send: Cell<Instant>,
@@ -129,6 +133,7 @@ impl PeerHandle {
             uploaded: Cell::new(0),
             client: RefCell::new(None),
             suggested: RefCell::new(Vec::new()),
+            reqq: Cell::new(None),
             peer_id: Cell::new(None),
             last_recv: Cell::new(now),
             last_send: Cell::new(now),
@@ -349,7 +354,10 @@ impl PeerHandle {
         if choking && allowed.is_empty() {
             return;
         }
-        let depth = torrent::pipeline_depth(self.rate.get());
+        let mut depth = torrent::pipeline_depth(self.rate.get());
+        if let Some(q) = self.reqq.get() {
+            depth = depth.min(usize::try_from(q).unwrap_or(usize::MAX).max(2));
+        }
         let outstanding = conn.outstanding().len();
         if outstanding >= depth {
             return;
@@ -1269,6 +1277,9 @@ async fn handle_event(
                 *handle.client.borrow_mut() = ext.v.clone();
             }
             handle.listen_port.set(ext.p);
+            if let Some(q) = ext.reqq {
+                handle.reqq.set(Some(q));
+            }
             // `yourip`: the peer's view of our address is a vote for this
             // listen family's external address (libtorrent
             // `on_extended_handshake` → `set_external_address`).

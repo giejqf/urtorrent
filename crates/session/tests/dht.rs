@@ -178,3 +178,63 @@ fn private_copy(torrent: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&torrent[end..]);
     out
 }
+
+/// BEP 9 + BEP 5: a magnet link with no tracker (`SHOULD use the DHT`): the
+/// leecher looks the info-hash up before it has any metadata, finds the
+/// seeder, fetches the metadata over `ut_metadata` and downloads.
+#[test]
+fn magnet_without_trackers_resolves_through_the_dht() {
+    let dir = std::env::temp_dir().join(format!("urt-dht-magnet-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (torrent_bytes, data) =
+        make_torrent("dhtm.bin", 200_000, 32 * 1024, "http://127.0.0.1:1/x");
+    let a_dir = dir.join("a");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("dhtm.bin"), &data).unwrap();
+    let a = session_at(11, Vec::new(), None);
+    let a_udp = udp_addr(11, &a);
+    let c = session_at(12, vec![a_udp], None);
+    wait_for(20, "A's table to hold C", || {
+        block_on(a.stats()).unwrap().dht_nodes >= 1
+    });
+    let a_id =
+        block_on(a.add_torrent(AddTorrent::metainfo(torrent_bytes.clone(), &a_dir))).unwrap();
+    wait_state(&a, a_id, TorrentState::Seeding, 10);
+    let hex = bencode::hex(&block_on(a.status(a_id)).unwrap().info_hash);
+    wait_for(20, "C to store A's announce", || {
+        block_on(c.stats()).unwrap().dht_stored_peers >= 1
+    });
+
+    let b = session_at(13, vec![a_udp], None);
+    let mut events = b.events();
+    let b_dir = dir.join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let b_id = block_on(b.add_torrent(AddTorrent::magnet(
+        format!("magnet:?xt=urn:btih:{hex}&dn=dhtm"),
+        &b_dir,
+    )))
+    .unwrap();
+    assert_eq!(
+        block_on(b.status(b_id)).unwrap().state,
+        TorrentState::FetchingMetadata
+    );
+    wait_state(&b, b_id, TorrentState::Seeding, 90);
+    assert_eq!(std::fs::read(b_dir.join("dhtm.bin")).unwrap(), data);
+    let mut saw_dht_peers = false;
+    let mut saw_metadata = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !(saw_dht_peers && saw_metadata) {
+        match events.try_recv() {
+            Some(Event::DhtPeers { id, peers }) if id == b_id && peers > 0 => saw_dht_peers = true,
+            Some(Event::MetadataReceived { id }) if id == b_id => saw_metadata = true,
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    assert!(saw_dht_peers, "no DhtPeers event for the magnet");
+    assert!(saw_metadata, "no MetadataReceived event");
+    block_on(b.shutdown()).unwrap();
+    block_on(c.shutdown()).unwrap();
+    block_on(a.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

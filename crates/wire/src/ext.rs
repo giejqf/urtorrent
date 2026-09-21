@@ -184,6 +184,14 @@ pub enum Metadata {
         /// Piece index.
         piece: u32,
     },
+    /// A `msg_type` this implementation does not know: BEP 9 says it MUST
+    /// be ignored (libtorrent does), so it parses instead of failing.
+    Unknown {
+        /// The message type.
+        msg_type: i64,
+        /// Piece index.
+        piece: u32,
+    },
 }
 
 impl Metadata {
@@ -200,6 +208,7 @@ impl Metadata {
                 data,
             } => (1, *piece, Some(*total_size), data),
             Metadata::Reject { piece } => (2, *piece, known_total, &[]),
+            Metadata::Unknown { msg_type, piece } => (*msg_type, *piece, known_total, &[]),
         };
         let mut entries: Vec<(&[u8], Value<'_>)> = vec![
             (b"msg_type", Value::Int(msg_type)),
@@ -247,7 +256,11 @@ impl Metadata {
                 })
             }
             Some(2) => Ok(Metadata::Reject { piece }),
-            _ => Err(Error::Protocol("ut_metadata: bad msg_type")),
+            Some(other) => Ok(Metadata::Unknown {
+                msg_type: other,
+                piece,
+            }),
+            None => Err(Error::Protocol("ut_metadata: bad msg_type")),
         }
     }
 }
@@ -339,7 +352,15 @@ mod tests {
             .encode(None),
             b"d8:msg_typei1e5:piecei0e10:total_sizei5eehello"
         );
-        assert!(Metadata::parse(b"d8:msg_typei9e5:piecei0ee").is_err());
+        // BEP 9: unknown message types are ignored, not fatal.
+        assert_eq!(
+            Metadata::parse(b"d8:msg_typei9e5:piecei0ee").unwrap(),
+            Metadata::Unknown {
+                msg_type: 9,
+                piece: 0
+            }
+        );
+        assert!(Metadata::parse(b"d5:piecei0ee").is_err());
         assert!(
             Metadata::parse(b"d8:msg_typei1e5:piecei0ee").is_err(),
             "no total_size"

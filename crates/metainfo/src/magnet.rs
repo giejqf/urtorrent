@@ -18,7 +18,21 @@ pub struct MagnetLink {
     pub trackers: Vec<String>,
     /// Whether a v2 `xt=urn:btmh:` was present (deferred; recorded for fidelity).
     pub has_v2: bool,
+    /// BEP 9 `x.pe`: peer addresses to connect to right away, as given
+    /// (`host:port`, `ipv4:port`, `[ipv6]:port`), deduplicated.
+    pub peers: Vec<String>,
+    /// `ws`: web seed URLs (BEP 19 in a magnet, as libtorrent and qBittorrent
+    /// read them), deduplicated.
+    pub web_seeds: Vec<String>,
+    /// BEP 53 `so`: the file indices to download (`0,2,4-6`), sorted and
+    /// deduplicated; `None` when the link selects everything. Bounded to
+    /// `MAX_SELECT_ONLY` entries.
+    pub select_only: Option<Vec<u32>>,
 }
+
+/// Most file indices a `so=` list may expand to (a hostile range like
+/// `0-4000000000` must not allocate).
+pub const MAX_SELECT_ONLY: usize = 100_000;
 
 impl MagnetLink {
     /// Parse a `magnet:?...` URI.
@@ -30,10 +44,18 @@ impl MagnetLink {
         let mut name = None;
         let mut trackers = Vec::new();
         let mut has_v2 = false;
+        let mut peers = Vec::new();
+        let mut web_seeds = Vec::new();
+        let mut select_only: Option<Vec<u32>> = None;
         for pair in query.split('&') {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            // Strip the `.N` multi-value suffix magnet allows on some keys.
-            let key = key.split('.').next().unwrap_or(key);
+            // Strip the `.N` multi-value suffix magnet allows on some keys
+            // (`tr.1=`); `x.pe` is a key of its own (BEP 9).
+            let key = if key.starts_with("x.pe") {
+                "x.pe"
+            } else {
+                key.split('.').next().unwrap_or(key)
+            };
             match key {
                 "xt" => {
                     let value = percent_decode(value);
@@ -52,21 +74,70 @@ impl MagnetLink {
                         trackers.push(t);
                     }
                 }
+                "x.pe" => {
+                    let p = percent_decode(value);
+                    if !p.is_empty() && p.len() <= 300 && !peers.contains(&p) && peers.len() < 64 {
+                        peers.push(p);
+                    }
+                }
+                "ws" => {
+                    let w = percent_decode(value);
+                    if !w.is_empty() && !web_seeds.contains(&w) && web_seeds.len() < 64 {
+                        web_seeds.push(w);
+                    }
+                }
+                "so" => {
+                    let list = select_only.get_or_insert_with(Vec::new);
+                    parse_select_only(&percent_decode(value), list);
+                }
                 _ => {}
             }
         }
         let info_hash = info_hash.ok_or(Error::Magnet("no v1 info-hash (xt=urn:btih:)"))?;
+        if let Some(list) = select_only.as_mut() {
+            list.sort_unstable();
+            list.dedup();
+        }
         Ok(MagnetLink {
             info_hash,
             name,
             trackers,
             has_v2,
+            peers,
+            web_seeds,
+            select_only,
         })
     }
 
     /// The tracker tiers (each tracker is its own tier for a magnet).
     pub fn tiers(&self) -> Vec<Vec<String>> {
         self.trackers.iter().map(|t| vec![t.clone()]).collect()
+    }
+}
+
+/// BEP 53: `0,2,4-6` → indices, appended to `out` (bounded).
+fn parse_select_only(text: &str, out: &mut Vec<u32>) {
+    for part in text.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (lo, hi) = match part.split_once('-') {
+            Some((a, b)) => match (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                (Ok(a), Ok(b)) if a <= b => (a, b),
+                _ => continue,
+            },
+            None => match part.parse::<u32>() {
+                Ok(v) => (v, v),
+                Err(_) => continue,
+            },
+        };
+        for i in lo..=hi {
+            if out.len() >= MAX_SELECT_ONLY {
+                return;
+            }
+            out.push(i);
+        }
     }
 }
 
@@ -165,6 +236,41 @@ mod tests {
         let b32 =
             MagnetLink::parse("magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
         assert_eq!(hex.info_hash, b32.info_hash);
+    }
+
+    /// BEP 9 `x.pe`, `ws` and BEP 53 `so` (with ranges, duplicates and
+    /// junk), plus the `tr.N` suffix form.
+    #[test]
+    fn peers_web_seeds_and_select_only() {
+        let uri = concat!(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "&x.pe=10.0.0.1%3A6881&x.pe=%5B2001%3Adb8%3A%3A1%5D%3A51413",
+            "&x.pe=seed.example.org:6881&x.pe=10.0.0.1:6881",
+            "&ws=http%3A%2F%2Fmirror%2Ffile&ws=http%3A%2F%2Fmirror%2Ffile",
+            "&so=0,2,4-6,junk,9-8,6&tr.1=http%3A%2F%2Ft%2Fann"
+        );
+        let m = MagnetLink::parse(uri).unwrap();
+        assert_eq!(
+            m.peers,
+            vec![
+                "10.0.0.1:6881".to_string(),
+                "[2001:db8::1]:51413".to_string(),
+                "seed.example.org:6881".to_string()
+            ]
+        );
+        assert_eq!(m.web_seeds, vec!["http://mirror/file".to_string()]);
+        assert_eq!(m.select_only, Some(vec![0, 2, 4, 5, 6]));
+        assert_eq!(m.trackers, vec!["http://t/ann".to_string()]);
+        // No `so`: everything selected. A hostile range stays bounded.
+        let plain =
+            MagnetLink::parse("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567")
+                .unwrap();
+        assert_eq!(plain.select_only, None);
+        let huge = MagnetLink::parse(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&so=0-4000000000",
+        )
+        .unwrap();
+        assert_eq!(huge.select_only.map(|v| v.len()), Some(MAX_SELECT_ONLY));
     }
 
     #[test]

@@ -413,7 +413,8 @@ Each milestone ends with its integration scenarios green in CI.
 - **M6 Extensions.** PEX, `ut_metadata`/magnet, `upload_only`, LSD, web seeds, BEP 40.
 - **M7 0.1.0 hardening.** Soak, perf, fuzz time, API review, docs. **Release 0.1.0.**
 - **Post-0.1.0:** each as its own minor release: 0.2.0 performance pass (done), 0.3.0 DHT
-  (done), 0.4.0 uTP (done), then `ut_holepunch`, BEP 52, port mapping.
+  (done), 0.4.0 uTP (done), 0.5.0 magnet / LTEP conformance (done), then `ut_holepunch`,
+  BEP 52, port mapping.
 
 ## 9. Working conventions
 

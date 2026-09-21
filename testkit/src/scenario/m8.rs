@@ -38,6 +38,12 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             run: dht_leech_from_oracle,
         },
         ScenarioDef {
+            name: "magnet_dht_from_oracle",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It],
+            run: magnet_dht_from_oracle,
+        },
+        ScenarioDef {
             name: "dht_seed_to_oracle",
             shapes: &[Shape::V4],
             tags: &[Tag::It],
@@ -412,6 +418,59 @@ fn dht_leech_from_oracle(ctx: &mut Ctx) -> Result<()> {
     let p = ctx.file("tap-dht-router.jsonl");
     d.save_jsonl(&p)?;
     ctx.artifact("tap-dht-router.jsonl", &p);
+    Ok(())
+}
+
+/// BEP 9 + BEP 5 against the oracle: a magnet link with no tracker at all.
+/// We look the hash up in the DHT before knowing anything else, find the
+/// oracle seeder, fetch the metadata from it and download.
+fn magnet_dht_from_oracle(ctx: &mut Ctx) -> Result<()> {
+    let d = router(ctx, 2)?;
+    let d_addr = d.local_addrs()[0];
+    let fx = dht_fixture("dhtmagnet.bin");
+    let mut cfg = OracleConfig::primary()
+        .dht(true)
+        .encryption(Encryption::Disable);
+    cfg.extra_session_settings
+        .push(("DHTBootstrapNodes".into(), fmt_hostport(d_addr)));
+    let oracle = ctx.oracle("oracle", cfg)?;
+    fx.write_data(&oracle.save_path)?;
+    let h = fx.info_hash_hex();
+    oracle.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&oracle.save_path.to_string_lossy()),
+        &h,
+    )?;
+    oracle
+        .api
+        .wait_for(&h, Duration::from_secs(60), "oracle seeding", |t| {
+            t.is_seeding()
+        })?;
+    ensure!(
+        d.wait_for(Duration::from_secs(60), |e| e
+            .iter()
+            .any(|e| e.is_query_from("announce_peer", oracle.actor.addr()))),
+        "oracle never announced to the router"
+    );
+    let actor = ctx.actor("urt")?;
+    let magnet = format!("magnet:?xt=urn:btih:{h}&dn=dhtmagnet.bin");
+    let mut client = crate::client::UrtClient::launch_magnet(
+        &actor,
+        dht_client_config(&[d_addr]).encryption("disabled"),
+        &magnet,
+    )?;
+    let st = client.wait_for(Duration::from_secs(120), "metadata via DHT", |s| {
+        s.has_metadata
+    })?;
+    ensure!(st.name == "dhtmagnet.bin", "name {}", st.name);
+    let st = client.wait_for(Duration::from_secs(120), "download via DHT", |s| s.complete)?;
+    ensure!(
+        st.events.iter().any(|e| e.starts_with("DhtPeers")),
+        "no DhtPeers event: {:?}",
+        st.events
+    );
+    fx.verify_data(&client.save_path)?
+        .map_err(|e| anyhow::anyhow!("client data mismatch: {e}"))?;
+    client.shutdown()?;
     Ok(())
 }
 

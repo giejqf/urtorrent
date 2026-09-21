@@ -154,6 +154,22 @@ a stale id is an unknown extension and is dropped. Pinned byte-exact in
 `crates/wire/tests/replay.rs`; the no-traffic guarantee (rule 2) is checked on
 the wire by the `private_no_pex_lsd` scenario (pcap + tap-peer).
 
+The magnet case is captured too (`capture_magnet_private`): before the
+metadata is known the oracle advertises `ut_metadata` and `ut_pex` (it cannot
+know yet), and every connection made after the metadata revealed
+`private=1` gets the private `m` above. We do the same: `ut_metadata` /
+`ut_pex` until the metadata arrives, the private map from then on, and PEX
+stops the moment we know (`torrent::on_metadata`). Note that BEP 27 does not
+disable BEP 10 itself: the extension handshake, `upload_only`,
+`lt_donthave` and `ut_holepunch` stay; only peer discovery goes.
+
+Two BEP 27 clauses libtorrent does not implement, and neither do we (the
+oracle wins): the MUST to disconnect every peer when switching trackers,
+and the MUST to connect *only* to tracker-returned peers — peers the user
+adds by hand (`Session::add_peer`, a magnet's `x.pe`) are dialled for
+private torrents too, as libtorrent's `connect_peer` does. Everything
+automatic (DHT, PEX, LSD) stays off.
+
 ## Q12. `left=16384` before the metadata is known
 
 Capture: `capture_magnet/v4/tap-tracker-magnet.jsonl` — the oracle's first

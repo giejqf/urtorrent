@@ -1044,7 +1044,11 @@ impl Connection {
                     if ext.upload_only == Some(true) {
                         self.peer_upload_only = true;
                     }
-                    self.peer_ext = Some(ext.clone());
+                    match self.peer_ext.as_mut() {
+                        // A repeated handshake updates the first (BEP 10).
+                        Some(prev) => prev.merge(ext.clone()),
+                        None => self.peer_ext = Some(ext.clone()),
+                    }
                     events.push(Event::ExtHandshake(ext));
                 } else {
                     events.push(Event::Extended { id, payload });
@@ -1576,6 +1580,42 @@ mod tests {
             c.receive(&Message::Request(r).to_bytes()).unwrap();
         }
         assert!(c.receive(&Message::Request(r).to_bytes()).is_err());
+    }
+
+    /// BEP 10: a second handshake adds and disables (id 0) extensions and
+    /// leaves the ones it does not mention alone.
+    #[test]
+    fn repeated_ext_handshake_merges() {
+        let mut c = established(2);
+        let first = ExtHandshake {
+            m: vec![("ut_pex".into(), 5), ("ut_metadata".into(), 6)],
+            reqq: Some(100),
+            ..Default::default()
+        };
+        c.receive(
+            &Message::Extended {
+                id: 0,
+                payload: first.encode(),
+            }
+            .to_bytes(),
+        )
+        .unwrap();
+        let second = ExtHandshake {
+            m: vec![("ut_pex".into(), 0), ("lt_donthave".into(), 9)],
+            ..Default::default()
+        };
+        c.receive(
+            &Message::Extended {
+                id: 0,
+                payload: second.encode(),
+            }
+            .to_bytes(),
+        )
+        .unwrap();
+        assert!(!c.peer_supports("ut_pex"));
+        assert!(c.peer_supports("ut_metadata"));
+        assert!(c.peer_supports("lt_donthave"));
+        assert_eq!(c.peer_ext().and_then(|e| e.reqq), Some(100));
     }
 
     #[test]

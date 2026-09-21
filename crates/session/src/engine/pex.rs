@@ -13,8 +13,10 @@
 //! - Exchangeable: connections past the handshake that we dialled, or that
 //!   dialled us *and* told us their listen port (`p`). At most 100 per
 //!   message.
-//! - Flags: `0x01` the connection is encrypted, `0x02` the peer is a seed,
-//!   `0x08` it advertised `ut_holepunch`; `0x04` (uTP) never, `0x10` never.
+//! - Flags: `0x01` the connection is encrypted, `0x02` the peer is a seed
+//!   (a complete have-set; BEP 21 upload-only alone does not count, as in
+//!   libtorrent), `0x04` the connection runs over uTP, `0x08` it advertised
+//!   `ut_holepunch`; `0x10` never (libtorrent only reads it).
 //! - Receiving: more than six messages in a minute or a message over 500 KiB
 //!   is a protocol violation; `added` feeds the candidate list, an `0x01`
 //!   flag makes the first dial encrypted.
@@ -72,7 +74,8 @@ pub struct PeerState {
 fn entry(p: &PeerHandle, pieces: usize) -> Option<(SocketAddr, u8)> {
     let addr = p.pex_addr()?;
     let mut flags = 0u8;
-    if p.is_seed(pieces) || p.conn.borrow().peer_upload_only() {
+    // libtorrent's `is_seed()`: a complete have-set, not BEP 21 upload-only.
+    if p.is_seed(pieces) {
         flags |= pex_flags::SEED;
     }
     if p.encrypted.get() {

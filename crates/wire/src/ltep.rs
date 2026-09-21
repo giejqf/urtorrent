@@ -89,6 +89,35 @@ impl ExtHandshake {
         }
     }
 
+    /// Apply a later handshake from the same peer (BEP 10: a client may send
+    /// the handshake again to add extensions or disable them with id 0;
+    /// entries it does not mention keep their ids, like libtorrent's
+    /// per-extension `on_extension_handshake` lookups).
+    pub fn merge(&mut self, later: ExtHandshake) {
+        for (name, id) in later.m {
+            match self.m.iter_mut().find(|(n, _)| *n == name) {
+                Some(e) => e.1 = id,
+                None => self.m.push((name, id)),
+            }
+        }
+        macro_rules! take {
+            ($f:ident) => {
+                if later.$f.is_some() {
+                    self.$f = later.$f;
+                }
+            };
+        }
+        take!(v);
+        take!(p);
+        take!(reqq);
+        take!(yourip);
+        take!(ipv4);
+        take!(ipv6);
+        take!(metadata_size);
+        take!(upload_only);
+        take!(complete_ago);
+    }
+
     /// The id under which the peer wants to receive extension `name`, if it
     /// supports it (0 means "disabled").
     pub fn peer_id_for(&self, name: &str) -> Option<u8> {

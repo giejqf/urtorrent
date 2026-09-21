@@ -376,3 +376,79 @@ fn spawn_range_server(data: Arc<Vec<u8>>) -> (String, Arc<std::sync::atomic::Ato
     });
     (format!("http://127.0.0.1:{port}/files/ext.bin"), hits)
 }
+
+/// BEP 9 `x.pe` and BEP 53 `so=` in a magnet link: the peer named in the
+/// link is dialled without any tracker or manual `add_peer`, the metadata
+/// arrives, and only the selected file is downloaded.
+#[test]
+fn magnet_peer_hint_and_select_only() {
+    let dir = std::env::temp_dir().join(format!("urt-ext-so-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let files = [
+        ("a.bin", 200_000usize),
+        ("b.bin", 300_000),
+        ("c.bin", 150_000),
+    ];
+    let (torrent_bytes, data) =
+        common::make_multi_torrent("so", &files, 64 * 1024, "http://127.0.0.1:1/x");
+    let a_dir = dir.join("a");
+    std::fs::create_dir_all(a_dir.join("so")).unwrap();
+    std::fs::write(a_dir.join("so/a.bin"), &data[..200_000]).unwrap();
+    std::fs::write(a_dir.join("so/b.bin"), &data[200_000..500_000]).unwrap();
+    std::fs::write(a_dir.join("so/c.bin"), &data[500_000..]).unwrap();
+    let a = session(false);
+    let a_id =
+        block_on(a.add_torrent(AddTorrent::metainfo(torrent_bytes.clone(), &a_dir))).unwrap();
+    let st = wait_state(&a, a_id, TorrentState::Seeding, 10);
+    let hex = bencode::hex(&st.info_hash);
+
+    let b = session_at(2, false);
+    let mut b_events = b.events();
+    let b_dir = dir.join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let uri = format!(
+        "magnet:?xt=urn:btih:{hex}&dn=so&so=2&x.pe=127.0.0.1%3A{}",
+        a.listen_port()
+    );
+    let b_id = block_on(b.add_torrent(AddTorrent::magnet(uri, &b_dir))).unwrap();
+    assert!(
+        wait_event(&mut b_events, 20, |e| matches!(
+            e,
+            Event::MetadataReceived { .. }
+        ))
+        .is_some(),
+        "metadata never arrived through the x.pe peer"
+    );
+    assert!(
+        wait_event(&mut b_events, 30, |e| matches!(
+            e,
+            Event::TorrentFinished { .. }
+        ))
+        .is_some(),
+        "selected file never finished"
+    );
+    let st = block_on(b.status(b_id)).unwrap();
+    let prios: Vec<u8> = st.files.iter().map(|f| f.priority).collect();
+    assert_eq!(prios, vec![0, 0, 4], "{:?}", st.files);
+    assert_eq!(
+        std::fs::read(b_dir.join("so/c.bin")).unwrap(),
+        &data[500_000..]
+    );
+    assert_eq!(st.files[0].done, 0);
+    // b.bin only gets the tail of the piece it shares with c.bin.
+    assert!(st.files[1].done < 64 * 1024, "{:?}", st.files);
+    assert_eq!(st.files[2].done, 150_000);
+    // Two upload-only peers part; the x.pe peer shows as a manual one.
+    let parted = wait_event(
+        &mut b_events,
+        10,
+        |e| matches!(e, Event::PeerDisconnected { info, .. } if info.source == PeerSource::Manual),
+    );
+    assert!(
+        parted.is_some(),
+        "the x.pe peer should be recorded as a manual peer"
+    );
+    block_on(b.shutdown()).unwrap();
+    block_on(a.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
