@@ -12,9 +12,9 @@ description = "Disk layout, preallocation, hashing pipeline and crash-safe resum
 workspace = true
 
 [dependencies]
-metainfo = { path = "../metainfo", version = "0.10.0" }
-uring = { path = "../uring", version = "0.10.0" }
-bencode = { path = "../bencode", version = "0.10.0" }
+metainfo = { path = "../metainfo", version = "0.10.1" }
+uring = { path = "../uring", version = "0.10.1" }
+bencode = { path = "../bencode", version = "0.10.1" }
 sha1.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -42,4 +42,17 @@ impl Error {
     pub fn is_message_too_long(&self) -> bool {
         matches!(self, Error::Io(e) if e.raw_os_error() == Some(libc::EMSGSIZE))
     }
+
+    /// The operation is not supported by the file system or kernel
+    /// (`EOPNOTSUPP`, `ENOSYS`, `EINVAL` from `fallocate` on file systems
+    /// without it).
+    pub fn is_unsupported(&self) -> bool {
+        matches!(
+            self,
+            Error::Io(e) if matches!(
+                e.raw_os_error(),
+                Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL)
+            )
+        )
+    }
 }

@@ -271,6 +271,9 @@ pub struct Storage {
     /// Per `info.files` entry: the path the file lives at when it was
     /// renamed (`rename_file`), else the metainfo's.
     mapped: RefCell<Vec<Option<SafePath>>>,
+    /// Preallocation mode (`preallocate` was called): files that become
+    /// wanted later are reserved too.
+    prealloc: std::cell::Cell<bool>,
     /// Pieces being downloaded, hashed as they are written.
     progress: RefCell<HashMap<usize, PieceHash>>,
     /// Bytes the hash cursor had to read back (diagnostics: zero when blocks
@@ -314,6 +317,7 @@ impl Storage {
             priorities: RefCell::new(priorities),
             use_parts: RefCell::new(vec![false; n]),
             mapped: RefCell::new(vec![None; n]),
+            prealloc: std::cell::Cell::new(false),
             progress: RefCell::new(HashMap::new()),
             readback_bytes: std::cell::Cell::new(0),
         }
@@ -475,6 +479,9 @@ impl Storage {
             }
         }
         for i in to_export {
+            if self.prealloc.get() {
+                self.reserve(i).await?;
+            }
             self.export_parts(i).await?;
             self.use_parts.borrow_mut()[i] = false;
         }
@@ -703,15 +710,35 @@ impl Storage {
         Ok(())
     }
 
-    /// Preallocate all non-padding files to their full length (`fallocate`).
+    /// Preallocate every wanted content file to its full length
+    /// (`fallocate`; a plain size set where the file system cannot
+    /// allocate) and remember the mode: files that become wanted later
+    /// (`set_file_priorities`) are reserved the same way. Skipped files
+    /// routed to the parts file are not created.
     pub async fn preallocate(&self) -> Result<(), Error> {
+        self.prealloc.set(true);
         self.create_files().await?;
         for (i, f) in self.info.files.iter().enumerate() {
-            if f.is_padding() || f.length == 0 {
+            if f.is_padding() || f.length == 0 || self.use_parts.borrow()[i] {
                 continue;
             }
-            let file = self.file(i).await?;
-            file.allocate(0, f.length).await?;
+            self.reserve(i).await?;
+        }
+        Ok(())
+    }
+
+    /// Reserve file `i`'s full length on disk (see [`Storage::preallocate`]).
+    async fn reserve(&self, i: usize) -> Result<(), Error> {
+        let len = self.info.files.get(i).map_or(0, |f| f.length);
+        if len == 0 {
+            return Ok(());
+        }
+        let file = self.file(i).await?;
+        if !file.reserve(len).await? {
+            tracing::warn!(
+                file = i,
+                "file system cannot preallocate; size set, blocks not reserved"
+            );
         }
         Ok(())
     }

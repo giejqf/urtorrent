@@ -1196,6 +1196,18 @@ mod ops {
         cqe_result(res).map(|_| ())
     }
 
+    /// `ftruncate` to `len` (`IORING_OP_FTRUNCATE`, kernel 6.9+; the caller
+    /// checks the probe).
+    pub(crate) async fn ftruncate(fd: i32, len: u64) -> io::Result<()> {
+        let (res, ()) = Op::submit((), |_, ud| {
+            opcode::Ftruncate::new(types::Fd(fd), len)
+                .build()
+                .user_data(ud)
+        })
+        .await;
+        cqe_result(res).map(|_| ())
+    }
+
     /// `fallocate` `len` bytes from `offset`.
     pub(crate) async fn fallocate(fd: i32, offset: u64, len: u64) -> io::Result<()> {
         let (res, ()) = Op::submit((), |_, ud| {

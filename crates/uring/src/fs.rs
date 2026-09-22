@@ -16,7 +16,8 @@ use std::rc::Rc;
 use crate::bufpool::Buffer;
 use crate::error::Result;
 use crate::reactor::{
-    self, close_fd_detached, fallocate, fsync, read_at, read_range_at, write_at, write_range_at,
+    self, close_fd_detached, fallocate, fsync, ftruncate, read_at, read_range_at, write_at,
+    write_range_at,
 };
 
 /// A torrent file opened for positional (offset-based) I/O.
@@ -135,6 +136,39 @@ impl File {
     /// Preallocate `len` bytes from `offset` (`fallocate`).
     pub async fn allocate(&self, offset: u64, len: u64) -> Result<()> {
         fallocate(self.fd, offset, len).await.map_err(Into::into)
+    }
+
+    /// Set the file's length (`ftruncate`): through the ring on kernels
+    /// with `IORING_OP_FTRUNCATE` (6.9+), else the plain syscall (one-time
+    /// file setup, off the data path; AGENTS.md 5.3).
+    pub async fn set_len(&self, len: u64) -> Result<()> {
+        static VIA_RING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let via_ring = *VIA_RING.get_or_init(|| crate::probe().is_ok_and(|f| f.ftruncate));
+        if via_ring {
+            return ftruncate(self.fd, len).await.map_err(Into::into);
+        }
+        // SAFETY: plain syscall on a valid fd; the result is checked.
+        let r = unsafe { libc::ftruncate(self.fd, len as libc::off_t) };
+        if r < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    /// Reserve the file's full `len` bytes up front: `fallocate`, with a
+    /// plain `ftruncate` (sparse; the size is right, the blocks are not
+    /// reserved) where the filesystem does not support allocation. Running
+    /// out of space is an error either way: that is what preallocation is
+    /// for.
+    pub async fn reserve(&self, len: u64) -> Result<bool> {
+        match self.allocate(0, len).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.is_unsupported() => {
+                self.set_len(len).await?;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// `fsync` — flush data and metadata.

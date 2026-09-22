@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-09-22
+
+### Fixed
+
+- Preallocation (`AddTorrent::preallocate`) reserved deselected files too:
+  a file with priority 0 that is routed to the parts file was created and
+  allocated at full size. Skipped files are left alone now, and a file
+  that later becomes wanted is reserved at once, before its data arrives
+  (libtorrent's `storage_mode_allocate` on first open).
+- On a file system without `fallocate` (`EOPNOTSUPP` / `ENOSYS` /
+  `EINVAL`) preallocation failed the add; it now sets the file's size
+  (`ftruncate`, through the ring on 6.9+) and logs that blocks were not
+  reserved. Running out of space is still an error, which is the point.
+- The `native` profile's peer id is `-UR0A10-`.
+
 ## [0.10.0] - 2026-09-22
 
 Hostile-peer pass: what a malformed or malicious peer can and cannot do
