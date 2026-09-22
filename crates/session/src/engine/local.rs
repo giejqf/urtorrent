@@ -144,6 +144,13 @@ impl Semaphore {
             let free = self.free.get();
             if free > 0 {
                 self.free.set(free - 1);
+                if free > 1 {
+                    // Pass the baton: `Notify` coalesces, so two permits
+                    // released before any waiter ran would otherwise wake
+                    // only one of them and leave the rest asleep on a free
+                    // permit.
+                    self.notify.notify();
+                }
                 return Permit { sem: self.clone() };
             }
             self.notify.wait().await;
@@ -221,6 +228,42 @@ mod semaphore_tests {
             let avail_inside = waiter.await;
             assert_eq!(avail_inside, 0, "the waiter took the released permit");
             assert_eq!(sem.available(), 1);
+        });
+    }
+
+    /// Two permits released before any waiter runs must wake two waiters:
+    /// the notify coalesces, so the first waiter passes the baton on.
+    #[test]
+    fn several_permits_released_at_once_wake_several_waiters() {
+        let rt = uring::Runtime::with_defaults().unwrap();
+        rt.block_on(async {
+            let sem = Semaphore::new(2);
+            let a = sem.acquire().await;
+            let b = sem.acquire().await;
+            let done = Rc::new(Cell::new(0usize));
+            let mut waiters = Vec::new();
+            for _ in 0..3 {
+                let sem = sem.clone();
+                let done = done.clone();
+                waiters.push(uring::spawn(async move {
+                    let _p = sem.acquire().await;
+                    done.set(done.get() + 1);
+                    // Hold the permit until every waiter has been served.
+                    uring::sleep(std::time::Duration::from_millis(50)).await;
+                }));
+            }
+            uring::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(done.get(), 0);
+            // Both released in one go, before the woken waiters are polled.
+            drop(a);
+            drop(b);
+            uring::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(done.get(), 2, "both free permits were taken");
+            for w in waiters {
+                w.await;
+            }
+            assert_eq!(done.get(), 3);
+            assert_eq!(sem.available(), 2);
         });
     }
 }

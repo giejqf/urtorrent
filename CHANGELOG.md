@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-09-22
+
+A pass over the orderings that overlap: the engine is single-threaded, so
+these are not data races but work in flight meeting a change that voids
+it. Gated in `crates/session/tests/races.rs` (rechecks during a download,
+pause / priority / sequential storms, renames and a storage move under
+live writes, remove-with-files mid-download, adds meeting a shutdown, and
+a dozen torrents added, removed and rechecked at once).
+
+### Fixed
+
+- **A recheck could strand pieces for good.** `Picker::set_have` only
+  reset the block bookkeeping of pieces the check *found*; a piece whose
+  blocks had all arrived but which the check did not find kept them, so it
+  was never picked again and the download stalled a few pieces short. The
+  disk is the truth for every piece now, and the blocks the check
+  discarded are counted as redundant, so `downloaded - corrupt -
+  redundant` stays the torrent's size (it drifted above it before).
+- **A lost wakeup in the engine's semaphore** (checking, announce and
+  resume-save concurrency): two permits released before either waiter ran
+  woke only one of them, leaving the others asleep on a free permit — with
+  `max_checking` that could park a torrent's hash check indefinitely.
+  Waiters now pass the baton on.
+
+### Changed
+
+- Work in flight is tagged with the torrent's `epoch`: a piece verify that
+  started before a recheck (or before a magnet's metadata arrived) and
+  comes back after it is dropped instead of applying a verdict about a
+  picture that is gone. `Storage::discard_piece` leaves a piece that
+  verified meanwhile alone, `torrent::stop` waits for writes in flight
+  before saving resume data (so `remove_torrent_with_files` cannot be
+  overtaken by a write that recreates a file), and an `add_torrent` that
+  meets a shutdown is refused rather than half-done.
+- The `native` profile's identity strings are `-UR0B10-` / `urtorrent/0.11.1`
+  / DHT `UR\x00\x0b`.
+
 ## [0.11.0] - 2026-09-22
 
 Resume data as a blob the caller stores, with libtorrent's coverage

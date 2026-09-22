@@ -151,6 +151,11 @@ pub struct Torrent {
     /// Paused by the active-torrent queue, not the caller
     /// (`TorrentState::Queued`); implies `paused`.
     pub auto_paused: bool,
+    /// Bumped whenever the piece bookkeeping is replaced wholesale (a
+    /// recheck's verdict, metadata arriving): a task that started before
+    /// and comes back after must not apply what it computed against the
+    /// old picture.
+    pub epoch: u64,
     /// A pause is winding the torrent down (`stopped` announces in flight);
     /// a resume meanwhile only clears `paused`, and the pause restarts the
     /// tasks when it is done.
@@ -246,6 +251,14 @@ impl Torrent {
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// The piece bookkeeping is about to be replaced: work in flight
+    /// against the old picture is void (`epoch`), including the verifies
+    /// whose pieces are being re-examined.
+    pub fn new_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.verifying.clear();
     }
 
     /// Payload bytes the live connections copied in user space.
@@ -916,6 +929,11 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         TorrentSource::Magnet(uri) => metainfo::MagnetLink::parse(uri).ok(),
         TorrentSource::Metainfo(_) => None,
     };
+    if ctx.closing.is_set() {
+        // The session started shutting down while this add was in flight:
+        // it would never be stopped (the shutdown took its snapshot).
+        return Err(Error::Shutdown);
+    }
     if ctx.by_hash.borrow().contains_key(&info_hash) {
         return Err(Error::Duplicate);
     }
@@ -967,6 +985,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         announce_key: ctx.new_announce_key(),
         peer_id: ctx.new_torrent_peer_id(),
         paused: params.paused,
+        epoch: 0,
         auto_paused: false,
         stopping: false,
         // Resume data may say otherwise (`load_resume`); the caller wins.
@@ -1248,6 +1267,7 @@ fn attach_metadata(
     for (i, p) in storage.piece_priorities().into_iter().enumerate() {
         picker.set_priority(i, p);
     }
+    t.new_epoch();
     t.metadata_size = raw.len().min(u32::MAX as usize) as u32;
     t.name = info.name.clone();
     t.private = info.private;
@@ -1445,10 +1465,15 @@ async fn restore_unfinished(
             if complete {
                 t.verifying.insert(piece as u32);
             }
-            complete
+            complete.then_some(t.epoch)
         };
-        if complete {
-            uring::spawn(verify_piece(ctx.clone(), torrent.clone(), piece as u32));
+        if let Some(epoch) = complete {
+            uring::spawn(verify_piece(
+                ctx.clone(),
+                torrent.clone(),
+                piece as u32,
+                epoch,
+            ));
         }
     }
     if restored > 0 {
@@ -1501,7 +1526,8 @@ fn finish_check(
         if let Some(s) = &t.storage {
             s.set_have(have.clone());
         }
-        t.picker.set_have(&have);
+        // (The initial check: nothing was received into the picker yet.)
+        let _ = t.picker.set_have(&have);
         if let Some((d, u)) = carried {
             t.stats.downloaded = d;
             t.stats.uploaded = u;
@@ -1586,10 +1612,18 @@ fn finish_check_after_recheck(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, hav
     };
     let (id, kick) = {
         let mut t = torrent.borrow_mut();
+        // The disk is the truth again: verifies and writes started against
+        // the old picture must not apply.
+        t.new_epoch();
         if let Some(s) = &t.storage {
             s.set_have(have.clone());
         }
-        t.picker.set_have(&have);
+        // Blocks received into pieces the check did not find are wasted
+        // bytes: they were downloaded and are being thrown away, so the
+        // accounting says so (`downloaded - corrupt - redundant` stays the
+        // torrent's size).
+        let discarded = t.picker.set_have(&have);
+        t.stats.redundant += discarded;
         t.checking = false;
         t.finished_emitted = t.is_complete();
         t.failed.clear();
@@ -1715,6 +1749,20 @@ pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, _final: bool) {
     }
     for h in handles {
         h.await;
+    }
+    // Blocks accepted just before the peers went away may still be on
+    // their way to the disk: let them land, so the resume data describes
+    // the files and a `remove_torrent_with_files` cannot be overtaken by a
+    // write that recreates one.
+    // Blocks accepted just before the peers went away may still be on
+    // their way to the disk: let them land, so the resume data describes
+    // the files and a `remove_torrent_with_files` cannot be overtaken by a
+    // write that recreates one.
+    for _ in 0..100 {
+        if torrent.borrow().writes_in_flight == 0 {
+            break;
+        }
+        uring::sleep(Duration::from_millis(20)).await;
     }
     if let Err(e) = save_resume(ctx, torrent).await {
         tracing::warn!("saving resume data failed: {e}");
@@ -2114,9 +2162,17 @@ pub async fn on_block_from(
     let (buf, start) = data.into_parts();
     let write = storage.write_block_from(request.index as usize, request.begin, buf, start);
     if piece_complete {
-        let already = !torrent.borrow_mut().verifying.insert(request.index);
-        if !already {
-            uring::spawn(verify_piece(ctx.clone(), torrent.clone(), request.index));
+        let epoch = {
+            let mut t = torrent.borrow_mut();
+            t.verifying.insert(request.index).then_some(t.epoch)
+        };
+        if let Some(epoch) = epoch {
+            uring::spawn(verify_piece(
+                ctx.clone(),
+                torrent.clone(),
+                request.index,
+                epoch,
+            ));
         }
     }
     Some(PendingWrite {
@@ -2125,7 +2181,7 @@ pub async fn on_block_from(
 }
 
 /// Hash a completed piece and act on the result.
-async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
+async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32, epoch: u64) {
     let Some(storage) = torrent.borrow().storage.clone() else {
         return;
     };
@@ -2135,6 +2191,12 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
     let finished = {
         let mut t = torrent.borrow_mut();
         t.verifying.remove(&piece);
+        if t.epoch != epoch {
+            // A recheck (or new metadata) replaced the picture while this
+            // verify ran: its verdict describes a world that is gone.
+            tracing::debug!(torrent = t.id.0, piece, "stale verify dropped");
+            return;
+        }
         let id = t.id;
         match result {
             Ok(true) => {

@@ -711,10 +711,13 @@ impl Storage {
     }
 
     /// Forget everything written to `piece` so far (a banned peer's blocks
-    /// are in it): the next writes start it over.
+    /// are in it): the next writes start it over. A piece that verified in
+    /// the meantime is left alone — we have it, whoever sent it.
     pub fn discard_piece(&self, piece: usize) {
+        if self.have.borrow().get(piece) {
+            return;
+        }
         self.progress.borrow_mut().remove(&piece);
-        self.have.borrow_mut().clear(piece);
     }
 
     /// The written-but-unverified ranges of every piece in progress, for

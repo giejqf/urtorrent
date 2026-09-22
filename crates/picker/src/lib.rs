@@ -445,16 +445,31 @@ impl Picker {
 
     /// Replace our have-set (from storage / resume). Resets block bookkeeping
     /// for pieces we now have.
-    pub fn set_have(&mut self, have: &Bitfield) {
-        for (i, p) in self.pieces.iter_mut().enumerate() {
-            p.have = have.get(i);
-            if p.have {
-                p.blocks = None;
-                p.free = 0;
-                p.received = 0;
+    pub fn set_have(&mut self, have: &Bitfield) -> u64 {
+        let mut discarded = 0u64;
+        for i in 0..self.pieces.len() {
+            let size = u64::from(self.piece_size(i));
+            let p = &mut self.pieces[i];
+            let now_have = have.get(i);
+            if !now_have && !p.have && p.received > 0 {
+                // Blocks we received into a piece this check says we do not
+                // have: the bytes were downloaded and are being thrown away
+                // (libtorrent's `waste_reason::piece_closing` class).
+                discarded += (u64::from(p.received) * u64::from(BLOCK_SIZE)).min(size);
             }
+            p.have = now_have;
+            // The disk is now the truth for every piece: block bookkeeping
+            // from before (requests in flight, blocks received into a piece
+            // this check says we do not have) is void, or a piece whose
+            // blocks were all received but which failed the check could
+            // never be picked again.
+            p.blocks = None;
+            p.free = 0;
+            p.received = 0;
         }
+        self.exclusive.clear();
         self.rebuild();
+        discarded
     }
 
     /// Only `peer` may download piece `i` from now on (until the piece
@@ -1312,6 +1327,39 @@ mod tests {
 
     /// BEP 6 `suggest piece`: suggested pieces the peer has come first, then
     /// the normal strategy; pieces the peer lacks or we have are skipped.
+    /// A piece whose blocks were all received but which a recheck says we
+    /// do not have becomes pickable again (its bookkeeping is void).
+    #[test]
+    fn set_have_frees_blocks_of_pieces_we_turn_out_not_to_have() {
+        let mut rng = Lcg(1);
+        let mut p = Picker::new(2, BLOCK_SIZE * 2, u64::from(BLOCK_SIZE) * 4);
+        p.peer_joined(&Bitfield::all_set(2));
+        let blocks = p.pick(1, &all, 4, &mut rng);
+        assert_eq!(blocks.len(), 4, "two pieces of two blocks");
+        for b in &blocks {
+            assert!(matches!(p.block_received(1, b), Received::Accepted { .. }));
+        }
+        assert!(
+            p.pick(1, &all, 4, &mut rng).is_empty(),
+            "everything received"
+        );
+        // The check found neither piece on disk: the four blocks received
+        // are wasted bytes, reported so the caller can account for them.
+        let discarded = p.set_have(&Bitfield::new(2));
+        assert_eq!(discarded, u64::from(BLOCK_SIZE) * 4);
+        assert_eq!(p.have_count(), 0);
+        let again = p.pick(1, &all, 4, &mut rng);
+        assert_eq!(again.len(), 4, "pickable again after the check");
+        // And one that the check did find is not.
+        let mut have = Bitfield::new(2);
+        have.set(0);
+        assert_eq!(p.set_have(&have), 0, "nothing received since");
+        assert_eq!(p.have_count(), 1);
+        let rest = p.pick(1, &all, 4, &mut rng);
+        assert_eq!(rest.len(), 2);
+        assert!(rest.iter().all(|b| b.piece == 1));
+    }
+
     #[test]
     fn preferred_pieces_come_first() {
         let mut p = Picker::new(6, BLOCK_SIZE * 2, u64::from(BLOCK_SIZE) * 12);
