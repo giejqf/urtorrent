@@ -12,7 +12,7 @@ mod common;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-use common::{block_on, make_multi_torrent};
+use common::{block_on, make_multi_torrent, wait_idle_disk};
 use session::{AddTorrent, Session, TorrentState};
 
 fn session(n: u8) -> Session {
@@ -127,12 +127,12 @@ fn preallocate_find_trackers_caps_times_and_removal() {
         assert!(p.connected_for > Duration::ZERO);
     }
 
-    // Session stats carry the new counters.
-    let stats = block_on(b.stats()).unwrap();
+    // Session stats carry the new counters. Completion queues a resume save
+    // (fsync + unfinished readback), so wait for the queues to drain rather
+    // than snapshotting them the instant the torrent finishes.
+    let stats = wait_idle_disk(&b, 10);
     assert_eq!(stats.recv_buffers, 256);
     assert!(stats.recv_buffers_free <= 256);
-    assert_eq!(stats.disk_jobs_pending, 0, "{stats:?}");
-    assert_eq!(stats.hash_jobs_pending, 0);
 
     // pause_all folds the clocks into the resume data and stops accrual.
     block_on(b.pause_all()).unwrap();

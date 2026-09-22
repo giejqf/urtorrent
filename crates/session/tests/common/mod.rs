@@ -324,3 +324,27 @@ pub fn spawn_range_server(
     });
     (format!("http://127.0.0.1:{port}{path}"), hits)
 }
+
+/// Poll session stats until the disk and hash queues are idle, and return
+/// that snapshot.
+///
+/// A torrent is observably `Seeding` as soon as its last piece verifies,
+/// and the resume save that completion triggers (`engine::torrent`,
+/// AGENTS.md 5.4) starts *after* that: it fsyncs the content files and
+/// reads back the unfinished ranges. So a snapshot taken the instant a
+/// torrent finishes can legitimately still see those jobs in flight on a
+/// slow disk. What the tests mean to assert is that the queues drain.
+pub fn wait_idle_disk(s: &session::Session, secs: u64) -> session::SessionStats {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let st = block_on(s.stats()).unwrap();
+        if st.disk_jobs_pending == 0 && st.hash_jobs_pending == 0 {
+            return st;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disk queue never drained: {st:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

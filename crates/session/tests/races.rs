@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{block_on, make_multi_torrent, make_torrent};
+use common::{block_on, make_multi_torrent, make_torrent, wait_idle_disk};
 use session::{AddTorrent, Session, SessionBuilder, TorrentId, TorrentState};
 
 fn init_log() {
@@ -396,10 +396,11 @@ fn many_torrents_added_and_removed_concurrently_stay_consistent() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let stats = block_on(a.stats()).unwrap();
+    // Each completion queues a resume save, so let the queues drain: the
+    // point is that every job finishes, not that none was in flight at the
+    // moment the last torrent flipped to seeding.
+    let stats = wait_idle_disk(&a, 30);
     assert_eq!(stats.torrents, n);
-    assert_eq!(stats.disk_jobs_pending, 0, "{stats:?}");
-    assert_eq!(stats.hash_jobs_pending, 0, "{stats:?}");
     block_on(a.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
