@@ -189,12 +189,23 @@ impl WebApi {
                     .join("&"),
             );
         }
-        let resp = self
-            .agent
-            .get(&url)
-            .call()
-            .with_context(|| format!("GET {url}"))?;
-        self.check(path, resp)
+        // Transport hiccups (an interrupted syscall while the oracle is
+        // busy with hundreds of torrents) are retried: they say nothing
+        // about the thing under test.
+        let mut last = None;
+        for attempt in 0..3 {
+            match self.agent.get(&url).call() {
+                Ok(resp) => return self.check(path, resp),
+                Err(e) => {
+                    last = Some(e);
+                    std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+                }
+            }
+        }
+        Err(last.map_or_else(
+            || anyhow!("GET {url}: no response"),
+            |e| anyhow!("GET {url}: {e}"),
+        ))
     }
 
     pub fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<String> {

@@ -12,6 +12,7 @@
 | Differential | scenarios tagged `Diff` (`diff_identity`, `mse_shape`, `dual_stack_announce`, `pex_discovery`, `web_seed_only`, `dht_shape`, `utp_shape`, `magnet_private_shape`, ...) | `cargo xtask diff` |
 | Captures | scenarios tagged `Capture` | `cargo xtask capture` |
 | Enforcement | `xtask syscalls` (uring probe + real session under `strace -f -Y`) | `cargo xtask syscalls` |
+| Benchmark | `testkit/src/scenario/bench.rs` (RSS / CPU against the oracle) | `cargo xtask bench [bench_leech\|bench_seed\|bench_many]` (see `docs/perf.md`) |
 | Soak / perf | `testkit/src/bin/urt-soak.rs` | `cargo xtask soak [transfer\|many\|all] [--size 20G] [--torrents 500]` (see `docs/perf.md`) |
 
 ## Hostile peers

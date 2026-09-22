@@ -318,3 +318,55 @@ fn peer_id_lifetime_follows_the_profile() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A peer that hangs up before the handshake (still checking its files,
+/// just restarted) is retried at once, not after the full reconnect
+/// backoff: libtorrent's `fast_reconnect`.
+#[test]
+fn a_peer_that_was_not_ready_is_retried_immediately() {
+    let dir = std::env::temp_dir().join(format!("urt-fastretry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (torrent_bytes, data) =
+        make_torrent("fr.bin", 512 * 1024, 64 * 1024, "http://127.0.0.1:1/x");
+    let info_hash = metainfo::Torrent::parse(&torrent_bytes)
+        .unwrap()
+        .info
+        .info_hash;
+    let data = std::sync::Arc::new(data);
+    // The first connection is dropped before a byte is exchanged.
+    let seeder = common::spawn_seeder_resetting(info_hash, data.clone(), 64 * 1024, 1);
+    let s = block_on(
+        Session::builder()
+            .listen_port(0)
+            .listen_v4(Some(Ipv4Addr::LOCALHOST))
+            .listen_v6(None)
+            .lsd(false)
+            .dht(false)
+            .build(),
+    )
+    .unwrap();
+    let id = block_on(s.add_torrent(AddTorrent::metainfo(torrent_bytes, &dir))).unwrap();
+    block_on(s.add_peer(id, seeder)).unwrap();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(30);
+    loop {
+        let st = block_on(s.status(id)).unwrap();
+        if st.state == TorrentState::Seeding {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not retried within 30s (the backoff is 60s): {st:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(std::fs::read(dir.join("fr.bin")).unwrap(), *data);
+    block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

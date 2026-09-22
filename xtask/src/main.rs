@@ -307,6 +307,7 @@ fn main() -> ExitCode {
         "it" => testkit(&["it"], rest),
         "capture" => testkit(&["capture"], rest),
         "diff" => testkit(&["diff"], rest),
+        "bench" => testkit_release(&["bench"], rest),
         "fuzz" => fuzz(rest),
         "syscalls" => syscalls(),
         "soak" => soak(rest),
@@ -502,6 +503,30 @@ fn testkit(sub: &[&str], args: &[String]) -> Result<()> {
     c.args(["run", "-q", "-p", "testkit", "--bin", "testkit", "--"])
         .args(sub)
         .args(args);
+    run(&mut c, &format!("testkit {}", sub.join(" ")))
+}
+
+/// [`testkit`] with everything built in release mode: the benchmarks
+/// compare our client against a release-built oracle, so a debug build
+/// would make the CPU numbers meaningless.
+fn testkit_release(sub: &[&str], args: &[String]) -> Result<()> {
+    run(
+        cargo().args(["build", "-q", "--release", "-p", "testkit", "--bins"]),
+        "build testkit binaries (release)",
+    )?;
+    let mut c = cargo();
+    c.args([
+        "run",
+        "-q",
+        "--release",
+        "-p",
+        "testkit",
+        "--bin",
+        "testkit",
+        "--",
+    ])
+    .args(sub)
+    .args(args);
     run(&mut c, &format!("testkit {}", sub.join(" ")))
 }
 

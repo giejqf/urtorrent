@@ -463,11 +463,12 @@ fn unrequested_pieces_are_dropped_and_counted_not_written() {
     std::thread::sleep(Duration::from_millis(500));
     let st = block_on(b.status(b_id)).unwrap();
     assert_eq!(st.pieces_have, 0);
-    assert_eq!(
-        st.downloaded, 0,
-        "unrequested data counted as downloaded: {st:?}"
-    );
+    // The payload arrived, so it counts as downloaded, and it was useless,
+    // so it counts as redundant: the two cancel out (libtorrent's
+    // `incoming_piece` does both) and the torrent gains nothing.
+    assert_eq!(st.downloaded, st.redundant, "{st:?}");
     assert!(st.redundant >= 4 * 16 * 1024, "{st:?}");
+    assert_eq!(st.total_wanted_done, 0, "{st:?}");
     // The connection survives (libtorrent keeps it, Q23) and a real
     // download can still proceed through it.
     assert_eq!(st.peers, 1, "{st:?}");

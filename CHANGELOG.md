@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] - 2026-09-22
+
+Benchmarked against the oracle (`cargo xtask bench`, numbers and caveats
+in `docs/perf.md`): 18 MiB peak RSS against qBittorrent's 287–308 MiB (of
+which ~276 MiB is libtorrent 2.0's memory-mapped storage; anonymous memory
+is 11.5–12.6 MiB against 6–37 MiB), 20–25% less CPU per GiB moved, and
+51 KiB against 95 KiB of anonymous memory per idle complete torrent at 300
+torrents. Writing it found two bugs.
+
+### Fixed
+
+- **The request pipeline only grew once a second.** Its depth came from
+  the peer's measured rate (libtorrent's three-seconds-of-rate rule), and
+  that rate is an average updated on the tick, so every transfer spent its
+  first seconds with a handful of blocks in flight: 256 MiB over the lab's
+  link took 11 s instead of 1.3 s. The depth now also grows per delivered
+  block while the peer keeps the pipeline full (up to the same 256-block
+  cap) and falls back to the starting depth on a request timeout or a
+  reject.
+- **A peer that hung up before the handshake waited out the full reconnect
+  backoff.** A seeder that is still checking its files resets the first
+  connection; we then left the address alone for a minute. Such an address
+  now gets one immediate retry (libtorrent's `fast_reconnect`), the rest
+  of the backoff rules unchanged.
+
+- Payload we cannot use is counted as downloaded as well as redundant, so
+  `downloaded - corrupt - redundant` is always the torrent's own progress
+  (libtorrent's `incoming_piece` does both). Blocks a peer sent without
+  being asked were counted only as redundant, which made the figure drift
+  below the torrent size; docs/quirks.md Q24.
+
+### Added
+
+- `cargo xtask bench [bench_leech|bench_seed|bench_many]`: the same work
+  with our client and with the oracle, sampling peak RSS (split into
+  anonymous and file-backed) and CPU from `/proc`
+  (`testkit::resources`). `urt-client` gained `--add-dir` (add every
+  `.torrent` in a directory) for the many-torrents case.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0B20-` / `urtorrent/0.11.2`
+  / DHT `UR\x00\x0b`.
+
 ## [0.11.1] - 2026-09-22
 
 A pass over the orderings that overlap: the engine is single-threaded, so

@@ -156,3 +156,61 @@ assembled every frame, then the message decoder copied the payload out of
 it). The receive ring buffers themselves are never held past the receive
 cycle: a block is copied out precisely so the kernel gets its buffer back
 while the disk write is in flight.
+
+## Against the oracle: RSS and CPU (2026-09-22, 0.11.2)
+
+`cargo xtask bench` runs the same work twice — once with our client, once
+with the oracle (qBittorrent 5.2.3 / libtorrent 2.0.14) — in the netns lab,
+and samples the client process from `/proc` (`VmHWM` for the peak, `RssAnon`
+/ `RssFile` for the split, `utime + stime` for CPU). Both sides run TCP
+only, no encryption, no DHT/PEX/LSD, against the same counterpart, one after
+the other, release builds. Development VM, 2 vCPU, 256 MiB payload, 1 MiB
+pieces; two rounds, ranges given.
+
+| | urtorrent | qBittorrent / libtorrent |
+|---|---|---|
+| Leech, peak RSS | **18.0–18.9 MiB** (anon 11.5–12.6) | 287–308 MiB (anon 15–37) |
+| Leech, CPU per GiB | **3.8–5.0 s** | 4.5–5.4 s |
+| Seed, peak RSS | **17.8–18.0 MiB** (anon 11.4–11.7) | 281–284 MiB (anon 5.9) |
+| Seed, CPU per GiB | **3.4–3.8 s** | 4.2–5.0 s |
+| 300 torrents (512 KiB each, all complete): peak RSS | **21.2 MiB** (anon 14.9) = **51 KiB/torrent** | 47.9 MiB (anon 27.8) = 95 KiB/torrent |
+| 300 torrents: add + check | **2.4 s wall, 0.5 s CPU** | 301 s wall, 47 s CPU |
+
+Read it with the caveats:
+
+- **libtorrent 2.0 memory-maps the torrent's files**, so its `VmRSS`
+  includes ~276 MiB of page cache for a 256 MiB torrent. That memory is
+  reclaimable and not "used" in the way anonymous memory is; the honest
+  comparison is the anonymous column, where the two are in the same
+  bracket (ours is flat at ~12 MiB, theirs swings between 6 MiB seeding
+  and ~37 MiB leeching). Our data path never maps torrent files: reads and
+  writes go through the ring, so RSS stays flat whatever the torrent size.
+- **CPU per GiB is 20–25% lower for us** in both directions. That is the
+  data path (one copy per received byte, none per sent byte, ADR 0006)
+  against libtorrent's mmap path; the absolute numbers are small either
+  way and this VM's variance is ±10%.
+- **The many-torrents row compares each client's own add path**, not
+  libtorrent's hashing: the oracle's 301 s and 47 s CPU are mostly
+  qBittorrent's per-torrent work (one WebAPI POST each, its queueing, its
+  sqlite resume store), not the library's. The memory column is the
+  like-for-like one: 51 KiB against 95 KiB of anonymous memory per idle,
+  complete torrent.
+- **Throughput is not what this measures.** On this link both clients land
+  between 90 and 210 MiB/s depending on page-cache state; the benchmark
+  fixes the work, not the wall time.
+- qbittorrent-nox is an application (Qt, a WebUI, a resume database) and
+  `urt-client` is a test binary around the library. The RSS floor of each
+  reflects that: about 6 MiB of our 18 MiB is the binary's own file-backed
+  pages.
+
+Two bugs came out of writing this benchmark, both fixed in 0.11.2:
+
+- The request pipeline only grew from the peer's *measured* rate, which
+  moves once a second, so the first seconds of every transfer ran with a
+  handful of blocks in flight: 256 MiB took 11 s (23 MiB/s) instead of
+  1.3 s (196 MiB/s). It now grows per delivered block while the peer keeps
+  the pipeline full, and falls back to the starting depth on a timeout or
+  a reject.
+- A peer that hung up before the handshake (a seeder still checking its
+  files) was not retried for a full minute. libtorrent's `fast_reconnect`
+  gives such an address one immediate retry; so do we now.

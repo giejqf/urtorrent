@@ -339,6 +339,11 @@ pub struct Oracle {
 }
 
 impl Oracle {
+    /// The `qbittorrent-nox` process's pid (for resource sampling).
+    pub fn pid(&self) -> Option<u32> {
+        self.proc.as_ref().and_then(crate::lab::Proc::leaf_pid)
+    }
+
     /// Launch the oracle inside `actor`. `whitelist` are the subnets allowed to
     /// use the WebAPI without a password (the lab subnets).
     pub fn launch(actor: &Actor, config: OracleConfig, whitelist: &[String]) -> Result<Oracle> {

@@ -139,11 +139,31 @@ pub fn make_multi_torrent(
 
 /// A seeder speaking through our own sans-IO connection (responder role).
 pub fn spawn_seeder(info_hash: [u8; 20], data: Arc<Vec<u8>>, piece_len: usize) -> SocketAddr {
+    spawn_seeder_resetting(info_hash, data, piece_len, 0)
+}
+
+/// [`spawn_seeder`] that drops the first `reset` connections without a
+/// byte (a peer that is not ready yet).
+pub fn spawn_seeder_resetting(
+    info_hash: [u8; 20],
+    data: Arc<Vec<u8>>,
+    piece_len: usize,
+    reset: usize,
+) -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
+        let mut left = reset;
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
+            if left > 0 {
+                left -= 1;
+                // Hung up before the handshake, like a peer that is not
+                // ready for connections yet.
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                drop(stream);
+                continue;
+            }
             let data = data.clone();
             std::thread::spawn(move || {
                 let pieces = data.len().div_ceil(piece_len);

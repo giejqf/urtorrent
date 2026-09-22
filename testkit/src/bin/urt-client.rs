@@ -42,6 +42,9 @@ struct Args {
     lsd: bool,
     /// DHT routers; empty = DHT off (never the public defaults in the lab).
     dht_routers: Vec<String>,
+    /// Every `.torrent` in this directory is added as well (the
+    /// many-torrents benchmark).
+    add_dir: Option<PathBuf>,
     /// `both` (TCP first) / `utp-first` / `tcp` / `utp`.
     protocol: String,
     pex: bool,
@@ -70,6 +73,7 @@ fn parse_args() -> Result<Args> {
         encryption: "enabled".into(),
         lsd: true,
         dht_routers: Vec::new(),
+        add_dir: None,
         protocol: "both".into(),
         pex: true,
         add_peers: Vec::new(),
@@ -86,6 +90,7 @@ fn parse_args() -> Result<Args> {
             "--protocol" => a.protocol = val()?,
             "--no-pex" => a.pex = false,
             "--add-peer" => a.add_peers.push(val()?.parse()?),
+            "--add-dir" => a.add_dir = Some(PathBuf::from(val()?)),
             "--file-priorities" => a.file_priorities = Some(parse_priorities(&val()?)?),
             "--save" => a.save = PathBuf::from(val()?),
             "--resume" => a.resume = Some(PathBuf::from(val()?)),
@@ -201,6 +206,26 @@ async fn main() -> Result<()> {
         session.add_peer(id, *p).await?;
     }
 
+    let mut extra = 0usize;
+    if let Some(dir) = &args.add_dir {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "torrent"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let bytes = std::fs::read(&path)?;
+            let add = AddTorrent::metainfo(bytes, &args.save);
+            match session.add_torrent(add).await {
+                Ok(_) => extra += 1,
+                // The one named by `--torrent` is already there.
+                Err(urtorrent::Error::Duplicate) => {}
+                Err(e) => tracing::warn!("adding {}: {e}", path.display()),
+            }
+        }
+        tracing::info!(extra, "extra torrents added");
+    }
     let mut event_log: Vec<String> = Vec::new();
     let mut peers_seen: std::collections::BTreeMap<String, serde_json::Value> =
         std::collections::BTreeMap::new();
@@ -224,6 +249,20 @@ async fn main() -> Result<()> {
         }
         let st = session.status(id).await?;
         let stats = session.stats().await?;
+        // With extra torrents loaded, report how many there are and
+        // whether they are all seeding (the many-torrents benchmark).
+        let (torrents, all_seeding) = if extra > 0 {
+            let all = session.statuses().await.unwrap_or_default();
+            (
+                all.len(),
+                !all.is_empty()
+                    && all
+                        .iter()
+                        .all(|s| s.state == urtorrent::TorrentState::Seeding),
+            )
+        } else {
+            (1, st.state == urtorrent::TorrentState::Seeding)
+        };
         let peers = session.peers(id).await.unwrap_or_default();
         for p in &peers {
             if p.peer_id.is_some() {
@@ -254,6 +293,8 @@ async fn main() -> Result<()> {
                 "save_path": st.save_path.to_string_lossy(),
                 "total_wanted": st.total_wanted,
                 "total_wanted_done": st.total_wanted_done,
+                "torrents": torrents,
+                "all_seeding": all_seeding,
                 "auto_managed": st.auto_managed,
                 "queue_position": st.queue_position,
                 "max_uploads": st.max_uploads,
@@ -302,6 +343,19 @@ async fn main() -> Result<()> {
                             }
                         } else if let Some(path) = other.strip_prefix("move ") {
                             session.move_storage(id, PathBuf::from(path.trim())).await?;
+                        } else if let Some(path) = other.strip_prefix("add ") {
+                            // A second (third, ...) torrent in the same
+                            // session: the benchmarks load hundreds.
+                            match std::fs::read(path.trim()) {
+                                Ok(bytes) => {
+                                    let add = AddTorrent::metainfo(bytes, &args.save);
+                                    match session.add_torrent(add).await {
+                                        Ok(_) => extra += 1,
+                                        Err(e) => tracing::warn!("add {path}: {e}"),
+                                    }
+                                }
+                                Err(e) => tracing::warn!("reading {path}: {e}"),
+                            }
                         } else {
                             tracing::warn!("unknown control command {other}");
                         }

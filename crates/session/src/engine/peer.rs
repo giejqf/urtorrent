@@ -66,6 +66,13 @@ pub struct PeerHandle {
     last_have: RefCell<Bitfield>,
     rate: Cell<u64>,
     rate_mark: Cell<u64>,
+    /// Requests we keep in flight towards this peer, grown while it keeps
+    /// the pipeline full and reset when it stops delivering. The
+    /// rate-derived depth (libtorrent's three seconds of the measured
+    /// rate) only moves once a second, which on a fast link spends the
+    /// first seconds of a transfer ramping; this reaches the cap within a
+    /// few round trips.
+    desired_queue: Cell<usize>,
     up_rate: Cell<u64>,
     up_rate_mark: Cell<u64>,
     /// When the connection was set up.
@@ -147,6 +154,7 @@ impl PeerHandle {
             upload_queue: RefCell::new(VecDeque::new()),
             upload_notify: Notify::new(),
             drained: Notify::new(),
+            desired_queue: Cell::new(MIN_PIPELINE),
             last_unchoke: Cell::new(None),
             cipher: RefCell::new(Cipher::default()),
             encrypted: Cell::new(false),
@@ -279,6 +287,24 @@ impl PeerHandle {
         }
     }
 
+    /// A block arrived: if the peer had the pipeline full, ask for more
+    /// next time (slow start, bounded by `pipeline_depth`'s cap and the
+    /// peer's `reqq`).
+    fn note_block_delivered(&self) {
+        let outstanding = self.conn.borrow().outstanding().len();
+        let desired = self.desired_queue.get();
+        if outstanding + 1 >= desired {
+            self.desired_queue
+                .set((desired + 1).min(torrent::MAX_PIPELINE));
+        }
+    }
+
+    /// The peer stopped delivering (timeout, choke, reject): back to the
+    /// starting depth, so a stalled peer is not asked for more and more.
+    fn reset_pipeline(&self) {
+        self.desired_queue.set(MIN_PIPELINE);
+    }
+
     /// Interested iff the peer has a wanted piece we lack.
     pub fn update_interest(&self, picker: &Picker) {
         let mut conn = self.conn.borrow_mut();
@@ -356,7 +382,7 @@ impl PeerHandle {
         if choking && allowed.is_empty() {
             return;
         }
-        let mut depth = torrent::pipeline_depth(self.rate.get());
+        let mut depth = torrent::pipeline_depth(self.rate.get()).max(self.desired_queue.get());
         if let Some(q) = self.reqq.get() {
             depth = depth.min(usize::try_from(q).unwrap_or(usize::MAX).max(2));
         }
@@ -416,6 +442,10 @@ impl PeerHandle {
                     true
                 }
             });
+            if !timed_out.is_empty() {
+                // The peer is not keeping up with what we asked for.
+                self.desired_queue.set(MIN_PIPELINE);
+            }
             for r in timed_out {
                 conn.cancel(r);
                 t.picker.release(
@@ -1019,7 +1049,10 @@ fn dial_failed(t: &mut Torrent, ctx: &Ctx, addr: SocketAddr, was_utp: bool) {
             && ctx.udp.supports(addr.ip())
             && !t.utp_failed.contains(&addr)
     };
-    if retry_now {
+    if retry_now || t.take_fast_retry(addr) {
+        // Either the other transport is worth a try, or this address gets
+        // its one immediate retry (libtorrent's `fast_reconnect`: a peer
+        // that was not listening yet costs a round trip, not a minute).
         t.allow_reconnect_now(addr);
     } else {
         t.note_disconnect(addr, Instant::now());
@@ -1054,6 +1087,10 @@ enum Outbound {
 /// Chunks framed per receive batch (bounds the events handled before the
 /// batch's writes go out; the ring size bounds it anyway).
 const MAX_RECV_BATCH: usize = 32;
+
+/// Requests in flight towards a fresh peer, before it has shown what it
+/// can deliver.
+const MIN_PIPELINE: usize = 8;
 
 /// Suggested pieces remembered per peer (libtorrent `max_suggest_pieces`).
 const MAX_SUGGESTED: usize = 16;
@@ -1131,6 +1168,11 @@ async fn finish_connection(
             // The encrypted retry died too: back to plaintext next time.
             t.mse_retry.remove(&addr);
             t.note_disconnect(addr, Instant::now());
+        } else if died_before_handshake && t.take_fast_retry(addr) {
+            // The peer was not ready (it reset us, or hung up before the
+            // handshake): one immediate retry, as libtorrent's
+            // `fast_reconnect` does, instead of a minute of backoff.
+            t.allow_reconnect_now(addr);
         } else {
             // Do not dial this address again right away: libtorrent's
             // `min_reconnect_time` counts from the last connection *attempt*
@@ -1436,14 +1478,22 @@ async fn handle_event(
                 .request_times
                 .borrow_mut()
                 .retain(|(r, _)| *r != request);
+            handle.note_block_delivered();
             if let Some(w) = torrent::on_block(ctx, torrent, handle, request, data).await {
                 writes.push(w);
             }
         }
         WireEvent::UnexpectedBlock { length, .. } => {
-            torrent.borrow_mut().stats.redundant += u64::from(length);
+            // Payload we received and cannot use: counted as downloaded
+            // (it came off the wire) and as redundant (libtorrent's
+            // `incoming_piece`: `received_bytes` plus
+            // `add_redundant_bytes`), so the two always cancel out.
+            let mut t = torrent.borrow_mut();
+            t.stats.downloaded += u64::from(length);
+            t.stats.redundant += u64::from(length);
         }
         WireEvent::Rejected(r) => {
+            handle.reset_pipeline();
             handle.request_times.borrow_mut().retain(|(x, _)| *x != r);
             torrent.borrow_mut().picker.release(
                 handle.key,

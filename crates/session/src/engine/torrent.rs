@@ -222,6 +222,9 @@ pub struct Torrent {
     pub outgoing_pids: HashSet<[u8; 20]>,
     /// Addresses whose next outgoing attempt uses MSE (Q3 toggle).
     pub mse_retry: HashSet<SocketAddr>,
+    /// Addresses that already used their one immediate retry
+    /// (`take_fast_retry`).
+    fast_retried: HashSet<SocketAddr>,
     pub half_open: usize,
     /// Set when the torrent is stopping; every task of the torrent exits.
     pub closing: Rc<Flag>,
@@ -689,6 +692,7 @@ impl Torrent {
             self.known.remove(&a);
             self.sources.remove(&a);
             self.failed.remove(&a);
+            self.fast_retried.remove(&a);
         }
         true
     }
@@ -741,6 +745,21 @@ impl Torrent {
     /// `fast_reconnect` after a plaintext attempt that needs MSE).
     pub fn allow_reconnect_now(&mut self, addr: SocketAddr) {
         self.failed.remove(&addr);
+    }
+
+    /// One immediate retry per address whose first connection died before
+    /// the handshake (libtorrent's `fast_reconnect`): a peer that was not
+    /// ready — still checking its files, just restarted — costs a
+    /// round trip, not the full `min_reconnect_time`. Returns whether this
+    /// retry is the one.
+    pub fn take_fast_retry(&mut self, addr: SocketAddr) -> bool {
+        if self.fast_retried.contains(&addr) {
+            return false;
+        }
+        if self.fast_retried.len() < MAX_PEER_LIST {
+            self.fast_retried.insert(addr);
+        }
+        true
     }
 
     /// Record who supplied a block (for blame).
@@ -1018,6 +1037,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         connecting: HashSet::new(),
         outgoing_pids: HashSet::new(),
         mse_retry: HashSet::new(),
+        fast_retried: HashSet::new(),
         half_open: 0,
         closing: Flag::new(),
         tracker_kick: Notify::new(),
@@ -2529,11 +2549,15 @@ pub fn fail_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, error: String
     });
 }
 
+/// Most requests in flight towards one peer (4 MiB of blocks).
+pub const MAX_PIPELINE: usize = 256;
+
 /// Pipeline depth for a peer: ~3 seconds of its current rate in 16 KiB
-/// blocks, within sane bounds (libtorrent-style, L3).
+/// blocks, within sane bounds (libtorrent-style, L3). The peer's own
+/// slow-start (`desired_queue`) raises this while it keeps up.
 pub fn pipeline_depth(rate_bytes_per_sec: u64) -> usize {
     let by_rate = (rate_bytes_per_sec * 3 / u64::from(picker::BLOCK_SIZE)) as usize;
-    by_rate.clamp(8, 256)
+    by_rate.clamp(8, MAX_PIPELINE)
 }
 
 /// Pick with the engine's RNG.

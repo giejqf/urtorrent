@@ -14,7 +14,8 @@ use anyhow::{Context as _, Result, bail};
 use crate::lab::{Actor, Lab, Shape};
 use crate::oracle::{Oracle, OracleConfig};
 
-pub mod m0;
+pub mod bench;
+mod m0;
 pub mod m2;
 pub mod m3;
 pub mod m4;
@@ -32,6 +33,8 @@ pub enum Tag {
     Capture,
     /// `xtask diff`: differential oracle-vs-us run.
     Diff,
+    /// `xtask bench`: resource benchmark against the oracle.
+    Bench,
 }
 
 /// A registered scenario.
@@ -129,6 +132,7 @@ impl Ctx {
 /// All registered scenarios.
 pub fn all() -> Vec<ScenarioDef> {
     let mut v = Vec::new();
+    v.extend(bench::scenarios());
     v.extend(m0::scenarios());
     v.extend(m2::scenarios());
     v.extend(m3::scenarios());

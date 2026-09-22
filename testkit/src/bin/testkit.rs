@@ -53,6 +53,7 @@ fn main() -> ExitCode {
         "capture" => run_tagged(rest, Some(Tag::Capture), true),
         "run" => run_tagged(rest, None, false),
         "diff" => run_tagged(rest, Some(Tag::Diff), false),
+        "bench" => run_tagged(rest, Some(Tag::Bench), false),
         "lab" => match rest.first().map(String::as_str) {
             Some("clean") => testkit::lab::clean_all().map(|r| {
                 println!("removed: {r:?}");

@@ -24,6 +24,7 @@ pub mod http;
 pub mod lab;
 pub mod oracle;
 pub mod peerwire;
+pub mod resources;
 pub mod scenario;
 pub mod tap;
 pub mod trackers;

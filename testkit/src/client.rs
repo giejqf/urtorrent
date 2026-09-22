@@ -41,6 +41,8 @@ pub struct ClientConfig {
     pub add_peers: Vec<std::net::SocketAddr>,
     /// Initial file priorities.
     pub file_priorities: Option<Vec<u8>>,
+    /// Every `.torrent` in this directory is added as well.
+    pub add_dir: Option<PathBuf>,
     /// Extra environment (e.g. `RUST_LOG`).
     pub env: Vec<(String, String)>,
 }
@@ -62,6 +64,7 @@ impl Default for ClientConfig {
             protocol: "both".into(),
             add_peers: Vec::new(),
             file_priorities: None,
+            add_dir: None,
             env: vec![("RUST_LOG".into(), "debug".into())],
         }
     }
@@ -89,6 +92,12 @@ impl ClientConfig {
         self.pex = on;
         self
     }
+    /// Add every `.torrent` in `dir` as well.
+    pub fn add_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.add_dir = Some(dir.into());
+        self
+    }
+
     pub fn add_peer(mut self, a: std::net::SocketAddr) -> Self {
         self.add_peers.push(a);
         self
@@ -148,6 +157,12 @@ pub struct ClientStatus {
     pub seeds: usize,
     #[serde(default)]
     pub complete: bool,
+    /// Torrents in the session (1 unless `add` was used).
+    #[serde(default = "one")]
+    pub torrents: usize,
+    /// Every torrent in the session is seeding.
+    #[serde(default)]
+    pub all_seeding: bool,
     #[serde(default)]
     pub has_metadata: bool,
     #[serde(default)]
@@ -234,6 +249,10 @@ pub struct ClientPeer {
     /// `Tcp` / `Utp`.
     #[serde(default)]
     pub transport: String,
+}
+
+fn one() -> usize {
+    1
 }
 
 /// A running client.
@@ -328,6 +347,9 @@ impl UrtClient {
         for p in &config.add_peers {
             cmd.arg("--add-peer").arg(p.to_string());
         }
+        if let Some(d) = &config.add_dir {
+            cmd.arg("--add-dir").arg(d);
+        }
         if let Some(p) = &config.file_priorities {
             let csv: Vec<String> = p.iter().map(|x| x.to_string()).collect();
             cmd.arg("--file-priorities").arg(csv.join(","));
@@ -407,6 +429,16 @@ impl UrtClient {
     }
 
     /// Graceful shutdown: `stopped` announces, resume data, exit.
+    /// The port the client listens on.
+    pub fn listen_port(&self) -> u16 {
+        self.config.listen_port
+    }
+
+    /// The `urt-client` process's pid (for resource sampling).
+    pub fn pid(&self) -> Option<u32> {
+        self.proc.as_ref().and_then(crate::lab::Proc::leaf_pid)
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         self.command("shutdown")?;
         if let Some(mut p) = self.proc.take() {

@@ -458,6 +458,12 @@ torrent size, "which upsets some trackers". `corrupt=` and `redundant=`
 carry the excluded bytes. `TorrentStatus::downloaded` stays the gross count
 of payload received; `build_request` subtracts.
 
+Every byte counted as `redundant` is counted in `downloaded` first, so
+`downloaded - corrupt - redundant` is the torrent's own progress. That
+covers blocks that arrived twice, blocks we never requested (libtorrent's
+`incoming_piece` does `received_bytes` *and* `add_redundant_bytes`), and
+blocks a recheck discards because the piece they belonged to turned out
+not to be on disk (libtorrent's `waste_reason::piece_closing` class).
 ## Q25. Dual-stack duplicates and connections to ourselves
 
 Source: libtorrent 2.0.14 `bt_peer_connection.cpp` (`on_receive_handshake`),
