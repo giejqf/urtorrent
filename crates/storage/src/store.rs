@@ -1026,6 +1026,14 @@ impl Storage {
         length: u32,
     ) -> Result<Buffer, Error> {
         let torrent_off = self.torrent_offset(piece, offset)?;
+        // The block must lie within its piece (the last piece is short).
+        let piece_size = self.info.piece_size(piece).ok_or(Error::OutOfRange)?;
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > piece_size)
+        {
+            return Err(Error::OutOfRange);
+        }
         let slices = self.info.slices_for(torrent_off, u64::from(length));
         // One content file (the common case): read straight into the block
         // buffer. Otherwise assemble the block slice by slice, zero-filling

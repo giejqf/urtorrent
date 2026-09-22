@@ -53,6 +53,10 @@ const TRUST_CAP: i32 = 8;
 const RESUME_SAVE_EVERY: Duration = Duration::from_secs(60);
 /// Do not reconnect to an address that failed for this long.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
+/// Most peer addresses kept per torrent (libtorrent `max_peerlist_size`):
+/// a tracker, PEX peer or DHT reply handing out endless unique addresses
+/// cannot grow the session without bound.
+pub const MAX_PEER_LIST: usize = 3000;
 
 /// Truthful transfer counters.
 #[derive(Debug, Clone, Default)]
@@ -520,6 +524,7 @@ impl Torrent {
             seeding_time: self.times(now).1,
             max_peers: self.max_peers,
             max_uploads: self.max_uploads,
+            peer_list_size: self.known.len(),
             auto_managed: self.auto_managed,
             queue_position,
             next_announce_in: self
@@ -606,6 +611,10 @@ impl Torrent {
         }
         let mut added = 0;
         for &p in peers {
+            if self.known.len() >= MAX_PEER_LIST && !self.evict_candidate() {
+                // Full of connected peers: nothing to make room with.
+                break;
+            }
             // Normalise on ingress (AGENTS.md 5.5): a v4-mapped v6 address
             // (`::ffff:a.b.c.d`, as some trackers put in `peers6` and some
             // clients in PEX `added6`) is the IPv4 peer it names.
@@ -626,6 +635,34 @@ impl Torrent {
             self.candidates_dirty = true;
         }
         added
+    }
+
+    /// Make room in a full peer list (libtorrent `peer_list::erase_peers`):
+    /// drop the candidate that has waited longest and is not connected or
+    /// being dialled. `false` when every entry is in use.
+    fn evict_candidate(&mut self) -> bool {
+        let victim = self
+            .candidates
+            .iter()
+            .position(|a| !self.has_peer_ip(a.ip()) && !self.connecting.contains(a));
+        let Some(i) = victim else {
+            return false;
+        };
+        if let Some(a) = self.candidates.remove(i) {
+            self.known.remove(&a);
+            self.sources.remove(&a);
+            self.failed.remove(&a);
+        }
+        true
+    }
+
+    /// Forget expired reconnect backoffs (the map would otherwise grow with
+    /// every address ever tried).
+    pub fn prune_failed(&mut self, now: Instant) {
+        if self.failed.len() > MAX_PEER_LIST {
+            self.failed
+                .retain(|_, t| now.duration_since(*t) < RECONNECT_BACKOFF);
+        }
     }
 
     /// Our external address changed: BEP 40 ranks depend on it.
@@ -1690,6 +1727,7 @@ pub fn tick_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, now: Instant) ->
         }
         super::pex::tick(ctx, &mut t, now);
         super::metadata::tick(&mut t, now);
+        t.prune_failed(now);
         connect_more(ctx, torrent, &mut t, now);
         let save = t.resume_dirty
             && !t.resume_saving

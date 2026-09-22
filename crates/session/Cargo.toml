@@ -12,19 +12,19 @@ description = "The urtorrent engine: wires tracker, wire, picker, storage and ur
 workspace = true
 
 [dependencies]
-dht = { path = "../dht", version = "0.9.0" }
-utp = { path = "../utp", version = "0.9.0" }
-bencode = { path = "../bencode", version = "0.9.0" }
-metainfo = { path = "../metainfo", version = "0.9.0" }
-profile = { path = "../profile", version = "0.9.0" }
-wire = { path = "../wire", version = "0.9.0" }
-tracker = { path = "../tracker", version = "0.9.0" }
-picker = { path = "../picker", version = "0.9.0" }
-mse = { path = "../mse", version = "0.9.0" }
+dht = { path = "../dht", version = "0.10.0" }
+utp = { path = "../utp", version = "0.10.0" }
+bencode = { path = "../bencode", version = "0.10.0" }
+metainfo = { path = "../metainfo", version = "0.10.0" }
+profile = { path = "../profile", version = "0.10.0" }
+wire = { path = "../wire", version = "0.10.0" }
+tracker = { path = "../tracker", version = "0.10.0" }
+picker = { path = "../picker", version = "0.10.0" }
+mse = { path = "../mse", version = "0.10.0" }
 # DH exponents for MSE (the getrandom syscall; not on the io_uring data path).
 getrandom = "0.3"
-uring = { path = "../uring", version = "0.9.0" }
-storage = { path = "../storage", version = "0.9.0" }
+uring = { path = "../uring", version = "0.10.0" }
+storage = { path = "../storage", version = "0.10.0" }
 # Verifying fetched metadata against the info-hash (BEP 9).
 sha1.workspace = true
 thiserror.workspace = true

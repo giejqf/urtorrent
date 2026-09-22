@@ -693,16 +693,33 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
     if ctx.is_banned_ip(addr.ip()) {
         return;
     }
+    // A connection still in its handshake counts against the session limit
+    // (libtorrent refuses at accept when `connections_limit` is reached), so
+    // a flood of idle connections cannot pile up ahead of the limit.
+    if ctx.connection_count() >= ctx.max_connections() {
+        tracing::debug!(%addr, "incoming refused: connection limit");
+        return;
+    }
+    ctx.connection_opened();
+    let _pending = super::local::Defer(Some({
+        let ctx = ctx.clone();
+        move || ctx.connection_closed()
+    }));
     let local_addr = stream
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::new(addr.ip(), ctx.listen_port()));
     let mut raw: Vec<u8> = Vec::with_capacity(wire::HANDSHAKE_LEN);
     let mut cipher = Cipher::default();
+    // One deadline for the whole handshake, however many reads it takes: a
+    // peer trickling bytes (slow loris) is out at the same time as a silent
+    // one.
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let remaining = || deadline.saturating_duration_since(Instant::now());
     // Read until we can tell plaintext from MSE (20 bytes), then finish the
     // respective handshake.
     let hs = loop {
         let chunk = Buffer::from_vec(vec![0u8; 4096]);
-        match uring::timeout(HANDSHAKE_TIMEOUT, stream.recv(chunk)).await {
+        match uring::timeout(remaining(), stream.recv(chunk)).await {
             Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => return,
             Ok((Ok(_), b)) => raw.extend_from_slice(b.as_slice()),
         }
@@ -726,7 +743,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
                     }
                 }
                 let chunk = Buffer::from_vec(vec![0u8; 1024]);
-                match uring::timeout(HANDSHAKE_TIMEOUT, stream.recv(chunk)).await {
+                match uring::timeout(remaining(), stream.recv(chunk)).await {
                     Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => return,
                     Ok((Ok(_), b)) => raw.extend_from_slice(b.as_slice()),
                 }
@@ -770,7 +787,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
                 }
             }
             let chunk = Buffer::from_vec(vec![0u8; 4096]);
-            match uring::timeout(HANDSHAKE_TIMEOUT, stream.recv(chunk)).await {
+            match uring::timeout(remaining(), stream.recv(chunk)).await {
                 Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => return,
                 Ok((Ok(_), b)) => pending = b.as_slice().to_vec(),
             }
@@ -791,7 +808,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
                 }
             }
             let chunk = Buffer::from_vec(vec![0u8; 1024]);
-            match uring::timeout(HANDSHAKE_TIMEOUT, stream.recv(chunk)).await {
+            match uring::timeout(remaining(), stream.recv(chunk)).await {
                 Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => return,
                 Ok((Ok(_), mut b)) => {
                     if let Some(d) = cipher.dec.as_mut() {
@@ -816,7 +833,7 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
             || !t.is_running()
             || t.is_banned(addr.ip())
             || t.peers.len() >= t.max_peers(&ctx)
-            || ctx.connection_count() >= ctx.max_connections()
+            || ctx.connection_count() > ctx.max_connections()
         {
             return;
         }
@@ -829,6 +846,8 @@ pub async fn run_incoming(ctx: Rc<Ctx>, stream: Transport) {
         ))
     };
     let _ = stream.set_nodelay(true);
+    // Handshake done: the connection counts as itself from here on.
+    drop(_pending);
     run_connection(
         ctx,
         torrent,
@@ -1627,6 +1646,20 @@ async fn uploader(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, handle: Rc<PeerHa
         };
         let mut reads = Vec::with_capacity(batch.len());
         for r in batch {
+            // A request past the end of its piece is a protocol violation
+            // (libtorrent `invalid_request`): nothing honest asks for it and
+            // serving it would splice the next piece in.
+            let piece_size = torrent
+                .borrow()
+                .info
+                .as_ref()
+                .and_then(|i| i.piece_size(r.index as usize));
+            let in_piece = piece_size
+                .is_some_and(|n| r.begin.checked_add(r.length).is_some_and(|end| end <= n));
+            if !in_piece {
+                handle.close("protocol: request beyond the piece");
+                return;
+            }
             // Cancelled or choked meanwhile? `wire` dropped it from its queue.
             if !handle.conn.borrow().incoming_requests().contains(&r) {
                 continue;

@@ -334,6 +334,11 @@ mod tests {
             client_name(&id(b"-qB5230-")).as_deref(),
             Some("qBittorrent 5.2.3")
         );
+        // libtorrent's letter digits for components of ten or more.
+        assert_eq!(
+            client_name(&id(b"-UR0A00-")).as_deref(),
+            Some("urtorrent 0.10.0")
+        );
         assert_eq!(
             client_name(&id(b"-TR4010-")).as_deref(),
             Some("Transmission 4.0.1")

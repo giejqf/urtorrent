@@ -187,6 +187,17 @@ pub async fn join_all<F: Future>(futs: Vec<F>) -> Vec<F::Output> {
     out.into_iter().flatten().collect()
 }
 
+/// Runs a closure when dropped (a scope guard).
+pub struct Defer<F: FnOnce()>(pub Option<F>);
+
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 #[cfg(test)]
 mod semaphore_tests {
     use super::*;

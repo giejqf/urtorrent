@@ -14,6 +14,38 @@
 | Enforcement | `xtask syscalls` (uring probe + real session under `strace -f -Y`) | `cargo xtask syscalls` |
 | Soak / perf | `testkit/src/bin/urt-soak.rs` | `cargo xtask soak [transfer\|many\|all] [--size 20G] [--torrents 500]` (see `docs/perf.md`) |
 
+## Hostile peers
+
+Anything that eats bytes from the network is untrusted (AGENTS.md 9), and
+the gates run at three levels:
+
+- **Parsers**: a `cargo-fuzz` target per parser (`fuzz/`: bencode, metainfo,
+  peer wire messages and the connection state machine, LTEP, PEX,
+  `ut_metadata`, tracker replies, HTTP framing, MSE, LSD, resume data, KRPC,
+  uTP packets, peer-id identification). Every length is bounded before it is
+  trusted (`wire::MAX_FRAME` 1 MiB, `MAX_BLOCK`, `MAX_BITFIELD`,
+  `MAX_EXT_PAYLOAD` 256 KiB, `MAX_METADATA_SIZE` 8 MiB, tracker bodies 4 MiB,
+  KRPC 1500 bytes, bencode nesting 32).
+- **The state machine** (`crates/wire/src/conn.rs` unit tests): out-of-range
+  indices and lengths, wrong bitfield sizes, fast-extension messages without
+  the extension, requests while choked (300, then dropped), allowed-fast
+  abuse, 4096 queued requests, cancels, duplicate and self connections.
+- **A live engine** (`crates/session/tests/hostile.rs`, raw sockets against
+  a seeding session): slow-loris handshakes leave at one deadline (10 s for
+  the whole handshake, however many reads) while a real peer completes;
+  an idle-connection flood is refused at the connection limit (pending
+  handshakes count); a 4 GiB length prefix, random bytes after the
+  handshake, a wrong info-hash and an HTTP request are dropped without
+  allocation; requests past the end of a piece (also of the short last
+  piece), out of range, empty or oversized end the connection with nothing
+  served; PEX floods are disconnected (libtorrent's cadence rule) and the
+  per-torrent peer list is capped at 3000 (`max_peerlist_size`, evicting
+  waiting candidates, never connected ones) for every source; 5000-deep
+  bencode nesting and 300 KiB extension payloads are refused; unrequested
+  blocks are counted as redundant, never written, never `downloaded`.
+- **In the lab**: `hash_fail_ban` (tap-peer serving corrupt pieces is
+  banned after `BAN_AT`), `encryption_matrix`, `private_no_pex_lsd`.
+
 ## The lab
 
 `testkit::lab` builds a bridge on the host (`urt<id>`) with a private v4 /16

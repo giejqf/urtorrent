@@ -231,6 +231,7 @@ impl ActiveLimits {
 /// block is fixed for the session's lifetime (build a new session to change
 /// it); the rest changes at runtime through the `Session::set_*` methods.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SessionSettings {
     /// The listen port in use (the ephemeral one if 0 was asked for).
     pub listen_port: u16,
@@ -290,6 +291,7 @@ pub enum PieceState {
 
 /// One piece in [`Session::pieces`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PieceInfo {
     /// Its standing.
     pub state: PieceState,
@@ -299,6 +301,7 @@ pub struct PieceInfo {
 
 /// One content file in a status snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FileStatus {
     /// Path relative to the save directory, `/`-separated.
     pub path: String,
@@ -334,6 +337,7 @@ pub enum TorrentState {
 
 /// One tracker's state in a status snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackerStatus {
     /// Announce URL.
     pub url: String,
@@ -357,6 +361,7 @@ pub struct TrackerStatus {
 
 /// A copied-out snapshot of a torrent. Counters are truthful (AGENTS.md rule 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TorrentStatus {
     /// The torrent id.
     pub id: TorrentId,
@@ -441,6 +446,9 @@ pub struct TorrentStatus {
     pub max_peers: Option<usize>,
     /// Upload slot cap set for this torrent (`None` = session budget only).
     pub max_uploads: Option<usize>,
+    /// Peer addresses known for the torrent (connected or waiting to be
+    /// dialled), capped at 3000 like libtorrent's `max_peerlist_size`.
+    pub peer_list_size: usize,
     /// Whether the active-torrent queue manages this torrent.
     pub auto_managed: bool,
     /// Position in the queue (0 = first, dense across the session's
@@ -493,6 +501,7 @@ pub enum PeerSource {
 
 /// A connected peer, copied out.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PeerInfo {
     /// Remote address.
     pub addr: SocketAddr,
@@ -601,6 +610,7 @@ pub enum PeerTransport {
 
 /// Session-wide counters.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SessionStats {
     /// Torrents in the session.
     pub torrents: usize,

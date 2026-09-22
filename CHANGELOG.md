@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-09-22
+
+Hostile-peer pass: what a malformed or malicious peer can and cannot do
+to a live engine, gated in `crates/session/tests/hostile.rs`
+(`docs/testing.md`, "Hostile peers").
+
+### Fixed
+
+- The incoming handshake had a timeout per read, so a peer trickling one
+  byte at a time (slow loris) held its connection indefinitely; the whole
+  handshake now has one 10 s deadline.
+- Connections still in their handshake did not count towards
+  `max_connections`, so an idle-connection flood could hold any number of
+  sockets for the handshake timeout; they count now and are refused at
+  accept beyond the limit (libtorrent refuses at `connections_limit`).
+- A request reaching past the end of its piece (including the short last
+  piece) was served with the next piece's bytes spliced in (or zero-filled
+  past the end of the torrent); it is now a protocol violation that ends
+  the connection, and `Storage::read_block` refuses it too.
+- The per-torrent peer list (tracker, PEX, DHT, LSD and manual addresses)
+  was unbounded; it is capped at 3000 like libtorrent's
+  `max_peerlist_size`, evicting the longest-waiting unconnected candidate,
+  and expired reconnect backoffs are pruned.
+
+### Changed
+
+- `TorrentStatus::peer_list_size` reports the capped list.
+- `TorrentStatus`, `PeerInfo`, `SessionStats`, `SessionSettings`,
+  `FileStatus`, `TrackerStatus` and `PieceInfo` are `#[non_exhaustive]`:
+  fields can be added in patch releases from now on (read them, do not
+  construct them).
+- The `native` profile's identity strings are `-UR0A00-` (libtorrent's
+  letter digits for a component of ten or more) / `urtorrent/0.10.0` /
+  DHT `UR\x00\x0a`.
+
 ## [0.9.0] - 2026-09-21
 
 The last settings that needed a session rebuild change live.
