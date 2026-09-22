@@ -18,16 +18,39 @@ use std::path::Path;
 use bencode::{Decoder, Value};
 use metainfo::InfoHash;
 
+use std::net::SocketAddr;
+
 use crate::Error;
 use metainfo::Bitfield;
+
+/// Compact peer lists (BEP 23 / BEP 7 layout: 6 and 18 bytes per peer).
+fn compact_peers(peers: &[SocketAddr]) -> (Vec<u8>, Vec<u8>) {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for p in peers.iter().take(MAX_RESUME_PEERS) {
+        match p.ip() {
+            std::net::IpAddr::V4(ip) => {
+                v4.extend_from_slice(&ip.octets());
+                v4.extend_from_slice(&p.port().to_be_bytes());
+            }
+            std::net::IpAddr::V6(ip) => {
+                v6.extend_from_slice(&ip.octets());
+                v6.extend_from_slice(&p.port().to_be_bytes());
+            }
+        }
+    }
+    (v4, v6)
+}
 
 /// Current resume-data format version. Version 2 added `file_priorities`
 /// (optional; version-1 files read as "all default"), version 3 the time
 /// counters, version 4 the queue fields (`auto_managed`, `queue_position`;
 /// absent in older files: managed, appended), version 5 the per-torrent
 /// settings (`sequential`, rate limits, `max_peers`, `max_uploads`) and the
-/// renamed file paths (`mapped_files`); all optional on read.
-pub const FORMAT_VERSION: i64 = 5;
+/// renamed file paths (`mapped_files`); version 6 the trackers, web seeds,
+/// timestamps, last peers and the unfinished pieces' written ranges (the
+/// self-contained blob of `Session::resume_data`); all optional on read.
+pub const FORMAT_VERSION: i64 = 6;
 
 /// Decoded resume data for one torrent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +93,28 @@ pub struct ResumeData {
     /// Renamed file paths per `info.files` entry, `/`-separated; an empty
     /// string means the metainfo's path (v5; empty list = none renamed).
     pub mapped_files: Vec<String>,
+    /// Tracker tiers as they stood (v6; empty = the metainfo's). They
+    /// replace the metainfo's on load, like libtorrent's resume trackers.
+    pub trackers: Vec<Vec<String>>,
+    /// Web seed URLs as they stood (v6; empty = the metainfo's).
+    pub web_seeds: Vec<String>,
+    /// When the torrent was added, unix seconds (v6; 0 = unknown).
+    pub added_time: u64,
+    /// When the download completed, unix seconds (v6).
+    pub completed_time: Option<u64>,
+    /// Peers worth dialling first after a restart (v6; at most
+    /// `MAX_RESUME_PEERS`).
+    pub peers: Vec<SocketAddr>,
+    /// Pieces in progress: `(piece, [(start, end)])` byte ranges written
+    /// and synced but not yet hashed (v6). Restored as downloaded blocks;
+    /// the hash check happens when the piece completes.
+    pub unfinished: Vec<(u32, Vec<(u32, u32)>)>,
 }
+
+/// Most peers kept in resume data.
+pub const MAX_RESUME_PEERS: usize = 100;
+/// Most unfinished pieces kept in resume data.
+pub const MAX_RESUME_UNFINISHED: usize = 4096;
 
 impl ResumeData {
     /// Build fresh resume data for a torrent with no pieces yet.
@@ -99,6 +143,12 @@ impl ResumeData {
             max_peers: None,
             max_uploads: None,
             mapped_files: Vec::new(),
+            trackers: Vec::new(),
+            web_seeds: Vec::new(),
+            added_time: 0,
+            completed_time: None,
+            peers: Vec::new(),
+            unfinished: Vec::new(),
         }
     }
 
@@ -158,6 +208,76 @@ impl ResumeData {
                     b"mapped_files",
                     Value::List {
                         items: mapped,
+                        raw: b"",
+                    },
+                ));
+            }
+        }
+        // v6: kept as owned values while the entries borrow them.
+        let tiers: Vec<Value<'_>> = self
+            .trackers
+            .iter()
+            .map(|t| Value::List {
+                items: t.iter().map(|u| Value::Bytes(u.as_bytes())).collect(),
+                raw: b"",
+            })
+            .collect();
+        let seeds: Vec<Value<'_>> = self
+            .web_seeds
+            .iter()
+            .map(|u| Value::Bytes(u.as_bytes()))
+            .collect();
+        let (peers4, peers6) = compact_peers(&self.peers);
+        let unfinished: Vec<Value<'_>> = self
+            .unfinished
+            .iter()
+            .take(MAX_RESUME_UNFINISHED)
+            .map(|(piece, ranges)| {
+                let mut items = vec![Value::Int(i64::from(*piece))];
+                for (s, e) in ranges {
+                    items.push(Value::Int(i64::from(*s)));
+                    items.push(Value::Int(i64::from(*e)));
+                }
+                Value::List { items, raw: b"" }
+            })
+            .collect();
+        if self.format_version >= 6 {
+            if !tiers.is_empty() {
+                entries.push((
+                    b"trackers",
+                    Value::List {
+                        items: tiers,
+                        raw: b"",
+                    },
+                ));
+            }
+            if !seeds.is_empty() {
+                entries.push((
+                    b"web_seeds",
+                    Value::List {
+                        items: seeds,
+                        raw: b"",
+                    },
+                ));
+            }
+            entries.push((
+                b"added_time",
+                Value::Int(self.added_time.min(i64::MAX as u64) as i64),
+            ));
+            if let Some(c) = self.completed_time {
+                entries.push((b"completed_time", Value::Int(c.min(i64::MAX as u64) as i64)));
+            }
+            if !peers4.is_empty() {
+                entries.push((b"peers", Value::Bytes(&peers4)));
+            }
+            if !peers6.is_empty() {
+                entries.push((b"peers6", Value::Bytes(&peers6)));
+            }
+            if !unfinished.is_empty() {
+                entries.push((
+                    b"unfinished",
+                    Value::List {
+                        items: unfinished,
                         raw: b"",
                     },
                 ));
@@ -280,6 +400,113 @@ impl ResumeData {
                     _ => None,
                 })
                 .unwrap_or_default(),
+            // v6 fields.
+            trackers: v
+                .get_str("trackers")
+                .and_then(|l| match l {
+                    Value::List { items, .. } => Some(
+                        items
+                            .iter()
+                            .take(256)
+                            .filter_map(|tier| match tier {
+                                Value::List { items, .. } => Some(
+                                    items
+                                        .iter()
+                                        .take(256)
+                                        .filter_map(|u| {
+                                            u.as_bytes()
+                                                .map(|b| String::from_utf8_lossy(b).into_owned())
+                                        })
+                                        .collect::<Vec<String>>(),
+                                ),
+                                _ => None,
+                            })
+                            .filter(|t: &Vec<String>| !t.is_empty())
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            web_seeds: v
+                .get_str("web_seeds")
+                .and_then(|l| match l {
+                    Value::List { items, .. } => Some(
+                        items
+                            .iter()
+                            .take(256)
+                            .filter_map(|u| {
+                                u.as_bytes()
+                                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            added_time: secs("added_time"),
+            completed_time: v
+                .get_str("completed_time")
+                .and_then(Value::as_int)
+                .filter(|c| *c > 0)
+                .map(|c| c as u64),
+            peers: {
+                let mut peers = Vec::new();
+                if let Some(b) = v.get_str("peers").and_then(Value::as_bytes) {
+                    for c in b.as_chunks::<6>().0.iter().take(MAX_RESUME_PEERS) {
+                        let ip = std::net::Ipv4Addr::new(c[0], c[1], c[2], c[3]);
+                        peers.push(SocketAddr::new(ip.into(), u16::from_be_bytes([c[4], c[5]])));
+                    }
+                }
+                if let Some(b) = v.get_str("peers6").and_then(Value::as_bytes) {
+                    for c in b.as_chunks::<18>().0.iter().take(MAX_RESUME_PEERS) {
+                        let mut o = [0u8; 16];
+                        o.copy_from_slice(&c[..16]);
+                        let ip = std::net::Ipv6Addr::from(o);
+                        peers.push(SocketAddr::new(
+                            ip.into(),
+                            u16::from_be_bytes([c[16], c[17]]),
+                        ));
+                    }
+                }
+                peers.truncate(MAX_RESUME_PEERS);
+                peers
+            },
+            unfinished: v
+                .get_str("unfinished")
+                .and_then(|l| match l {
+                    Value::List { items, .. } => Some(
+                        items
+                            .iter()
+                            .take(MAX_RESUME_UNFINISHED)
+                            .filter_map(|entry| match entry {
+                                Value::List { items, .. } => {
+                                    let ints: Vec<i64> = items
+                                        .iter()
+                                        .take(1 + 2 * 4096)
+                                        .filter_map(Value::as_int)
+                                        .collect();
+                                    let (&piece, rest) = ints.split_first()?;
+                                    if piece < 0 || piece > i64::from(u32::MAX) {
+                                        return None;
+                                    }
+                                    let ranges: Vec<(u32, u32)> = rest
+                                        .as_chunks::<2>()
+                                        .0
+                                        .iter()
+                                        .filter(|r| {
+                                            r[0] >= 0 && r[1] > r[0] && r[1] <= i64::from(u32::MAX)
+                                        })
+                                        .map(|r| (r[0] as u32, r[1] as u32))
+                                        .collect();
+                                    (!ranges.is_empty()).then_some((piece as u32, ranges))
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -357,7 +584,48 @@ mod tests {
             max_peers: Some(30),
             max_uploads: None,
             mapped_files: vec![String::new(), "renamed/b.bin".into(), String::new()],
+            trackers: vec![
+                vec!["http://a/announce".into(), "http://b/announce".into()],
+                vec!["udp://c:1/announce".into()],
+            ],
+            web_seeds: vec!["http://w/files/".into()],
+            added_time: 1_700_000_000,
+            completed_time: Some(1_700_000_100),
+            peers: vec![
+                "10.1.2.3:6881".parse().unwrap(),
+                "[fd77::1]:51413".parse().unwrap(),
+            ],
+            unfinished: vec![
+                (3, vec![(0, 32768), (65536, 81920)]),
+                (7, vec![(16384, 32768)]),
+            ],
         }
+    }
+
+    /// A version-5 file (no trackers, timestamps, peers or unfinished
+    /// pieces) still loads with the defaults.
+    #[test]
+    fn reads_format_version_5() {
+        let mut v5 = sample();
+        v5.format_version = 5;
+        let bytes = v5.encode();
+        assert!(!bytes.windows(10).any(|w| w == b"unfinished"));
+        let back = ResumeData::decode(&bytes).unwrap();
+        assert_eq!(back.format_version, 5);
+        assert!(back.trackers.is_empty() && back.web_seeds.is_empty());
+        assert_eq!(back.added_time, 0);
+        assert_eq!(back.completed_time, None);
+        assert!(back.peers.is_empty() && back.unfinished.is_empty());
+        assert_eq!(back.mapped_files, v5.mapped_files);
+    }
+
+    /// Hostile unfinished entries are dropped, not trusted.
+    #[test]
+    fn unfinished_ranges_are_validated() {
+        let mut r = sample();
+        r.unfinished = vec![(1, vec![(10, 5)]), (2, vec![(0, 100)])];
+        let back = ResumeData::decode(&r.encode()).unwrap();
+        assert_eq!(back.unfinished, vec![(2, vec![(0, 100)])]);
     }
 
     /// A version-4 file (no per-torrent settings) still loads with the

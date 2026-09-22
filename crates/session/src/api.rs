@@ -88,6 +88,11 @@ pub struct AddTorrent {
     /// `None` keeps the resume data's value, else `true`. `false` is a
     /// "force start": the torrent runs regardless of the limits.
     pub auto_managed: Option<bool>,
+    /// Resume data as [`Session::resume_data`] returned it, for a caller
+    /// that stores the blob itself (libtorrent's `read_resume_data`). It is
+    /// used instead of the `resume_dir` file, if both are given, and must
+    /// belong to this torrent (the info-hash is checked).
+    pub resume_data: Option<Vec<u8>>,
 }
 
 impl AddTorrent {
@@ -106,6 +111,7 @@ impl AddTorrent {
             max_peers: None,
             max_uploads: None,
             auto_managed: None,
+            resume_data: None,
         }
     }
 
@@ -124,6 +130,7 @@ impl AddTorrent {
             max_peers: None,
             max_uploads: None,
             auto_managed: None,
+            resume_data: None,
         }
     }
 
@@ -184,6 +191,12 @@ impl AddTorrent {
     /// Whether the active-torrent queue manages this torrent (see the field).
     pub fn auto_managed(mut self, on: bool) -> AddTorrent {
         self.auto_managed = Some(on);
+        self
+    }
+
+    /// Resume data from an earlier run (see the field).
+    pub fn resume_data(mut self, bytes: Vec<u8>) -> AddTorrent {
+        self.resume_data = Some(bytes);
         self
     }
 }
@@ -449,6 +462,15 @@ pub struct TorrentStatus {
     /// Peer addresses known for the torrent (connected or waiting to be
     /// dialled), capped at 3000 like libtorrent's `max_peerlist_size`.
     pub peer_list_size: usize,
+    /// Something the resume data records has changed since it was last
+    /// saved or returned (libtorrent `need_save_resume`): a caller storing
+    /// blobs itself fetches [`Session::resume_data`] when this is set.
+    pub needs_resume_save: bool,
+    /// When the torrent was added, unix seconds (restored from resume
+    /// data).
+    pub added_on: u64,
+    /// When the download completed, unix seconds, if it has.
+    pub completed_on: Option<u64>,
     /// Whether the active-torrent queue manages this torrent.
     pub auto_managed: bool,
     /// Position in the queue (0 = first, dense across the session's
@@ -497,6 +519,8 @@ pub enum PeerSource {
     Incoming,
     /// The DHT (BEP 5).
     Dht,
+    /// Resume data (a peer from the previous run).
+    Resume,
 }
 
 /// A connected peer, copied out.
@@ -1263,6 +1287,19 @@ impl Session {
     /// multicast sockets open on first use and stay for the session.
     pub async fn set_lsd(&self, on: bool) -> Result<(), Error> {
         self.send(|tx| Command::SetLsd(on, tx)).await
+    }
+
+    /// The torrent's resume data as bytes (libtorrent's
+    /// `write_resume_data_buf`), after syncing its files so everything the
+    /// data claims is on disk: verified pieces, the written ranges of
+    /// unfinished pieces, counters and times, the tracker list and web seeds
+    /// as they stand, per-torrent settings, renamed files, queue standing,
+    /// and up to 100 peers to try first. Store it and pass it back through
+    /// [`AddTorrent::resume_data`] on the next run; `resume_dir` is not
+    /// needed for that. Clears [`TorrentStatus::needs_resume_save`]. Fails
+    /// while a magnet link's metadata is unknown.
+    pub async fn resume_data(&self, id: TorrentId) -> Result<Vec<u8>, Error> {
+        self.send(|tx| Command::ResumeData(id, tx)).await?
     }
 
     /// The per-file status of a torrent (empty until the metadata is known).

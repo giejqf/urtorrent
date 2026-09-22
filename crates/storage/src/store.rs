@@ -710,6 +710,62 @@ impl Storage {
         Ok(())
     }
 
+    /// Forget everything written to `piece` so far (a banned peer's blocks
+    /// are in it): the next writes start it over.
+    pub fn discard_piece(&self, piece: usize) {
+        self.progress.borrow_mut().remove(&piece);
+        self.have.borrow_mut().clear(piece);
+    }
+
+    /// The written-but-unverified ranges of every piece in progress, for
+    /// resume data: `(piece, [(start, end)])`. Meaningful after
+    /// [`Storage::sync_all`] (the ranges are then on disk).
+    pub fn unfinished(&self) -> Vec<(usize, Vec<(u32, u32)>)> {
+        let have = self.have.borrow();
+        self.progress
+            .borrow()
+            .iter()
+            .filter(|(piece, p)| {
+                !have.get(**piece) && !p.written.is_empty() && p.verdict != Some(false)
+            })
+            .map(|(piece, p)| (*piece, p.written.clone()))
+            .collect()
+    }
+
+    /// Restore a piece's written ranges from resume data (bytes on disk from
+    /// an earlier run, never hashed): the hash cursor reads them back when
+    /// it reaches them. A run from the piece start is hashed right away.
+    pub async fn restore_unfinished(
+        &self,
+        piece: usize,
+        ranges: &[(u32, u32)],
+    ) -> Result<(), Error> {
+        let piece_len = self.piece_len(piece)?;
+        if self.have.borrow().get(piece) {
+            return Ok(());
+        }
+        let start_run = {
+            let mut prog = self.progress.borrow_mut();
+            let p = prog.entry(piece).or_insert_with(PieceHash::new);
+            for &(s, e) in ranges {
+                let e = e.min(piece_len);
+                if s < e {
+                    p.mark(s, e);
+                }
+            }
+            if p.run_end(0).is_some() && !p.hashing {
+                p.hashing = true;
+                true
+            } else {
+                false
+            }
+        };
+        if start_run {
+            self.advance(piece, piece_len).await;
+        }
+        Ok(())
+    }
+
     /// Preallocate every wanted content file to its full length
     /// (`fallocate`; a plain size set where the file system cannot
     /// allocate) and remember the mode: files that become wanted later

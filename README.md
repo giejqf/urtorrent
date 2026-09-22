@@ -10,7 +10,8 @@ architecture, milestones). Design decisions live in [docs/adr](docs/adr),
 oracle-vs-BEP disagreements in [docs/quirks.md](docs/quirks.md), the test
 layers in [docs/testing.md](docs/testing.md), soak/perf baselines in
 [docs/perf.md](docs/perf.md) and the configuration a client gets from the
-library (versus what stays in the frontend) in [docs/config.md](docs/config.md).
+library (versus what stays in the frontend) in [docs/config.md](docs/config.md),
+and how a torrent's state survives a restart in [docs/resume.md](docs/resume.md).
 
 ## Status
 
@@ -25,6 +26,7 @@ library (versus what stays in the frontend) in [docs/config.md](docs/config.md).
 | M6 Extensions | done: PEX, `ut_metadata` / magnets, `upload_only`, LSD, web seeds, BEP 40; private torrents proven silent on the wire (Q11); scenarios green in v4 / v6 |
 | M7 Hardening | done: file priorities with a parts file + move storage (Tier 1), torrent files opened on the ring, `xtask syscalls` on a real session, `xtask soak` (20 GiB loopback, 500 torrents), fuzz time, API review; **0.1.0** |
 | 0.3.0 DHT | done: `crates/dht` (BEP 5 / 42 / 43 / 51 sans-IO node ported from libtorrent), engine integration on the listen port's UDP demux, `port` messages, per-actor /24s in the lab, `tap-dht`, `dht_leech_from_oracle` / `dht_seed_to_oracle` / `dht_shape` green (our node is indistinguishable from the oracle's on every probed shape); **0.3.0** |
+| 0.11.0 Resume blobs | done: `resume_data` / `AddTorrent::resume_data` (libtorrent's `write_resume_data_buf` / `read_resume_data` shape), format 6 with unfinished pieces, trackers, web seeds, timestamps and last peers, `needs_resume_save`; **0.11.0** |
 | 0.10.0 Hostile peers | done: slow-loris and idle-connection floods bounded (one handshake deadline, pending handshakes count towards the limit), requests past a piece refused, peer lists capped at 3000 per torrent, live-engine gates for malformed peers (`hostile.rs`) on top of the parser fuzzers and the state-machine tests; snapshot structs `#[non_exhaustive]`; **0.10.0** |
 | 0.9.0 Live settings | done: listen port / addresses, the DHT node and the identity profile change at runtime (`set_listen`, `set_dht`, `set_profile`), trackers told with `stopped` / `started` pairs; nothing a preferences page exposes needs a session rebuild any more; **0.9.0** |
 | 0.8.0 Daemon readiness | done: `torrent_file` (byte-exact re-add after a restart), per-piece state, cheap list snapshots, runtime encryption / transport / PEX / LSD switches and a settings snapshot, session-wide IP bans, live web seeds, `rename_file`, resume data v5 carrying per-torrent settings and renamed files; **0.8.0** |

@@ -12,8 +12,8 @@ description = "Sans-IO Message Stream Encryption (MSE/PE) handshake and RC4 stre
 workspace = true
 
 [dependencies]
-metainfo = { path = "../metainfo", version = "0.10.1" }
-profile = { path = "../profile", version = "0.10.1" }
+metainfo = { path = "../metainfo", version = "0.11.0" }
+profile = { path = "../profile", version = "0.11.0" }
 sha1.workspace = true
 # Audited crypto primitives (AGENTS.md 9): RC4 from RustCrypto, the 768-bit
 # DH modpow from num-bigint (arbitrary precision, widely used; the exchange

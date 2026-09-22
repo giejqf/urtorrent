@@ -97,6 +97,21 @@ enum Job {
         id: u64,
         done: Done,
     },
+    Unfinished {
+        id: u64,
+        done: Done,
+    },
+    RestoreUnfinished {
+        id: u64,
+        piece: usize,
+        ranges: Vec<(u32, u32)>,
+        done: Done,
+    },
+    DiscardPiece {
+        id: u64,
+        piece: usize,
+        done: Done,
+    },
     Close {
         id: u64,
     },
@@ -179,7 +194,12 @@ pub enum Reply {
     Bytes(Result<Vec<u8>, Error>),
     /// A have-set (from a full check).
     Bits(Result<Bitfield, Error>),
+    /// Unfinished pieces' written ranges.
+    Ranges(Result<Unfinished, Error>),
 }
+
+/// Pieces in progress with their written `(start, end)` ranges.
+pub type Unfinished = Vec<(usize, Vec<(u32, u32)>)>;
 
 struct Shared {
     jobs: Mutex<VecDeque<Job>>,
@@ -702,6 +722,45 @@ impl DiskStore {
         self.ring.submit(Job::SyncAll { id: self.id, done });
         unit(t.await)
     }
+
+    /// The written-but-unverified ranges of the pieces in progress (see
+    /// [`Storage::unfinished`]); call after [`DiskStore::sync_all`].
+    pub async fn unfinished(&self) -> Result<Unfinished, Error> {
+        let (t, done) = self.ticket();
+        self.ring.submit(Job::Unfinished { id: self.id, done });
+        match t.await {
+            Reply::Ranges(r) => r,
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Forget everything written to `piece` (see [`Storage::discard_piece`]).
+    pub async fn discard_piece(&self, piece: usize) -> Result<(), Error> {
+        let (t, done) = self.ticket();
+        self.ring.submit(Job::DiscardPiece {
+            id: self.id,
+            piece,
+            done,
+        });
+        unit(t.await)
+    }
+
+    /// Restore a piece's written ranges from resume data (see
+    /// [`Storage::restore_unfinished`]).
+    pub async fn restore_unfinished(
+        &self,
+        piece: usize,
+        ranges: Vec<(u32, u32)>,
+    ) -> Result<(), Error> {
+        let (t, done) = self.ticket();
+        self.ring.submit(Job::RestoreUnfinished {
+            id: self.id,
+            piece,
+            ranges,
+            done,
+        });
+        unit(t.await)
+    }
 }
 
 impl Drop for DiskStore {
@@ -723,6 +782,7 @@ fn unexpected(r: Reply) -> Error {
         Reply::Bool(_) => "bool",
         Reply::Bytes(_) => "bytes",
         Reply::Bits(_) => "bitfield",
+        Reply::Ranges(_) => "ranges",
     };
     Error::Io(std::io::Error::other(format!(
         "disk thread answered with an unexpected reply ({what})"
@@ -761,6 +821,9 @@ fn is_barrier(j: &Job) -> bool {
             | Job::MoveTo { .. }
             | Job::RenameFile { .. }
             | Job::SyncAll { .. }
+            | Job::Unfinished { .. }
+            | Job::RestoreUnfinished { .. }
+            | Job::DiscardPiece { .. }
             | Job::CreateFiles { .. }
             | Job::DeleteFiles { .. }
     )
@@ -897,6 +960,9 @@ fn job_id(j: &Job) -> u64 {
         | Job::MoveTo { id, .. }
         | Job::RenameFile { id, .. }
         | Job::SyncAll { id, .. }
+        | Job::Unfinished { id, .. }
+        | Job::RestoreUnfinished { id, .. }
+        | Job::DiscardPiece { id, .. }
         | Job::Close { id } => *id,
         Job::Shutdown => 0,
     }
@@ -912,7 +978,10 @@ fn fail(job: Job, why: &str) {
         | Job::SetPriorities { done, .. }
         | Job::MoveTo { done, .. }
         | Job::RenameFile { done, .. }
+        | Job::RestoreUnfinished { done, .. }
+        | Job::DiscardPiece { done, .. }
         | Job::SyncAll { done, .. } => done.complete(Reply::Unit(Err(err()))),
+        Job::Unfinished { done, .. } => done.complete(Reply::Ranges(Err(err()))),
         Job::ReadBlock { done, .. } => done.complete(Reply::Bytes(Err(err()))),
         Job::VerifyPiece { done, .. } => done.complete(Reply::Bool(Err(err()))),
         Job::CheckAll { done, .. } => done.complete(Reply::Bits(Err(err()))),
@@ -1056,6 +1125,23 @@ async fn run_job(entry: Rc<RefCell<Entry>>, job: Job) {
         }
         Job::SyncAll { done, .. } => {
             done.complete(Reply::Unit(storage.sync_all().await));
+        }
+        Job::Unfinished { done, .. } => {
+            done.complete(Reply::Ranges(Ok(storage.unfinished())));
+        }
+        Job::DiscardPiece { piece, done, .. } => {
+            storage.discard_piece(piece);
+            done.complete(Reply::Unit(Ok(())));
+        }
+        Job::RestoreUnfinished {
+            piece,
+            ranges,
+            done,
+            ..
+        } => {
+            done.complete(Reply::Unit(
+                storage.restore_unfinished(piece, &ranges).await,
+            ));
         }
         Job::Open { .. } | Job::Close { .. } | Job::Shutdown => {}
     }

@@ -66,7 +66,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bencode"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -172,7 +172,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dht"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bencode",
  "metainfo",
@@ -398,7 +398,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "metainfo"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bencode",
  "proptest",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "mse"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "metainfo",
  "num-bigint",
@@ -496,7 +496,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "picker"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "metainfo",
  "profile",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "profile"
-version = "0.10.1"
+version = "0.11.0"
 
 [[package]]
 name = "proptest"
@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bencode",
  "dht",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "storage"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bencode",
  "metainfo",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "testkit"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "mse",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "tracker"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bencode",
  "metainfo",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "uring"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "urtorrent"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "metainfo",
  "profile",
@@ -1233,7 +1233,7 @@ checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utp"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "profile",
  "proptest",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bencode",
  "metainfo",
@@ -1405,7 +1405,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "anyhow",
 ]

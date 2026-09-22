@@ -207,6 +207,7 @@ pub enum Command {
         TorrentId,
         oneshot::Sender<Result<Vec<crate::api::FileStatus>, Error>>,
     ),
+    ResumeData(TorrentId, oneshot::Sender<Result<Vec<u8>, Error>>),
     Trackers(
         TorrentId,
         oneshot::Sender<Result<Vec<TrackerStatus>, Error>>,
@@ -1399,6 +1400,18 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             v.sort_by_key(|s| s.id);
             let _ = reply.send(v);
         }
+        Command::ResumeData(id, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let ctx2 = ctx.clone();
+                uring::spawn(async move {
+                    let r = torrent::resume_data(&ctx2, &t).await;
+                    let _ = reply.send(r);
+                });
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
         Command::Files(id, reply) => {
             let r = ctx
                 .torrent(id)

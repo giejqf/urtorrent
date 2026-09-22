@@ -43,16 +43,30 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub const KEEPALIVE_AFTER: Duration = Duration::from_secs(100);
 /// Drop a peer after this much inbound silence.
 pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(180);
-/// Trust points: a peer is banned when its score drops to this. A failed
-/// piece it supplied alone costs `SOLE_FAIL_COST`; a failed piece shared with
-/// others costs 1; a verified piece earns 1 (capped at `TRUST_CAP`).
-const BAN_AT: i32 = -3;
-const SOLE_FAIL_COST: i32 = 3;
+/// Trust points (libtorrent `torrent_peer::trust_points`): a peer is banned
+/// when its score drops to `BAN_AT`. A failed piece it supplied alone
+/// costs `SOLE_FAIL_COST` (an immediate ban, libtorrent's `known_bad_peer`);
+/// a failed piece shared with others costs `SHARED_FAIL_COST`; a verified
+/// piece earns 1 (capped at `TRUST_CAP`).
+const BAN_AT: i32 = -7;
+const SOLE_FAIL_COST: i32 = 7;
+const SHARED_FAIL_COST: i32 = 2;
 const TRUST_CAP: i32 = 8;
 /// Periodic resume save cadence.
 const RESUME_SAVE_EVERY: Duration = Duration::from_secs(60);
 /// Do not reconnect to an address that failed for this long.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
+/// The picker key under which blocks restored from resume data are
+/// recorded (no live peer has it: keys start at 1).
+const RESUME_PEER_KEY: u32 = 0;
+
+/// Wall-clock seconds since the epoch (timestamps in resume data).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Most peer addresses kept per torrent (libtorrent `max_peerlist_size`):
 /// a tracker, PEX peer or DHT reply handing out endless unique addresses
 /// cannot grow the session without bound.
@@ -93,6 +107,13 @@ pub struct Torrent {
     pub pex: super::pex::State,
     /// BEP 19 web seeds (`url-list`).
     pub web_seeds: Vec<String>,
+    /// Unix seconds when the torrent was added (from resume data when it
+    /// carries one) and when the download completed.
+    pub added_time: u64,
+    pub completed_time: Option<u64>,
+    /// A resume blob given at add time (`AddTorrent::resume_data`), taking
+    /// precedence over the resume directory's file.
+    pub resume_blob: Option<Vec<u8>>,
     /// `.torrent` extras kept for `Session::torrent_file` and the status:
     /// `comment`, `created by`, `creation date`.
     pub comment: Option<String>,
@@ -525,6 +546,9 @@ impl Torrent {
             max_peers: self.max_peers,
             max_uploads: self.max_uploads,
             peer_list_size: self.known.len(),
+            needs_resume_save: self.resume_dirty,
+            added_on: self.added_time,
+            completed_on: self.completed_time,
             auto_managed: self.auto_managed,
             queue_position,
             next_announce_in: self
@@ -717,20 +741,40 @@ impl Torrent {
     /// Adjust a peer's trust; ban (and drop) it when it falls to `BAN_AT`.
     /// Web seeds (blamed under the unspecified address) are not tracked by
     /// address; a failed piece drops the seed instead (`verify_piece`).
-    fn adjust_trust(&mut self, ip: IpAddr, delta: i32) {
+    fn adjust_trust(&mut self, ip: IpAddr, delta: i32) -> Vec<u32> {
         if ip.is_unspecified() {
-            return;
+            return Vec::new();
         }
         let t = self.trust.entry(ip).or_insert(0);
         *t = (*t + delta).min(TRUST_CAP);
-        if *t <= BAN_AT {
-            self.banned.insert(ip);
-            for p in self.peers.values() {
-                if p.addr.ip() == ip {
-                    p.close("banned: repeated hash failures");
-                }
+        if *t > BAN_AT {
+            return Vec::new();
+        }
+        let fresh = self.banned.insert(ip);
+        for p in self.peers.values() {
+            if p.addr.ip() == ip {
+                p.close("banned: repeated hash failures");
             }
         }
+        if !fresh {
+            return Vec::new();
+        }
+        // Everything it sent into pieces still in progress is suspect:
+        // those pieces start over, so its corrupt blocks cannot drag an
+        // honest peer down with them later.
+        let tainted: Vec<u32> = self
+            .suppliers
+            .iter()
+            .filter(|(piece, who)| {
+                !self.picker.have(**piece as usize) && who.iter().any(|(_, sup)| *sup == ip)
+            })
+            .map(|(piece, _)| *piece)
+            .collect();
+        for piece in &tainted {
+            self.suppliers.remove(piece);
+            self.picker.piece_failed(*piece as usize);
+        }
+        tainted
     }
 
     /// Drop `addr` from the candidates (an address that turned out to be
@@ -895,6 +939,9 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         metadata: super::metadata::Fetch::default(),
         pex: super::pex::State::default(),
         web_seeds,
+        added_time: unix_now(),
+        completed_time: None,
+        resume_blob: params.resume_data.clone(),
         comment: extras.0,
         created_by: extras.1,
         creation_date: extras.2,
@@ -1046,11 +1093,27 @@ fn wanted_files_present(torrent: &Rc<RefCell<Torrent>>) -> bool {
 
 /// Load the resume file, if any (unreadable data is ignored with a warning).
 fn load_resume(ctx: &Ctx, torrent: &Rc<RefCell<Torrent>>) -> Option<ResumeData> {
-    let path = torrent.borrow().resume_path.clone()?;
-    let r = ResumeData::load(&path).unwrap_or_else(|e| {
-        tracing::warn!("ignoring unreadable resume data {}: {e}", path.display());
-        None
-    })?;
+    let blob = torrent.borrow_mut().resume_blob.take();
+    let r = match blob {
+        Some(bytes) => match ResumeData::decode(&bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("ignoring unreadable resume data blob: {e}");
+                return None;
+            }
+        },
+        None => {
+            let path = torrent.borrow().resume_path.clone()?;
+            ResumeData::load(&path).unwrap_or_else(|e| {
+                tracing::warn!("ignoring unreadable resume data {}: {e}", path.display());
+                None
+            })?
+        }
+    };
+    if r.info_hash != torrent.borrow().info_hash {
+        tracing::warn!("ignoring resume data for another torrent");
+        return None;
+    }
     // The queue fields: the caller's `AddTorrent::auto_managed` wins over the
     // file's; the saved order is restored (positions are dense per session,
     // so a restored key only orders the torrent among the others restored).
@@ -1081,6 +1144,23 @@ fn load_resume(ctx: &Ctx, torrent: &Rc<RefCell<Torrent>>) -> Option<ResumeData> 
         }
         if !e.max_uploads {
             t.max_uploads = r.max_uploads.map(|m| m as usize);
+        }
+        // v6: the tracker list and web seeds as they stood replace the
+        // metainfo's (libtorrent's resume trackers), the timestamps come
+        // back, the last peers are the first candidates.
+        if !r.trackers.is_empty() {
+            let endpoints = t.announcer.endpoints();
+            t.announcer = Announcer::new(r.trackers.clone(), endpoints);
+        }
+        if !r.web_seeds.is_empty() {
+            t.web_seeds = r.web_seeds.clone();
+        }
+        if r.added_time > 0 {
+            t.added_time = r.added_time;
+        }
+        t.completed_time = r.completed_time;
+        if !r.peers.is_empty() {
+            t.add_candidates(ctx, &r.peers, PeerSource::Resume);
         }
     }
     Some(r)
@@ -1265,10 +1345,12 @@ async fn initial_check(
     };
     let mut have = Bitfield::new(info.piece_count());
     let mut carried: Option<(u64, u64)> = None;
+    let mut unfinished: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
     match resume {
         Some(r) if r.matches(&info) && files_present => {
             have = r.have.clone();
             carried = Some((r.downloaded, r.uploaded));
+            unfinished = r.unfinished.clone();
             let mut t = torrent.borrow_mut();
             t.active_time = Duration::from_secs(r.active_time);
             t.seeding_time = Duration::from_secs(r.seeding_time);
@@ -1292,7 +1374,90 @@ async fn initial_check(
             }
         }
     }
-    finish_check(&ctx, &torrent, have, carried);
+    finish_check(&ctx, &torrent, have.clone(), carried);
+    if !unfinished.is_empty() {
+        restore_unfinished(&ctx, &torrent, &storage, &have, unfinished).await;
+    }
+}
+
+/// Bring back the pieces that were partly written when the resume data was
+/// saved: their synced ranges become downloaded blocks (not requested
+/// again) and the storage's hash cursor reads them back as it advances;
+/// a piece whose blocks are all there is verified now.
+async fn restore_unfinished(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    storage: &Rc<DiskStore>,
+    have: &Bitfield,
+    unfinished: Vec<(u32, Vec<(u32, u32)>)>,
+) {
+    const BLOCK: u32 = 16 * 1024;
+    let piece_count = torrent.borrow().piece_count();
+    let mut restored = 0u64;
+    for (piece, ranges) in unfinished {
+        let piece = piece as usize;
+        if piece >= piece_count || have.get(piece) {
+            continue;
+        }
+        if let Err(e) = storage.restore_unfinished(piece, ranges.clone()).await {
+            tracing::warn!(piece, "unfinished piece not restored: {e}");
+            continue;
+        }
+        let complete = {
+            let mut t = torrent.borrow_mut();
+            let piece_size = t.picker.piece_size(piece);
+            let mut complete = false;
+            let mut piece_restored = 0u64;
+            for (s, e) in ranges {
+                let e = e.min(piece_size);
+                // Whole blocks only; a partial block is downloaded again.
+                let mut b = s.div_ceil(BLOCK) * BLOCK;
+                while b < e {
+                    let len = BLOCK.min(piece_size - b);
+                    if b + len > e {
+                        break;
+                    }
+                    let block = picker::Block {
+                        piece: piece as u32,
+                        offset: b,
+                        length: len,
+                    };
+                    if let picker::Received::Accepted { piece_complete, .. } =
+                        t.picker.block_received(RESUME_PEER_KEY, &block)
+                    {
+                        piece_restored += u64::from(len);
+                        complete |= piece_complete;
+                    }
+                    b += BLOCK;
+                }
+            }
+            restored += piece_restored;
+            if piece_restored > 0 {
+                // The disk is a supplier of this piece too: should the piece
+                // fail its hash, the peers that send the rest are not the
+                // sole suspects (a torn write is as likely).
+                t.note_supplier(
+                    piece as u32,
+                    RESUME_PEER_KEY,
+                    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+            }
+            if complete {
+                t.verifying.insert(piece as u32);
+            }
+            complete
+        };
+        if complete {
+            uring::spawn(verify_piece(ctx.clone(), torrent.clone(), piece as u32));
+        }
+    }
+    if restored > 0 {
+        tracing::info!(
+            torrent = torrent.borrow().id.0,
+            bytes = restored,
+            "unfinished pieces restored from resume data"
+        );
+    }
 }
 
 /// Run a hash check behind the session's checking gate (`max_checking`),
@@ -1601,47 +1766,39 @@ pub async fn delete_files(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
 /// Persist resume data: fsync content first so the have-set never claims data
 /// the disk does not hold.
 pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
-    let (
-        storage,
-        path,
-        have,
-        downloaded,
-        uploaded,
-        info,
-        times,
-        auto_managed,
-        queue_position,
-        sequential,
-        upload_limit,
-        download_limit,
-        max_peers,
-        max_uploads,
-    ) = {
+    let Some(path) = torrent.borrow().resume_path.clone() else {
+        return Ok(());
+    };
+    let Some(data) = build_resume(ctx, torrent).await? else {
+        return Ok(());
+    };
+    data.save(&path)?;
+    Ok(())
+}
+
+/// `Session::resume_data`: the resume blob, bytes.
+pub async fn resume_data(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Result<Vec<u8>, Error> {
+    match build_resume(ctx, torrent).await? {
+        Some(d) => Ok(d.encode()),
+        None => Err(Error::Busy("metadata not known yet")),
+    }
+}
+
+/// Assemble the resume data after syncing the content files, so everything
+/// it claims (verified pieces, written ranges of unfinished pieces) is on
+/// disk (AGENTS.md 5.4). `None` while the metadata is unknown. Clears the
+/// dirty flag.
+async fn build_resume(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+) -> Result<Option<ResumeData>, Error> {
+    let (storage, info) = {
         let t = torrent.borrow();
-        let Some(path) = t.resume_path.clone() else {
-            return Ok(());
-        };
         let (Some(storage), Some(info)) = (t.storage.clone(), t.info.clone()) else {
             // Nothing verified yet (metadata pending): nothing to persist.
-            return Ok(());
+            return Ok(None);
         };
-        let have = storage.have();
-        (
-            storage,
-            path,
-            have,
-            t.stats.downloaded,
-            t.stats.uploaded,
-            info,
-            t.times(Instant::now()),
-            t.auto_managed,
-            t.queue_position,
-            t.sequential,
-            t.up_limit.rate(),
-            t.down_limit.rate(),
-            t.max_peers,
-            t.max_uploads,
-        )
+        (storage, info)
     };
     // Bounded concurrency: each save fsyncs the torrent's files.
     let _permit = ctx.resume_gate.acquire().await;
@@ -1652,24 +1809,66 @@ pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Resul
         sync_ms = started.elapsed().as_millis() as u64,
         "resume save: content synced"
     );
+    let unfinished: Vec<(u32, Vec<(u32, u32)>)> = storage
+        .unfinished()
+        .await?
+        .into_iter()
+        .filter_map(|(p, r)| u32::try_from(p).ok().map(|p| (p, r)))
+        .collect();
+    let have = storage.have();
+    let mut t = torrent.borrow_mut();
+    let times = t.times(Instant::now());
+    // Peers worth trying first next time: connected ones by their listen
+    // address (incoming peers only when their LTEP handshake named a
+    // port), then the freshest candidates.
+    let mut peers: Vec<SocketAddr> = t
+        .peers
+        .values()
+        .filter_map(|p| {
+            if p.incoming {
+                p.listen_port
+                    .get()
+                    .map(|port| SocketAddr::new(p.addr.ip(), port))
+            } else {
+                Some(p.addr)
+            }
+        })
+        .collect();
+    for c in t.candidates.iter().rev() {
+        if peers.len() >= storage::MAX_RESUME_PEERS {
+            break;
+        }
+        if !peers.contains(c) {
+            peers.push(*c);
+        }
+    }
+    peers.truncate(storage::MAX_RESUME_PEERS);
+    let mut tiers: Vec<Vec<String>> = Vec::new();
+    for tr in t.announcer.snapshot() {
+        while tiers.len() <= tr.tier {
+            tiers.push(Vec::new());
+        }
+        tiers[tr.tier].push(tr.url);
+    }
+    tiers.retain(|tier| !tier.is_empty());
     let data = ResumeData {
         format_version: storage::FORMAT_VERSION,
         info_hash: info.info_hash,
         piece_length: info.piece_length,
         total_length: info.total_length,
         have,
-        uploaded,
-        downloaded,
+        uploaded: t.stats.uploaded,
+        downloaded: t.stats.downloaded,
         file_priorities: storage.file_priorities(),
         active_time: times.0.as_secs(),
         seeding_time: times.1.as_secs(),
-        auto_managed,
-        queue_position: Some(queue_position),
-        sequential,
-        upload_limit,
-        download_limit,
-        max_peers: max_peers.map(|m| m.min(u32::MAX as usize) as u32),
-        max_uploads: max_uploads.map(|m| m.min(u32::MAX as usize) as u32),
+        auto_managed: t.auto_managed,
+        queue_position: Some(t.queue_position),
+        sequential: t.sequential,
+        upload_limit: t.up_limit.rate(),
+        download_limit: t.down_limit.rate(),
+        max_peers: t.max_peers.map(|m| m.min(u32::MAX as usize) as u32),
+        max_uploads: t.max_uploads.map(|m| m.min(u32::MAX as usize) as u32),
         mapped_files: {
             let mapped = storage.mapped_files();
             if mapped.iter().all(Option::is_none) {
@@ -1684,12 +1883,16 @@ pub async fn save_resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) -> Resul
                     .collect()
             }
         },
+        trackers: tiers,
+        web_seeds: t.web_seeds.clone(),
+        added_time: t.added_time,
+        completed_time: t.completed_time,
+        peers,
+        unfinished,
     };
-    data.save(&path)?;
-    let mut t = torrent.borrow_mut();
     t.resume_dirty = false;
     t.last_resume_save = Instant::now();
-    Ok(())
+    Ok(Some(data))
 }
 
 /// One torrent's once-a-second housekeeping, driven by the session ticker's
@@ -1937,7 +2140,7 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
             Ok(true) => {
                 t.picker.piece_verified(piece as usize);
                 for (_, ip) in t.suppliers.remove(&piece).unwrap_or_default() {
-                    t.adjust_trust(ip, 1);
+                    let _ = t.adjust_trust(ip, 1);
                 }
                 t.resume_dirty = true;
                 t.broadcast_have(piece);
@@ -1959,15 +2162,21 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
                     }
                     let _ = ip;
                 }
+                // Suppliers already banned are the likely culprits; the
+                // others are not charged for what those sent.
+                let banned_in = blamed.iter().any(|(_, ip)| t.banned.contains(ip));
+                let mut tainted: Vec<u32> = Vec::new();
                 if blamed.len() == 1 {
                     // One supplier: it is the culprit.
-                    t.adjust_trust(blamed[0].1, -SOLE_FAIL_COST);
+                    tainted.extend(t.adjust_trust(blamed[0].1, -SOLE_FAIL_COST));
+                } else if banned_in {
+                    // A banned peer was in it: nobody else is charged.
                 } else if !blamed.is_empty() {
-                    // Several suppliers: everyone loses a little trust, and the
+                    // Several suppliers: everyone loses some trust, and the
                     // piece is re-downloaded from the least trusted one that
                     // is still connected, so the next verdict is unambiguous.
                     for (_, ip) in &blamed {
-                        t.adjust_trust(*ip, -1);
+                        tainted.extend(t.adjust_trust(*ip, -SHARED_FAIL_COST));
                     }
                     let suspect = blamed
                         .iter()
@@ -1979,6 +2188,18 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32) {
                     }
                 }
                 ctx.emit(Event::HashFailed { id, piece });
+                // Pieces a just-banned peer had blocks in start over on
+                // disk too.
+                if !tainted.is_empty()
+                    && let Some(s) = t.storage.clone()
+                {
+                    for p in tainted {
+                        let s = s.clone();
+                        uring::spawn(async move {
+                            let _ = s.discard_piece(p as usize).await;
+                        });
+                    }
+                }
                 // Re-request the piece from whoever is available.
                 for p in t.peers.values().cloned().collect::<Vec<_>>() {
                     p.fill_requests_locked(&mut t, &ctx);
@@ -2007,6 +2228,10 @@ fn maybe_finished(ctx: &Ctx, t: &mut Torrent, now: Instant) -> bool {
     }
     t.finished_emitted = true;
     t.sync_seeding_clock(now);
+    if t.completed_time.is_none() {
+        t.completed_time = Some(unix_now());
+        t.resume_dirty = true;
+    }
     if t.picker.is_seed() {
         t.announcer.completed(now);
         t.tracker_kick.notify();

@@ -182,7 +182,11 @@ fn pieces_files_trackers_and_slim_list_snapshots() {
     let full = block_on(b.status(b_id)).unwrap();
     assert_eq!(full.files.len(), 1);
     assert_eq!(full.trackers.len(), 1);
-    assert_eq!(block_on(b.files(b_id)).unwrap(), full.files);
+    // (`done` moves between two snapshots of a live download.)
+    let files = block_on(b.files(b_id)).unwrap();
+    assert_eq!(files.len(), full.files.len());
+    assert_eq!(files[0].path, full.files[0].path);
+    assert_eq!(files[0].size, full.files[0].size);
     assert_eq!(block_on(b.trackers(b_id)).unwrap().len(), 1);
     wait_state(&b, b_id, TorrentState::Seeding, 60);
     assert!(

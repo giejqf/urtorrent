@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-09-22
+
+Resume data as a blob the caller stores, with libtorrent's coverage
+(`docs/resume.md`).
+
+### Added
+
+- `Session::resume_data(id)` returns the resume data as bytes after
+  syncing the torrent's files (libtorrent `write_resume_data_buf`);
+  `AddTorrent::resume_data(bytes)` takes it back (`read_resume_data`),
+  winning over a `resume_dir` file; the info-hash is checked.
+  `TorrentStatus::needs_resume_save` says when a fresh blob is worth
+  fetching (libtorrent `need_save_resume`).
+- Resume data format 6 carries what a restart needs beyond the have-set:
+  the written ranges of unfinished pieces (restored as downloaded blocks
+  and read back by the hash cursor, so a `kill -9` mid-piece costs at most
+  the partial blocks, not the pieces; a fully written piece is hashed on
+  restore; a failed hash discards the ranges and blames the disk alongside
+  the peers), the tracker tiers and web seeds as they stood (they replace
+  the metainfo's on load), `added_time` / `completed_time`
+  (`TorrentStatus::{added_on, completed_on}`), and up to 100 peers to dial
+  first (`PeerSource::Resume`). Formats 1–5 still load.
+- `crates/session/tests/resume.rs` gates the round trip without a resume
+  directory, the restore of a fully written unverified piece with no peer
+  present, and corrupt restored ranges being re-fetched.
+
+### Fixed
+
+- Hash-failure blame could ban an honest peer: a peer banned for corrupt
+  pieces left its unverified blocks in the pieces still in progress, and
+  when the honest peer completed those pieces the shared blame (one point
+  each, ban at three) reached it first. Now a ban discards every piece the
+  banned peer had blocks in (they start over from honest peers), pieces
+  with a banned supplier charge nobody else, and the trust points are
+  libtorrent's (two per shared failure, ban at minus seven, a sole
+  supplier banned at once). Seen in the lab's `hash_fail_ban`.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0B00-` / `urtorrent/0.11.0`
+  / DHT `UR\x00\x0b`.
+
 ## [0.10.1] - 2026-09-22
 
 ### Fixed

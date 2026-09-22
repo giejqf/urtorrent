@@ -49,13 +49,16 @@ rates, transport, source), `SessionStats`.
 ## Daemon persistence
 
 A daemon restarts from three things: `torrent_file(id)` (the `.torrent`
-as bytes, info dictionary byte-exact so the info-hash holds, current
-trackers and web seeds included; the daemon stores it, also for magnets
-once their metadata arrived), the resume directory (have-set, accounting,
-queue standing, sequential / rate limits / connection and slot caps,
-renamed files: everything `AddTorrent` did not say explicitly is restored
-from it), and its own table of the frontend-side state (save path, paused,
-categories, tags, ...). `Session::dht_state()` persists the DHT.
+as bytes, info dictionary byte-exact so the info-hash holds; the daemon
+stores it, also for magnets once their metadata arrived), the resume data
+(either the engine's `resume_dir` files or blobs from `resume_data(id)`
+passed back through `AddTorrent::resume_data`: have-set, unfinished
+pieces, accounting, timestamps, trackers and web seeds as they stood, queue
+standing, sequential / rate limits / connection and slot caps, renamed
+files, last peers; everything `AddTorrent` did not say explicitly is
+restored from it; `docs/resume.md`), and its own table of the
+frontend-side state (save path, paused, categories, tags, ...).
+`Session::dht_state()` persists the DHT.
 
 ## Frontend responsibilities (deliberately not in the library)
 
