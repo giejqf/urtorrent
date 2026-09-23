@@ -194,9 +194,16 @@ pub struct Torrent {
     pub check_queued: bool,
     pub error: Option<String>,
     pub error_kind: Option<ErrorKind>,
-    /// The resume data of a torrent whose content went missing, kept as it
-    /// was loaded: saved back unchanged, and tried again by `resume`.
-    missing_resume: Option<ResumeData>,
+    /// Resume data loaded but not applied yet (the content went missing, or
+    /// the torrent is held): saved back unchanged, and used by the check
+    /// that `resume` / `release` runs.
+    kept_resume: Option<ResumeData>,
+    /// `AddTorrent::hold_after_metadata`, until the torrent is held or
+    /// released.
+    hold: bool,
+    /// Held: metadata installed, no file created, no check run, stopped,
+    /// until `Session::release` or `resume`.
+    pub held: bool,
     /// The error struck while checking: recovering rechecks.
     recheck_on_recover: bool,
     /// The wind-down an error started is still running.
@@ -344,6 +351,8 @@ impl Torrent {
     pub fn state(&self) -> TorrentState {
         if self.error.is_some() {
             TorrentState::Error
+        } else if self.held {
+            TorrentState::Held
         } else if self.checking {
             if self.check_queued {
                 TorrentState::QueuedForChecking
@@ -1032,7 +1041,9 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         check_queued: false,
         error: None,
         error_kind: None,
-        missing_resume: None,
+        kept_resume: None,
+        hold: params.hold_after_metadata,
+        held: false,
         recheck_on_recover: false,
         error_stopping: false,
         stats: Stats::default(),
@@ -1074,6 +1085,18 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
             if let Err(e) = attach_metadata(&ctx, &torrent, info, raw, resume.as_ref()) {
                 ctx.remove_torrent_entry(id);
                 return Err(e);
+            }
+            if params.hold_after_metadata {
+                // Held from the start: nothing created, nothing checked,
+                // nothing started until `release` or `resume`.
+                let mut t = torrent.borrow_mut();
+                t.hold = false;
+                t.held = true;
+                t.kept_resume = resume;
+                t.checking = false;
+                t.paused = true;
+                t.auto_managed = false;
+                return Ok(id);
             }
             // Before any file is created: does the disk still hold what the
             // resume data describes? When it vouches for files that are gone,
@@ -1182,7 +1205,7 @@ fn report_content_missing(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, r: Resu
         t.seeding_time = Duration::from_secs(r.seeding_time);
         t.checking = false;
         t.check_queued = false;
-        t.missing_resume = Some(r);
+        t.kept_resume = Some(r);
         first_missing_file(&t)
     };
     let what = missing.map_or_else(|| "a content file".to_string(), |p| p.display().to_string());
@@ -1402,6 +1425,10 @@ pub async fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec
         fail_torrent(ctx, torrent, ErrorKind::Metadata, e.to_string());
         return;
     }
+    if torrent.borrow().hold {
+        hold_torrent(ctx, torrent, resume).await;
+        return;
+    }
     let files_present = wanted_files_present(torrent);
     if !content_missing(torrent, files_present, resume.as_ref())
         && let Err(e) = create_files(torrent).await
@@ -1440,6 +1467,70 @@ pub async fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec
         files_present,
         resume,
     ));
+}
+
+/// `AddTorrent::hold_after_metadata`: the metadata is in and the torrent
+/// waits, no file created and no check run, for `Session::release` (or
+/// `resume`). It stops the way the oracle's "stop condition: metadata
+/// received" does (capture `capture_magnet_hold`): `stopped` to the
+/// trackers, peers dropped, out of the queue's hands.
+async fn hold_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, resume: Option<ResumeData>) {
+    let (id, private) = {
+        let mut t = torrent.borrow_mut();
+        t.hold = false;
+        t.held = true;
+        t.kept_resume = resume;
+        t.checking = false;
+        t.check_queued = false;
+        t.auto_managed = false;
+        t.auto_paused = false;
+        if t.private {
+            // Rule 2, as when the metadata arrives unheld.
+            t.pex = super::pex::State::default();
+        }
+        (t.id, t.private)
+    };
+    tracing::info!(torrent = id.0, private, "metadata received; held");
+    ctx.emit(Event::MetadataReceived { id });
+    pause(ctx, torrent).await;
+}
+
+/// `Session::release` (`start` false) and `resume` / `force_resume` on a
+/// held torrent (`start` true): create the files and check them, with the
+/// resume data the torrent was added with, then start or stay paused. A
+/// magnet still fetching its metadata is released from the hold before it
+/// takes effect.
+pub async fn release(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    start: bool,
+) -> Result<(), Error> {
+    let resume = {
+        let mut t = torrent.borrow_mut();
+        if !t.held {
+            if t.hold {
+                t.hold = false;
+                return Ok(());
+            }
+            return Err(Error::Busy("the torrent is not held"));
+        }
+        t.held = false;
+        t.checking = true;
+        if start {
+            t.paused = false;
+            t.auto_paused = false;
+        }
+        t.kept_resume.take()
+    };
+    let files_present = wanted_files_present(torrent);
+    if !content_missing(torrent, files_present, resume.as_ref())
+        && let Err(e) = create_files(torrent).await
+    {
+        fail_check(ctx, torrent, e.to_string());
+        return Ok(());
+    }
+    initial_check(ctx.clone(), torrent.clone(), files_present, resume).await;
+    Ok(())
 }
 
 /// Resume data or recheck, then start. A resume file only ever records pieces
@@ -1818,8 +1909,8 @@ pub fn resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
         let mut t = torrent.borrow_mut();
         // A paused torrent starts; so does one that is not paused but not
         // running either (outside the queue, just checked or added: the
-        // queue's `activate` hands it here).
-        if t.error.is_some() || (!t.paused && t.tasks_running) {
+        // queue's `activate` hands it here). A held one needs `release`.
+        if t.error.is_some() || t.held || (!t.paused && t.tasks_running) {
             return;
         }
         t.auto_paused = false;
@@ -2088,9 +2179,9 @@ async fn build_resume(
         peers,
         unfinished,
     };
-    if let Some(r) = &t.missing_resume {
-        // The content is missing: what the resume data vouched for stands
-        // until the files are back or a recheck replaces it.
+    if let Some(r) = &t.kept_resume {
+        // Not applied yet (the content is missing, or the torrent is held):
+        // what the resume data vouched for stands until a check replaces it.
         data.have = r.have.clone();
         data.unfinished = r.unfinished.clone();
     }
@@ -2753,7 +2844,7 @@ pub async fn recover(
         }
         uring::sleep(Duration::from_millis(50)).await;
     }
-    let missing_resume = {
+    let kept_resume = {
         let mut t = torrent.borrow_mut();
         t.error = None;
         t.error_kind = None;
@@ -2764,7 +2855,7 @@ pub async fn recover(
             t.paused = false;
             t.auto_paused = false;
         }
-        t.missing_resume.take()
+        t.kept_resume.take()
     };
     tracing::info!(torrent = torrent.borrow().id.0, ?kind, ?how, "recovering");
     match (how, kind) {
@@ -2775,7 +2866,7 @@ pub async fn recover(
                 fail_check(ctx, torrent, e.to_string());
                 return Ok(true);
             }
-            initial_check(ctx.clone(), torrent.clone(), files_present, missing_resume).await;
+            initial_check(ctx.clone(), torrent.clone(), files_present, kept_resume).await;
         }
         (Recovery::Resume, _) if !recheck_needed => {
             let storage = torrent.borrow().storage.clone();

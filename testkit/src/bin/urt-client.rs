@@ -50,6 +50,7 @@ struct Args {
     pex: bool,
     add_peers: Vec<std::net::SocketAddr>,
     file_priorities: Option<Vec<u8>>,
+    hold: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -78,6 +79,7 @@ fn parse_args() -> Result<Args> {
         pex: true,
         add_peers: Vec::new(),
         file_priorities: None,
+        hold: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -104,6 +106,7 @@ fn parse_args() -> Result<Args> {
             "--no-v6" => a.no_v6 = true,
             "--exit-when-complete" => a.exit_when_complete = true,
             "--sequential" => a.sequential = true,
+            "--hold" => a.hold = true,
             "--upload-limit" => a.upload_limit = val()?.parse()?,
             "--download-limit" => a.download_limit = val()?.parse()?,
             "--encryption" => a.encryption = val()?,
@@ -200,6 +203,9 @@ async fn main() -> Result<()> {
     }
     if let Some(p) = &args.file_priorities {
         add = add.file_priorities(p.clone());
+    }
+    if args.hold {
+        add = add.hold_after_metadata(true);
     }
     let id = session.add_torrent(add).await.context("adding torrent")?;
     for p in &args.add_peers {
@@ -331,6 +337,7 @@ async fn main() -> Result<()> {
                     "reannounce" => session.force_reannounce(id).await?,
                     "save-resume" => session.save_resume_data(id).await?,
                     "recheck" => session.force_recheck(id).await?,
+                    "release" => session.release(id).await?,
                     "scrape" => {
                         let r = session.scrape(id).await?;
                         tracing::info!("scrape: {r:?}");

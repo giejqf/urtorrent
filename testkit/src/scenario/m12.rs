@@ -13,6 +13,7 @@ use anyhow::{Result, ensure};
 use serde_json::json;
 
 use super::{Ctx, ScenarioDef, Tag};
+use crate::client::ClientConfig;
 use crate::fixtures::{Fixture, FixtureSpec};
 use crate::lab::Shape;
 use crate::oracle::{Encryption, OracleConfig};
@@ -33,6 +34,12 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             shapes: &[Shape::V4],
             tags: &[Tag::Capture],
             run: capture_magnet_hold,
+        },
+        ScenarioDef {
+            name: "magnet_hold",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It, Tag::Diff],
+            run: magnet_hold,
         },
     ]
 }
@@ -299,5 +306,118 @@ fn capture_magnet_hold(ctx: &mut Ctx) -> Result<()> {
     let tp = ctx.file("tap-tracker-hold.jsonl");
     tracker.save_jsonl(&tp)?;
     ctx.artifact("tap-tracker-hold.jsonl", &tp);
+    Ok(())
+}
+
+/// Our client under the qbt profile, a magnet added with
+/// `hold_after_metadata`: what the tracker and the seed see must match the
+/// oracle's "stop condition: metadata received" (`capture_magnet_hold`):
+/// the same announces (`started` with the placeholder `left` before the
+/// metadata, then `stopped`), the metadata fetched and no piece requested,
+/// the connection dropped, nothing on disk. Resumed, it downloads.
+fn magnet_hold(ctx: &mut Ctx) -> Result<()> {
+    let golden = crate::scenario::golden_file("capture_magnet_hold", Shape::V4, "magnet-hold.json")
+        .ok_or_else(|| {
+            anyhow::anyhow!("no golden; run `cargo xtask capture capture_magnet_hold`")
+        })?;
+    let golden: serde_json::Value = serde_json::from_slice(&std::fs::read(golden)?)?;
+    let tracker = tap_tracker(ctx)?;
+    let fx = Arc::new(Fixture::generate(
+        FixtureSpec::small("hold.bin")
+            .with_size(1 << 20)
+            .with_piece_length(64 << 10)
+            .with_tracker(&tracker.http_url(0)),
+    ));
+    let seed_ip = ctx.host_alias(2)?;
+    let peer_addr = SocketAddr::new(seed_ip, 6890);
+    tracker.inject_peer(fx.info_hash, peer_addr, 0);
+    let tap_seed = TapPeer::start(
+        TapPeerConfig::new(fx.info_hash, Role::Seeder)
+            .listen(vec![peer_addr])
+            .fixture(fx.clone())
+            .encryption(TapEncryption::Disabled)
+            .linger(Duration::from_secs(8)),
+    )?;
+    let h = fx.info_hash_hex();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{h}&dn=hold.bin&tr={}",
+        crate::http::percent_encode(tracker.http_url(0).as_bytes())
+    );
+    let actor = ctx.actor("urt")?;
+    let mut client = crate::client::UrtClient::launch_magnet(
+        &actor,
+        ClientConfig::default()
+            .profile("qbt")
+            .encryption("disabled")
+            .lsd(false)
+            .hold(true),
+        &magnet,
+    )?;
+    client.wait_for(Duration::from_secs(60), "the hold", |s| s.state == "Held")?;
+    // Let the stop play out (stopped announce, the peer dropped).
+    ensure!(
+        tap_seed.wait_for(Duration::from_secs(10), |c| c
+            .iter()
+            .any(|c| c.closed_ms.is_some())),
+        "the seed's connection was not dropped"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let caps = tap_seed.captures();
+    let pieces_sent: usize = caps
+        .iter()
+        .flat_map(|c| c.events.iter())
+        .filter(|e| e.dir == "send" && e.kind == "piece")
+        .count();
+    let requests: usize = caps
+        .iter()
+        .flat_map(|c| c.events.iter())
+        .filter(|e| e.dir == "recv" && e.kind == "request")
+        .count();
+    let ours = announce_summary(&tracker.events(), 0);
+    let theirs = golden["held"]["announces"].clone();
+    ctx.note(format!("held: ours={ours:?} oracle={theirs}"));
+    ensure!(
+        serde_json::Value::Array(ours.clone()) == theirs,
+        "held announces differ: ours {ours:?}, oracle {theirs}"
+    );
+    ensure!(
+        pieces_sent == 0 && requests == 0,
+        "a held torrent requested {requests} blocks"
+    );
+    ensure!(
+        !client.save_path.join("hold.bin").exists(),
+        "a held torrent created its file"
+    );
+    ensure!(
+        client.status().is_some_and(|s| s.state == "Held"),
+        "no longer held"
+    );
+    // Start it: it must download.
+    client.command("resume")?;
+    client.wait_for(Duration::from_secs(60), "download after resume", |s| {
+        s.state == "Seeding"
+    })?;
+    fx.verify_data(&client.save_path)?
+        .map_err(|e| anyhow::anyhow!("data mismatch: {e}"))?;
+    let after: Vec<Option<String>> = announce_summary(&tracker.events(), 0)
+        .iter()
+        .map(|a| a["event"].as_str().map(str::to_string))
+        .collect();
+    let oracle_after: Vec<Option<String>> = golden["after_start_announces"]
+        .as_array()
+        .map(|v| {
+            v.iter()
+                .map(|a| a["event"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    ctx.note(format!(
+        "after resume: ours={after:?} oracle={oracle_after:?}"
+    ));
+    ensure!(
+        after.starts_with(&oracle_after),
+        "announces after resume differ: ours {after:?}, oracle {oracle_after:?}"
+    );
+    client.shutdown()?;
     Ok(())
 }

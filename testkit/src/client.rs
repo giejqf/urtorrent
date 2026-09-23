@@ -41,6 +41,8 @@ pub struct ClientConfig {
     pub add_peers: Vec<std::net::SocketAddr>,
     /// Initial file priorities.
     pub file_priorities: Option<Vec<u8>>,
+    /// `AddTorrent::hold_after_metadata` (`release` / `resume` controls).
+    pub hold: bool,
     /// Every `.torrent` in this directory is added as well.
     pub add_dir: Option<PathBuf>,
     /// Extra environment (e.g. `RUST_LOG`).
@@ -64,6 +66,7 @@ impl Default for ClientConfig {
             protocol: "both".into(),
             add_peers: Vec::new(),
             file_priorities: None,
+            hold: false,
             add_dir: None,
             env: vec![("RUST_LOG".into(), "debug".into())],
         }
@@ -100,6 +103,10 @@ impl ClientConfig {
 
     pub fn add_peer(mut self, a: std::net::SocketAddr) -> Self {
         self.add_peers.push(a);
+        self
+    }
+    pub fn hold(mut self, on: bool) -> Self {
+        self.hold = on;
         self
     }
     pub fn file_priorities(mut self, p: Vec<u8>) -> Self {
@@ -349,6 +356,9 @@ impl UrtClient {
         }
         if let Some(d) = &config.add_dir {
             cmd.arg("--add-dir").arg(d);
+        }
+        if config.hold {
+            cmd.arg("--hold");
         }
         if let Some(p) = &config.file_priorities {
             let csv: Vec<String> = p.iter().map(|x| x.to_string()).collect();

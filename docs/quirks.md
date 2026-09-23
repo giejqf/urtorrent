@@ -593,3 +593,25 @@ torrent states.
   libtorrent's `clear_error` resumes; a torrent that failed while checking
   checks again. Metadata that cannot be used (`ErrorKind::Metadata`) is the
   one error only removal clears.
+
+## Q29. Holding a torrent at its metadata
+
+Source: capture `capture_magnet_hold` (golden
+`testkit/golden/capture_magnet_hold/v4/magnet-hold.json`), checked against
+us by `magnet_hold` (`xtask diff`).
+
+- **A held magnet stops the way qBittorrent's "stop condition: metadata
+  received" does.** The oracle fetches the metadata, then stops the torrent:
+  `stopped` to the tracker (after the `started` that carried libtorrent's
+  placeholder `left=16384`), the connection to the peer that supplied the
+  metadata dropped, no `interested`, no request, no file on disk. The
+  daemon asked for held torrents to keep their peers; the oracle's
+  behaviour is the spec for what trackers and peers see, so peers are
+  dropped and found again on release.
+- **Starting it is a plain start.** The oracle announces `started` with the
+  real `left`, then `completed`; `Session::resume` on a held torrent does
+  the same after creating the files and checking them. `Session::release`
+  (check, stay paused) has no qBittorrent button; its "stop condition:
+  files checked" for a magnet is hold then release.
+- **The hold is not persisted.** A held torrent's resume data describes the
+  torrent without the hold; a caller that restarts re-adds it held.

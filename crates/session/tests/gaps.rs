@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{block_on, event_param, make_torrent, spawn_tracker};
+use common::{block_on, event_param, make_multi_torrent, make_torrent, spawn_tracker};
 use session::{AddTorrent, Session, SessionBuilder, TorrentId, TorrentState, TransportPolicy};
 
 fn init_log() {
@@ -275,5 +275,138 @@ fn an_io_error_is_recovered_by_resume_and_by_recheck() {
     assert_eq!(status(&a, a_id).pieces_have, status(&a, a_id).pieces_total);
     block_on(b.shutdown()).unwrap();
     block_on(a.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn magnet_for(bytes: &[u8], tracker: &str) -> String {
+    let hash = metainfo::Torrent::parse(bytes).unwrap().info.info_hash;
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    let tr: String = tracker
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    format!("magnet:?xt=urn:btih:{hex}&tr={tr}")
+}
+
+fn events_of(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|l| event_param(l))
+        .collect()
+}
+
+#[test]
+fn a_held_magnet_waits_with_its_metadata_until_released() {
+    // The daemon's metadata preview and its stop conditions: the magnet is
+    // held once the metadata is in (no file, no check, no piece; stopped as
+    // the oracle's "stop condition: metadata received" does), files are
+    // excluded and renamed while nothing exists, then release checks and
+    // stays paused, and resume downloads into the chosen layout.
+    let dir = tmp("hold");
+    let files = [("a.bin", 300_000usize), ("b.bin", 400_000)];
+    let (bytes, data) = make_multi_torrent("hold", &files, 64 * 1024, "http://127.0.0.1:1/x");
+    let a_dir = dir.join("a");
+    std::fs::create_dir_all(a_dir.join("hold")).unwrap();
+    std::fs::write(a_dir.join("hold/a.bin"), &data[..300_000]).unwrap();
+    std::fs::write(a_dir.join("hold/b.bin"), &data[300_000..]).unwrap();
+    let a = block_on(builder(1).build()).unwrap();
+    let a_id = block_on(a.add_torrent(AddTorrent::metainfo(bytes.clone(), &a_dir))).unwrap();
+    wait_state(&a, a_id, TorrentState::Seeding, 10);
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_tracker(addr_of(1, &a), log.clone());
+    let b_dir = dir.join("b");
+    let b = block_on(builder(2).build()).unwrap();
+    let id = block_on(b.add_torrent(
+        AddTorrent::magnet(magnet_for(&bytes, &url), &b_dir).hold_after_metadata(true),
+    ))
+    .unwrap();
+    wait_state(&b, id, TorrentState::Held, 20);
+    let st = status(&b, id);
+    assert!(st.has_metadata, "{st:?}");
+    assert_eq!(st.pieces_have, 0);
+    assert!(
+        !b_dir.join("hold").exists(),
+        "a held torrent creates nothing"
+    );
+    assert_eq!(block_on(b.files(id)).unwrap().len(), 2);
+    let tf = block_on(b.torrent_file(id)).unwrap().unwrap();
+    assert_eq!(
+        metainfo::Torrent::parse(&tf).unwrap().info.info_hash,
+        st.info_hash
+    );
+    // Stopped like the oracle: the tracker hears `stopped`, peers go.
+    wait_for("the stopped announce", 10, || {
+        events_of(&log).last().map(String::as_str) == Some("stopped")
+    });
+    wait_for("the peers to go", 10, || status(&b, id).peers == 0);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(status(&b, id).state, TorrentState::Held);
+
+    // Layout while nothing exists: skip a.bin, move b.bin.
+    block_on(b.set_file_priorities(id, vec![0, 4])).unwrap();
+    block_on(b.rename_file(id, 1, "hold/kept/b.bin".into())).unwrap();
+    assert!(!b_dir.join("hold").exists());
+
+    // Release: checked, then paused; the file exists where it was put.
+    block_on(b.release(id)).unwrap();
+    wait_state(&b, id, TorrentState::Paused, 10);
+    assert!(b_dir.join("hold/kept/b.bin").exists());
+    assert!(!b_dir.join("hold/a.bin").exists());
+    assert!(matches!(
+        block_on(b.release(id)),
+        Err(session::Error::Busy(_))
+    ));
+
+    // Resume: it downloads what is wanted and seeds.
+    let before = events_of(&log).len();
+    block_on(b.resume(id)).unwrap();
+    wait_state(&b, id, TorrentState::Seeding, 30);
+    assert_eq!(
+        std::fs::read(b_dir.join("hold/kept/b.bin")).unwrap(),
+        &data[300_000..]
+    );
+    assert!(!b_dir.join("hold/a.bin").exists());
+    assert!(events_of(&log)[before..].iter().any(|e| e == "started"));
+    block_on(b.shutdown()).unwrap();
+    block_on(a.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_held_torrent_file_is_held_at_once_and_removed_without_trace() {
+    let dir = tmp("hold-file");
+    let resume = dir.join("resume");
+    let (bytes, _) = make_torrent("h.bin", 256 * 1024, 64 * 1024, "http://127.0.0.1:1/x");
+    let s = block_on(builder(1).build()).unwrap();
+    let id = block_on(
+        s.add_torrent(
+            AddTorrent::metainfo(bytes, &dir)
+                .resume_dir(&resume)
+                .hold_after_metadata(true),
+        ),
+    )
+    .unwrap();
+    assert_eq!(status(&s, id).state, TorrentState::Held);
+    // Pausing and resuming-all leave nothing half-started: resume-all
+    // releases it like `resume`.
+    block_on(s.pause(id)).unwrap();
+    assert_eq!(status(&s, id).state, TorrentState::Held);
+    assert!(!dir.join("h.bin").exists());
+    block_on(s.remove_torrent(id)).unwrap();
+    assert!(!dir.join("h.bin").exists());
+    assert_eq!(
+        std::fs::read_dir(&resume).map(|d| d.count()).unwrap_or(0),
+        0,
+        "no resume file left behind"
+    );
+    block_on(s.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

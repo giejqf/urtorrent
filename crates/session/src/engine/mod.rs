@@ -240,6 +240,7 @@ pub enum Command {
         oneshot::Sender<Result<(), Error>>,
     ),
     ForceRecheck(TorrentId, oneshot::Sender<Result<(), Error>>),
+    Release(TorrentId, oneshot::Sender<Result<(), Error>>),
     Scrape(
         TorrentId,
         oneshot::Sender<Result<Vec<TrackerStatus>, Error>>,
@@ -1147,6 +1148,15 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         Command::ResumeAll(reply) => {
             let all: Vec<Rc<RefCell<Torrent>>> = ctx.torrents.borrow().values().cloned().collect();
             for t in all {
+                if t.borrow().held {
+                    // Held torrents are released and started too.
+                    t.borrow_mut().auto_managed = true;
+                    let ctx2 = ctx.clone();
+                    uring::spawn(async move {
+                        let _ = torrent::release(&ctx2, &t, true).await;
+                    });
+                    continue;
+                }
                 queue::mark_eligible(&t);
             }
             queue::recalculate(ctx, Instant::now());
@@ -1330,6 +1340,11 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             Some(t) => {
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
+                    if t.borrow().held {
+                        t.borrow_mut().auto_managed = false;
+                        let _ = reply.send(torrent::release(&ctx2, &t, true).await);
+                        return;
+                    }
                     if t.borrow().error.is_some() {
                         t.borrow_mut().auto_managed = false;
                         t.borrow_mut().auto_paused = false;
@@ -1376,7 +1391,14 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         },
         Command::Resume(id, reply) => match ctx.torrent(id) {
             Some(t) => {
-                if t.borrow().error.is_some() {
+                if t.borrow().held {
+                    let ctx2 = ctx.clone();
+                    uring::spawn(async move {
+                        // Released into the queue's hands.
+                        t.borrow_mut().auto_managed = true;
+                        let _ = reply.send(torrent::release(&ctx2, &t, true).await);
+                    });
+                } else if t.borrow().error.is_some() {
                     let ctx2 = ctx.clone();
                     uring::spawn(async move {
                         // Back in the queue's hands, then recovered: the
@@ -1610,10 +1632,26 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 let _ = reply.send(Err(Error::NoSuchTorrent));
             }
         },
+        Command::Release(id, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let ctx2 = ctx.clone();
+                uring::spawn(async move {
+                    let r = torrent::release(&ctx2, &t, false).await;
+                    let _ = reply.send(r);
+                });
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
         Command::ForceRecheck(id, reply) => match ctx.torrent(id) {
             Some(t) => {
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
+                    if t.borrow().held {
+                        let _ = reply.send(torrent::release(&ctx2, &t, false).await);
+                        return;
+                    }
                     let r = match torrent::recover(&ctx2, &t, torrent::Recovery::Recheck).await {
                         Ok(true) => Ok(()),
                         Ok(false) => {

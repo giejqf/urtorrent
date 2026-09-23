@@ -47,6 +47,7 @@ pub enum TorrentSource {
 
 /// Parameters for [`Session::add_torrent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AddTorrent {
     /// The torrent.
     pub source: TorrentSource,
@@ -93,6 +94,16 @@ pub struct AddTorrent {
     /// used instead of the `resume_dir` file, if both are given, and must
     /// belong to this torrent (the info-hash is checked).
     pub resume_data: Option<Vec<u8>>,
+    /// Hold the torrent once its metadata is known
+    /// ([`TorrentState::Held`]): no file created, no check, no piece
+    /// requested, until [`Session::release`] or [`Session::resume`]. For a
+    /// `.torrent` that is at once; for a magnet link, when the metadata
+    /// arrives, and the torrent then stops the way qBittorrent's "stop
+    /// condition: metadata received" does (`stopped` to the trackers, peers
+    /// dropped). Meanwhile [`Session::files`], [`Session::torrent_file`],
+    /// file priorities, renames and storage moves apply to files that do
+    /// not exist yet.
+    pub hold_after_metadata: bool,
 }
 
 impl AddTorrent {
@@ -112,6 +123,7 @@ impl AddTorrent {
             max_uploads: None,
             auto_managed: None,
             resume_data: None,
+            hold_after_metadata: false,
         }
     }
 
@@ -131,6 +143,7 @@ impl AddTorrent {
             max_uploads: None,
             auto_managed: None,
             resume_data: None,
+            hold_after_metadata: false,
         }
     }
 
@@ -197,6 +210,13 @@ impl AddTorrent {
     /// Resume data from an earlier run (see the field).
     pub fn resume_data(mut self, bytes: Vec<u8>) -> AddTorrent {
         self.resume_data = Some(bytes);
+        self
+    }
+
+    /// Hold the torrent once its metadata is known (see
+    /// [`AddTorrent::hold_after_metadata`](struct.AddTorrent.html#structfield.hold_after_metadata)).
+    pub fn hold_after_metadata(mut self, hold: bool) -> AddTorrent {
+        self.hold_after_metadata = hold;
         self
     }
 }
@@ -347,6 +367,10 @@ pub enum TorrentState {
     Paused,
     /// Stopped by an error (see `error` and `error_kind`).
     Error,
+    /// Metadata known, waiting for [`Session::release`] or
+    /// [`Session::resume`] ([`AddTorrent::hold_after_metadata`]): no file
+    /// created, no check run, stopped.
+    Held,
 }
 
 /// What stopped a torrent in [`TorrentState::Error`], and so what brings it
@@ -1446,7 +1470,8 @@ impl Session {
     /// starts when the [`ActiveLimits`] allow, else waits as
     /// `TorrentState::Queued`. [`Session::force_resume`] bypasses the queue.
     ///
-    /// An errored torrent is recovered first, by [`ErrorKind`]:
+    /// A held torrent is released and started. An errored torrent is
+    /// recovered first, by [`ErrorKind`]:
     /// `ContentMissing` looks for the files again (and stays errored while
     /// they are still gone), `Io` restarts and downloads again the pieces
     /// that were in progress (a torrent that failed while checking is
@@ -1520,12 +1545,21 @@ impl Session {
         self.send(|tx| Command::Scrape(id, tx)).await?
     }
 
+    /// Let a held torrent ([`TorrentState::Held`]) go on: its files are
+    /// created and checked, and it then stays paused
+    /// ([`Session::resume`] releases and starts it instead). A magnet still
+    /// fetching its metadata drops the hold. [`Error::Busy`] for a torrent
+    /// that is not held.
+    pub async fn release(&self, id: TorrentId) -> Result<(), Error> {
+        self.send(|tx| Command::Release(id, tx)).await?
+    }
+
     /// Drop peers and re-hash everything on disk; the have-set is rebuilt from
     /// what verifies. Resolves when the check is done. An errored torrent
     /// (other than [`ErrorKind::Metadata`], refused with [`Error::Busy`]) has
     /// its error cleared and its files created where missing first, so a
     /// torrent whose content went missing starts over from what the disk
-    /// holds.
+    /// holds. A held torrent is released (checked, and left paused).
     pub async fn force_recheck(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::ForceRecheck(id, tx)).await?
     }

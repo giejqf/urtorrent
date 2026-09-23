@@ -23,6 +23,18 @@ Breaking: `Event` and `TorrentState` are `#[non_exhaustive]` now, and
   `Error::Busy`. Before, all three returned `Ok` and did nothing.
 - `crates/session/tests/gaps.rs`; oracle captures `capture_missing_files`
   and `capture_magnet_hold` (goldens committed).
+- **Holding a torrent once its metadata is known**:
+  `AddTorrent::hold_after_metadata`, `TorrentState::Held`,
+  `Session::release`. No file is created and no check runs until
+  `release` (check, stay paused) or `resume` / `force_resume` (check,
+  start); `force_recheck` releases too. Meanwhile `files`, `torrent_file`,
+  file priorities, renames and storage moves apply to files that do not
+  exist yet: the daemon's metadata preview and its stop conditions without
+  races. A magnet stops as the oracle's "stop condition: metadata received"
+  does (`stopped` announce, peers dropped; docs/quirks.md Q29), checked by
+  the lab scenario `magnet_hold`. `urt-client --hold`, control `release`.
+- `AddTorrent` is `#[non_exhaustive]` (build it with its constructors and
+  builder methods).
 
 ### Changed
 

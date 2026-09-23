@@ -118,7 +118,7 @@ fn entry(t: &Torrent, now: Instant) -> Entry {
         seed: t.is_complete(),
         running: !t.paused,
         auto_managed: t.auto_managed,
-        eligible: t.error.is_none() && !t.checking && (!t.paused || t.auto_paused),
+        eligible: t.error.is_none() && !t.checking && !t.held && (!t.paused || t.auto_paused),
         inactive: t.is_inactive(now),
     }
 }
@@ -165,7 +165,7 @@ pub fn recalculate(ctx: &Rc<Ctx>, now: Instant) {
 pub fn mark_eligible(t: &Rc<RefCell<Torrent>>) {
     let mut tb = t.borrow_mut();
     tb.auto_managed = true;
-    if tb.paused && tb.error.is_none() {
+    if tb.paused && tb.error.is_none() && !tb.held {
         tb.auto_paused = true;
     }
 }
