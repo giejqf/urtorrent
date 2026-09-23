@@ -269,7 +269,7 @@ fn set_profile_changes_the_identity_new_connections_carry() {
         .collect();
     assert_eq!(ids.len(), 3, "{lines:?}");
     assert_eq!(ids[0].0, "started");
-    assert!(ids[0].1.starts_with("-UR0B30-"), "{ids:?}");
+    assert!(ids[0].1.starts_with("-UR0B40-"), "{ids:?}");
     assert_eq!(ids[1].0, "stopped");
     assert_eq!(ids[1].1, ids[0].1, "stopped under the old id");
     assert_eq!(ids[2].0, "started");

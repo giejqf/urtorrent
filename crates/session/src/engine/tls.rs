@@ -12,6 +12,7 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use uring::{Buffer, TcpStream};
 
@@ -26,9 +27,7 @@ impl TlsClient {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         for pem in extra_roots {
-            let mut cursor = std::io::Cursor::new(pem);
-            for cert in rustls_pemfile::certs(&mut cursor) {
-                let cert: CertificateDer<'static> = cert.map_err(|e| format!("bad CA pem: {e}"))?;
+            for cert in pem_certs(pem)? {
                 roots
                     .add(cert)
                     .map_err(|e| format!("bad CA certificate: {e}"))?;
@@ -54,6 +53,14 @@ impl TlsClient {
             .into_iter()
             .collect()
     }
+}
+
+/// The certificates of a PEM bundle; other sections (keys, parameters) and
+/// text around them are skipped, a malformed certificate is an error.
+fn pem_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, String> {
+    CertificateDer::pem_slice_iter(pem)
+        .map(|c| c.map_err(|e| format!("bad CA pem: {e}")))
+        .collect()
 }
 
 /// A TLS session over a uring TCP stream.
@@ -165,5 +172,45 @@ impl TlsStream {
             self.flush().await?;
             self.read_records().await?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// A self-signed test CA (P-256, valid until 2126).
+    const CA: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBjzCCATWgAwIBAgIUUTs5zcSzVlQhTmwFwuJUUktDPwgwCgYIKoZIzj0EAwIw
+HDEaMBgGA1UEAwwRdXJ0b3JyZW50IHRlc3QgQ0EwIBcNMjYwOTIzMDY0MTUzWhgP
+MjEyNjA4MzAwNjQxNTNaMBwxGjAYBgNVBAMMEXVydG9ycmVudCB0ZXN0IENBMFkw
+EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERnnEl6iXl3muXkJEthwXy6fjQOvVtGes
+qiUjnjSKJRxL5fb1bTW0GhJZz4Qxw1U7px61laU85uvX6DVyLz2poqNTMFEwHQYD
+VR0OBBYEFOnh1DhyGtFfiFjp9Kwhb8Fltod/MB8GA1UdIwQYMBaAFOnh1DhyGtFf
+iFjp9Kwhb8Fltod/MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIh
+AJ/pt6Y1VuBTuHJGORuymlCrt76UdWryvC08jklxxkEXAiBnwyFfcvrEi7mMT63o
+bjoTPMwadd7Fylj3pQ4roKgdIg==
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn a_bundle_yields_its_certificates_and_skips_the_rest() {
+        let bundle = format!(
+            "a CA bundle\n-----BEGIN EC PARAMETERS-----\nBggqhkjOPQMBBw==\n-----END EC PARAMETERS-----\n{CA}{CA}"
+        );
+        assert_eq!(pem_certs(bundle.as_bytes()).unwrap().len(), 2);
+        assert!(pem_certs(b"no pem here").unwrap().is_empty());
+        assert!(TlsClient::new(&[CA.as_bytes().to_vec()]).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_certificate_is_refused() {
+        let broken = CA.replacen("MIIB", "M!!B", 1);
+        let err = pem_certs(broken.as_bytes()).err().unwrap();
+        assert!(err.starts_with("bad CA pem"), "{err}");
+        assert!(TlsClient::new(&[broken.into_bytes()]).is_err());
     }
 }

@@ -27,6 +27,13 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+[advisories]
+# RustSec advisories for the library graph: vulnerabilities always fail, and
+# so does an unmaintained crate. Replace it; ignore one here only with a
+# reason and a link.
+unmaintained = "all"
+ignore = []
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

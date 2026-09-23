@@ -351,7 +351,7 @@ mod tests {
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.starts_with("GET /abc123/announce.php?x=1&info_hash="));
         assert!(s.contains("\r\nHost: pt.example\r\n"));
-        assert!(s.contains("\r\nUser-Agent: urtorrent/0.11.3\r\n"));
+        assert!(s.contains("\r\nUser-Agent: urtorrent/0.11.4\r\n"));
     }
 
     #[test]

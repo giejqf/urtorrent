@@ -434,6 +434,9 @@ Each milestone ends with its integration scenarios green in CI.
   diffing.
 - Dependencies: keep the tree small; every new dependency is justified in the PR. Crypto
   primitives (SHA-1, SHA-256, RC4, DH bignum) come from audited crates, not hand-rolled.
+  `xtask check` runs `cargo deny check advisories`: a RustSec advisory against the library
+  graph, an unmaintained crate included, fails it. Replace the crate; an `ignore` entry in
+  `deny.toml` needs a reason and a link.
 - Commands (create in M0, keep working forever):
   - `cargo xtask check` - fmt, clippy `-D warnings`, unit + property tests, doc build
   - `cargo xtask doctor` - kernel version, uring probe, seccomp/sysctl, memlock, Docker

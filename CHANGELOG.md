@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.4] - 2026-09-23
+
+### Changed
+
+- **`rustls-pemfile` is gone** (unmaintained, RUSTSEC-2025-0134). The PEM
+  bundles given as extra TLS roots, and `SSL_CERT_FILE`, are parsed with
+  `rustls-pki-types`' `PemObject`, the code `rustls-pemfile` wrapped and a
+  crate `rustls` already brings in, so the dependency tree loses a crate
+  and nothing is added. The same sections are accepted: certificates are
+  taken, other sections and surrounding text skipped, a malformed
+  certificate refused. testkit's unused `rustls-pemfile` dependency is
+  dropped too.
+- `cargo xtask check` runs `cargo deny check advisories` for the library
+  graph: a RustSec advisory, an unmaintained crate included, fails the
+  check (`deny.toml` `[advisories]`, AGENTS.md section 9).
+- The `native` profile's identity strings are `-UR0B40-` / `urtorrent/0.11.4`
+  / DHT `UR\x00\x0b`.
+
 ## [0.11.3] - 2026-09-23
 
 ### Fixed

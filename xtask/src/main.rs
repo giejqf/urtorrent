@@ -419,7 +419,9 @@ fn semver_policy() -> Result<()> {
     )
 }
 
-/// AGENTS.md 5.3 enforcement #2: cargo-deny bans and the tokio feature audit.
+/// AGENTS.md 5.3 enforcement #2: cargo-deny bans and the tokio feature audit,
+/// plus the RustSec advisories for the library graph (fetches the advisory
+/// database, so a newly published advisory fails the check on its own).
 fn dependency_policy() -> Result<()> {
     let libs = existing_lib_crates();
     if libs.is_empty() {
@@ -435,11 +437,13 @@ fn dependency_policy() -> Result<()> {
             .unwrap_or(false)
         {
             run(
-                cargo().args(["deny", "check", "bans", "licenses", "sources"]),
+                cargo().args(["deny", "check", "bans", "licenses", "sources", "advisories"]),
                 "cargo deny",
             )?;
         } else {
-            eprintln!("warning: cargo-deny not installed; skipping bans check (CI runs it)");
+            eprintln!(
+                "warning: cargo-deny not installed; skipping bans and advisories (CI runs them)"
+            );
         }
     }
     // tokio feature audit: `cargo tree -e features` under each library crate.
