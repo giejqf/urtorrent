@@ -28,7 +28,7 @@ pub use api::{
     ActiveLimits, AddTorrent, EncryptionMode, ErrorKind, Event, EventStream, FileStatus, PeerInfo,
     PeerSource, PeerTransport, PieceInfo, PieceState, QueueMove, Session, SessionBuilder,
     SessionSettings, SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus,
-    TrackerStatus, TransportPolicy,
+    TrackerEndpoint, TrackerStatus, TransportPolicy,
 };
 pub use profile::Profile;
 

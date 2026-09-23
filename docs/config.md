@@ -20,9 +20,9 @@ snapshots and the public operations is the frontend's, and stays out.
 | Queue | `active_limits` (`downloads` / `seeds` / `total` / `count_slow`, + `set_active_limits`) | `auto_managed` (+ `set_auto_managed`, `force_resume`, `move_in_queue`); `pause` leaves the queue, `resume` rejoins it |
 | Transports | `transports` (`TcpOnly` / `PreferTcp` / `PreferUtp` / `UtpOnly`, + `set_transports`), `encryption` (`Disabled` / `Enabled` / `Forced`, + `set_encryption`) | |
 | Discovery | `pex` (+ `set_pex`), `lsd` (+ `set_lsd`), `dht` (+ `set_dht`), `dht_bootstrap_nodes`, `dht_read_only`, `dht_state` | `add_peer`, `add_tracker` / `remove_tracker`, `add_web_seed` / `remove_web_seed`, `force_reannounce`, `scrape` |
-| Peers | `ban_ip` / `unban_ip` / `banned_ips` (session-wide) | |
-| Storage | `max_open_files`, `disk_thread`, `max_checking`, `piece_extent_affinity` | `save_path`, `resume_dir`, `preallocate`, `file_priorities` (+ `set_file_priorities`), `sequential` (+ `set_sequential`), `rename_file`, `move_storage`, `force_recheck`, `save_resume_data` |
-| Engine | `hash_threads`, `recv_ring`, `zero_copy_send`, `max_concurrent_announces`, `root_certificate_pem` | `paused` |
+| Peers | `ban_ip` / `unban_ip` / `banned_ips`, `ban_ip_range` / `unban_ip_range` / `banned_ip_ranges` (session-wide) | |
+| Storage | `max_open_files`, `disk_thread`, `max_checking`, `piece_extent_affinity` | `save_path`, `resume_dir`, `preallocate`, `file_priorities` (+ `set_file_priorities`), `set_piece_priorities`, `sequential` (+ `set_sequential`), `rename_file`, `move_storage`, `force_recheck`, `save_resume_data` |
+| Engine | `hash_threads`, `recv_ring`, `zero_copy_send`, `max_concurrent_announces`, `root_certificate_pem` | `paused`, `hold_after_metadata` (+ `release`) |
 
 `Session::settings()` returns the values in force. Everything a
 preferences page exposes changes live; only the engine tuning row
@@ -75,8 +75,13 @@ frontend-side state (save path, paused, categories, tags, ...).
 - **Interface names**: resolve to addresses and pass `listen_v4` /
   `listen_v6`.
 - **Port randomisation**: pick and pass `listen_port`.
-- **IP filter files**: file formats are a non-goal (AGENTS.md 1); a
-  programmatic block list is on the candidate list below.
+- **IP filter files**: file formats are a non-goal (AGENTS.md 1); read the
+  file and pass its ranges to `ban_ip_range`.
+- **First and last piece first**: set those pieces to priority 7 with
+  `set_piece_priorities` (qBittorrent does the same through libtorrent's
+  `prioritize_pieces`).
+- **Incomplete-file suffix** (`.!qB`): rename with `rename_file`, and back
+  on `Event::FileCompleted` (qBittorrent does the renaming itself too).
 
 ## Not offered, on purpose or for now
 
@@ -90,8 +95,6 @@ frontend-side state (save path, paused, categories, tags, ...).
 | `connection_speed` / half-open limit | engine constant (10) |
 | peer / request / inactivity timeouts | libtorrent's defaults as constants (L3) |
 | `min_reconnect_time` | libtorrent's 60 s; `add_peer` bypasses it |
-| piece priorities / first-and-last-piece first | candidate: `set_piece_priorities` |
-| IP block list by range (`ip_filter`) | `ban_ip` bans single addresses; ranges are a candidate |
 | `seed_mode` / "skip hash check" on add | not offered: advertising unverified pieces would break rule 1; a lazy per-piece verify is the honest form and a candidate |
 | content layout (subfolder / no subfolder) | `rename_file` covers the effect per file; no add-time switch |
 | proxies, UPnP / NAT-PMP, share mode, super-seeding | non-goals or roadmap (AGENTS.md 1, 4) |

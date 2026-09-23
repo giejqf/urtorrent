@@ -40,7 +40,7 @@ pub use session::{
     ActiveLimits, AddTorrent, EncryptionMode, Error, ErrorKind, Event, EventStream, FileStatus,
     PeerInfo, PeerSource, PeerTransport, PieceInfo, PieceState, QueueMove, Session, SessionBuilder,
     SessionSettings, SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus,
-    TrackerStatus, TransportPolicy,
+    TrackerEndpoint, TrackerStatus, TransportPolicy,
 };
 
 /// This library's version (`CARGO_PKG_VERSION`), for a frontend's "about".

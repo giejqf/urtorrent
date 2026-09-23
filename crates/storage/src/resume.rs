@@ -50,9 +50,10 @@ fn compact_peers(peers: &[SocketAddr]) -> (Vec<u8>, Vec<u8>) {
 /// renamed file paths (`mapped_files`); version 6 the trackers, web seeds,
 /// timestamps, last peers and the unfinished pieces' written ranges (the
 /// self-contained blob of `Session::resume_data`); version 7 the activity
-/// times (`last_seen_complete`, `last_download`, `last_upload`); all
-/// optional on read.
-pub const FORMAT_VERSION: i64 = 7;
+/// times (`last_seen_complete`, `last_download`, `last_upload`); version 8
+/// piece priorities set directly (`piece_priorities`); all optional on
+/// read.
+pub const FORMAT_VERSION: i64 = 8;
 
 /// Decoded resume data for one torrent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +120,9 @@ pub struct ResumeData {
     pub last_download: Option<u64>,
     /// When payload last left, unix seconds (v7; libtorrent `last_upload`).
     pub last_upload: Option<u64>,
+    /// Piece priorities set directly, one per piece (v8; empty = derived
+    /// from the file priorities; libtorrent `piece_priority`).
+    pub piece_priorities: Vec<u8>,
 }
 
 /// Most peers kept in resume data.
@@ -162,6 +166,7 @@ impl ResumeData {
             last_seen_complete: None,
             last_download: None,
             last_upload: None,
+            piece_priorities: Vec::new(),
         }
     }
 
@@ -290,6 +295,9 @@ impl ResumeData {
                         entries.push((key, Value::Int(t.min(i64::MAX as u64) as i64)));
                     }
                 }
+            }
+            if self.format_version >= 8 && !self.piece_priorities.is_empty() {
+                entries.push((b"piece_priorities", Value::Bytes(&self.piece_priorities)));
             }
             if !peers4.is_empty() {
                 entries.push((b"peers", Value::Bytes(&peers4)));
@@ -488,6 +496,13 @@ impl ResumeData {
                 .and_then(Value::as_int)
                 .filter(|c| *c > 0)
                 .map(|c| c as u64),
+            // One byte per piece; out-of-range values are clamped, a length
+            // that does not match the torrent is ignored on load.
+            piece_priorities: v
+                .get_str("piece_priorities")
+                .and_then(Value::as_bytes)
+                .map(|b| b.iter().map(|p| (*p).min(crate::MAX_PRIORITY)).collect())
+                .unwrap_or_default(),
             peers: {
                 let mut peers = Vec::new();
                 if let Some(b) = v.get_str("peers").and_then(Value::as_bytes) {
@@ -641,7 +656,21 @@ mod tests {
             last_seen_complete: Some(1_700_000_200),
             last_download: Some(1_700_000_150),
             last_upload: None,
+            piece_priorities: vec![7, 4, 4, 0, 4, 4, 4, 4, 4, 7],
         }
+    }
+
+    /// A version-7 file (no piece priorities) still loads.
+    #[test]
+    fn reads_format_version_7() {
+        let mut v7 = sample();
+        v7.format_version = 7;
+        let bytes = v7.encode();
+        assert!(!bytes.windows(16).any(|w| w == b"piece_priorities"));
+        let back = ResumeData::decode(&bytes).unwrap();
+        assert_eq!(back.format_version, 7);
+        assert!(back.piece_priorities.is_empty());
+        assert_eq!(back.last_seen_complete, v7.last_seen_complete);
     }
 
     /// A version-6 file (no activity times) still loads.

@@ -27,7 +27,7 @@ pub mod udp;
 mod url;
 
 pub use announce::{AnnounceEvent, AnnounceRequest, AnnounceResponse, MAX_PEERS};
-pub use announcer::{AnnounceJob, Announcer, TrackerSnapshot};
+pub use announcer::{AnnounceJob, Announcer, EndpointSnapshot, TrackerSnapshot};
 pub use url::Url;
 
 /// A tracker-layer error.

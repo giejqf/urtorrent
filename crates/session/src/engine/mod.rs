@@ -14,6 +14,7 @@ mod dht;
 mod dns;
 mod external_ip;
 mod http;
+mod ipranges;
 mod listen;
 mod local;
 mod lsd;
@@ -194,6 +195,8 @@ pub enum Command {
     SetLsd(bool, oneshot::Sender<()>),
     BanIp(IpAddr, bool, oneshot::Sender<()>),
     BannedIps(oneshot::Sender<Vec<IpAddr>>),
+    BanIpRange(IpAddr, IpAddr, bool, oneshot::Sender<Result<(), Error>>),
+    BannedIpRanges(oneshot::Sender<Vec<(IpAddr, IpAddr)>>),
     Settings(oneshot::Sender<crate::api::SessionSettings>),
     SetListen(
         u16,
@@ -212,6 +215,8 @@ pub enum Command {
         TorrentId,
         oneshot::Sender<Result<Vec<TrackerStatus>, Error>>,
     ),
+    SetPiecePriorities(TorrentId, Vec<u8>, oneshot::Sender<Result<(), Error>>),
+    PiecePriorities(TorrentId, oneshot::Sender<Result<Vec<u8>, Error>>),
     Pieces(
         TorrentId,
         oneshot::Sender<Result<Vec<crate::api::PieceInfo>, Error>>,
@@ -336,6 +341,8 @@ pub struct Ctx {
     /// Addresses banned by the caller (`Session::ban_ip`): never dialled,
     /// never accepted, for every torrent.
     banned_ips: RefCell<HashSet<IpAddr>>,
+    /// Address ranges banned by the caller (`Session::ban_ip_range`).
+    banned_ranges: RefCell<ipranges::IpRanges>,
     /// Next queue position handed to an added torrent.
     next_queue_position: Cell<u64>,
     /// Payload bytes copied in user space by connections since closed (live
@@ -474,6 +481,29 @@ impl Ctx {
         self.listen_v6.get()
     }
 
+    /// The listen address of each tracker endpoint, in the announcer's
+    /// endpoint order (`Families::endpoints`).
+    pub fn endpoint_addrs(&self) -> Vec<SocketAddr> {
+        let port = self.listen_port();
+        self.families()
+            .endpoints()
+            .into_iter()
+            .map(|v6| {
+                if v6 {
+                    SocketAddr::new(
+                        self.listen_v6().unwrap_or(Ipv6Addr::UNSPECIFIED).into(),
+                        port,
+                    )
+                } else {
+                    SocketAddr::new(
+                        self.listen_v4().unwrap_or(Ipv4Addr::UNSPECIFIED).into(),
+                        port,
+                    )
+                }
+            })
+            .collect()
+    }
+
     /// The identity profile in force.
     pub fn profile(&self) -> Profile {
         self.profile.borrow().clone()
@@ -531,7 +561,7 @@ impl Ctx {
 
     /// Whether the caller banned `ip` (`Session::ban_ip`).
     pub fn is_banned_ip(&self, ip: IpAddr) -> bool {
-        self.banned_ips.borrow().contains(&ip)
+        self.banned_ips.borrow().contains(&ip) || self.banned_ranges.borrow().contains(ip)
     }
 
     /// A fresh queue position at the back of the queue.
@@ -855,6 +885,7 @@ pub fn run(
             pex: Cell::new(cfg.pex),
             lsd_on: Cell::new(cfg.lsd),
             banned_ips: RefCell::new(HashSet::new()),
+            banned_ranges: RefCell::new(ipranges::IpRanges::default()),
             next_queue_position: Cell::new(0),
             copied: Cell::new(0),
             own_ips: RefCell::new(HashSet::new()),
@@ -1281,6 +1312,32 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             }
             let _ = reply.send(());
         }
+        Command::BanIpRange(first, last, on, reply) => {
+            if first.is_ipv4() != last.is_ipv4() || first > last {
+                let _ = reply.send(Err(Error::InvalidArgument(format!(
+                    "{first}..={last} is not a range of one family"
+                ))));
+                return;
+            }
+            if on {
+                ctx.banned_ranges.borrow_mut().insert(first, last);
+                for t in ctx.torrents.borrow().values() {
+                    let t = t.borrow();
+                    for p in t.peers.values() {
+                        let ip = p.addr.ip();
+                        if first <= ip && ip <= last {
+                            p.close("banned");
+                        }
+                    }
+                }
+            } else {
+                ctx.banned_ranges.borrow_mut().remove(first, last);
+            }
+            let _ = reply.send(Ok(()));
+        }
+        Command::BannedIpRanges(reply) => {
+            let _ = reply.send(ctx.banned_ranges.borrow().ranges());
+        }
         Command::BannedIps(reply) => {
             let mut v: Vec<IpAddr> = ctx.banned_ips.borrow().iter().copied().collect();
             v.sort();
@@ -1421,8 +1478,12 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             let r = ctx
                 .torrent(id)
                 .map(|t| {
-                    t.borrow()
-                        .status(Instant::now(), queue_index(&positions, id), true)
+                    t.borrow().status(
+                        Instant::now(),
+                        queue_index(&positions, id),
+                        true,
+                        &ctx.endpoint_addrs(),
+                    )
                 })
                 .ok_or(Error::NoSuchTorrent);
             let _ = reply.send(r);
@@ -1436,7 +1497,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 .values()
                 .map(|t| {
                     let t = t.borrow();
-                    t.status(now, queue_index(&positions, t.id), false)
+                    t.status(now, queue_index(&positions, t.id), false, &[])
                 })
                 .collect();
             v.sort_by_key(|s| s.id);
@@ -1464,7 +1525,27 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         Command::Trackers(id, reply) => {
             let r = ctx
                 .torrent(id)
-                .map(|t| t.borrow().trackers(Instant::now()))
+                .map(|t| t.borrow().trackers(Instant::now(), &ctx.endpoint_addrs()))
+                .ok_or(Error::NoSuchTorrent);
+            let _ = reply.send(r);
+        }
+        Command::SetPiecePriorities(id, prios, reply) => {
+            let r = match ctx.torrent(id) {
+                Some(t) => torrent::set_piece_priorities(ctx, &t, prios),
+                None => Err(Error::NoSuchTorrent),
+            };
+            let _ = reply.send(r);
+        }
+        Command::PiecePriorities(id, reply) => {
+            let r = ctx
+                .torrent(id)
+                .map(|t| {
+                    t.borrow()
+                        .pieces()
+                        .into_iter()
+                        .map(|p| p.priority)
+                        .collect()
+                })
                 .ok_or(Error::NoSuchTorrent);
             let _ = reply.send(r);
         }
@@ -1672,7 +1753,9 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
                     tracker_task::scrape_all(&ctx2, &t).await;
-                    let st = t.borrow().status(Instant::now(), 0, true);
+                    let st = t
+                        .borrow()
+                        .status(Instant::now(), 0, true, &ctx2.endpoint_addrs());
                     let _ = reply.send(Ok(st.trackers));
                 });
             }

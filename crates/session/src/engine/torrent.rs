@@ -129,6 +129,12 @@ pub struct Torrent {
     /// Addresses this torrent banned since the last look (for
     /// `Event::PeerBanned`).
     new_bans: Vec<IpAddr>,
+    /// Per `info.files` entry: pieces touching the file not verified yet
+    /// (`Event::FileCompleted` when one reaches 0 through a verify).
+    file_left: Vec<u32>,
+    /// Piece priorities were set directly (`set_piece_priorities`), not only
+    /// derived from the file priorities: resume data keeps them.
+    piece_priorities_set: bool,
     /// A resume blob given at add time (`AddTorrent::resume_data`), taking
     /// precedence over the resume directory's file.
     pub resume_blob: Option<Vec<u8>>,
@@ -426,9 +432,15 @@ impl Torrent {
 
     /// The status snapshot. `detailed` fills the per-file and per-tracker
     /// vectors (`Session::status`); `Session::statuses` leaves them empty.
-    pub fn status(&self, now: Instant, queue_position: usize, detailed: bool) -> TorrentStatus {
+    pub fn status(
+        &self,
+        now: Instant,
+        queue_position: usize,
+        detailed: bool,
+        endpoints: &[SocketAddr],
+    ) -> TorrentStatus {
         let trackers = if detailed {
-            self.trackers(now)
+            self.trackers(now, endpoints)
         } else {
             Vec::new()
         };
@@ -436,8 +448,9 @@ impl Torrent {
         self.status_with(now, queue_position, files, trackers)
     }
 
-    /// The tracker list as a status snapshot.
-    pub fn trackers(&self, now: Instant) -> Vec<TrackerStatus> {
+    /// The tracker list as a status snapshot; `endpoints` are the listen
+    /// addresses of the announcer's endpoints, in order.
+    pub fn trackers(&self, now: Instant, endpoints: &[SocketAddr]) -> Vec<TrackerStatus> {
         self.announcer
             .snapshot()
             .into_iter()
@@ -451,6 +464,23 @@ impl Torrent {
                 leechers: t.incomplete,
                 downloaded: t.downloaded,
                 next_announce_in: t.next_announce.map(|a| a.saturating_duration_since(now)),
+                updating: t.updating,
+                endpoints: t
+                    .endpoints
+                    .into_iter()
+                    .zip(endpoints)
+                    .filter(|(e, _)| e.enabled)
+                    .map(|(e, local)| crate::api::TrackerEndpoint {
+                        local: *local,
+                        working: e.working,
+                        updating: e.updating,
+                        fails: e.fails,
+                        last_error: e.last_error,
+                        seeders: e.complete,
+                        leechers: e.incomplete,
+                        next_announce_in: e.next_announce.map(|a| a.saturating_duration_since(now)),
+                    })
+                    .collect(),
             })
             .collect()
     }
@@ -552,6 +582,7 @@ impl Torrent {
                     PieceState::Missing
                 },
                 availability: self.picker.availability(i),
+                priority: self.picker.priority(i),
             })
             .collect();
         for i in self.picker.open_piece_indices() {
@@ -690,6 +721,61 @@ impl Torrent {
 
     /// Indices into `info.files` of the content (non-padding) files, in
     /// order: the public API numbers files this way.
+    /// Replace the have-set (a check's verdict) and recount what each file
+    /// still misses. Returns the bytes voided (see `Picker::set_have`).
+    fn set_have(&mut self, have: &Bitfield) -> u64 {
+        let discarded = self.picker.set_have(have);
+        self.file_left.clear();
+        if let Some(info) = self.info.clone() {
+            let plen = u64::from(info.piece_length.max(1));
+            self.file_left = info
+                .files
+                .iter()
+                .map(|f| {
+                    if f.is_padding() || f.length == 0 {
+                        return 0;
+                    }
+                    let first = (f.offset / plen) as usize;
+                    let last = ((f.offset + f.length - 1) / plen) as usize;
+                    (first..=last).filter(|p| !have.get(*p)).count() as u32
+                })
+                .collect();
+        }
+        discarded
+    }
+
+    /// A piece verified: the content files (public numbering) it completes.
+    fn files_completed_by(&mut self, piece: usize) -> Vec<usize> {
+        let Some(info) = self.info.clone() else {
+            return Vec::new();
+        };
+        if self.file_left.len() != info.files.len() {
+            return Vec::new();
+        }
+        let plen = u64::from(info.piece_length.max(1));
+        let start = piece as u64 * plen;
+        let end = start + plen;
+        let first = info.files.partition_point(|f| f.offset + f.length <= start);
+        let mut done = Vec::new();
+        for i in first..info.files.len() {
+            let f = &info.files[i];
+            if f.offset >= end {
+                break;
+            }
+            if f.is_padding() || f.length == 0 {
+                continue;
+            }
+            let left = &mut self.file_left[i];
+            if *left > 0 {
+                *left -= 1;
+                if *left == 0 {
+                    done.push(info.files[..i].iter().filter(|f| !f.is_padding()).count());
+                }
+            }
+        }
+        done
+    }
+
     fn content_indices(info: &metainfo::Info) -> Vec<usize> {
         info.files
             .iter()
@@ -1053,6 +1139,8 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         last_download: None,
         last_upload: None,
         new_bans: Vec::new(),
+        file_left: Vec::new(),
+        piece_priorities_set: false,
         resume_blob: params.resume_data.clone(),
         comment: extras.0,
         created_by: extras.1,
@@ -1391,6 +1479,7 @@ fn attach_metadata(
         }
         Some(prios)
     });
+    let explicit_files = requested.is_some();
     let initial: Option<Vec<u8>> = match requested {
         Some(p) => match expand_priorities(&info, &p) {
             Some(e) => Some(e),
@@ -1434,6 +1523,15 @@ fn attach_metadata(
     picker.set_extent_affinity(ctx.cfg.piece_extent_affinity);
     for (i, p) in storage.piece_priorities().into_iter().enumerate() {
         picker.set_priority(i, p);
+    }
+    // v8: piece priorities set directly, unless the caller chose the files'.
+    if let Some(r) = resume.filter(|r| {
+        !explicit_files && r.matches(&info) && r.piece_priorities.len() == info.piece_count()
+    }) {
+        for (i, p) in r.piece_priorities.iter().enumerate() {
+            picker.set_priority(i, *p);
+        }
+        t.piece_priorities_set = true;
     }
     t.new_epoch();
     t.metadata_size = raw.len().min(u32::MAX as usize) as u32;
@@ -1653,7 +1751,7 @@ async fn initial_check(
         }
     }
     // (The initial check: nothing was received into the picker yet.)
-    let _ = torrent.borrow_mut().picker.set_have(&have);
+    let _ = torrent.borrow_mut().set_have(&have);
     let restores = begin_restore(&torrent, &storage, &have, unfinished);
     finish_check(&ctx, &torrent, have, carried);
     finish_restore(&ctx, &torrent, &storage, restores).await;
@@ -1920,7 +2018,7 @@ fn finish_check_after_recheck(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, hav
         // bytes: they were downloaded and are being thrown away, so the
         // accounting says so (`downloaded - corrupt - redundant` stays the
         // torrent's size).
-        let discarded = t.picker.set_have(&have);
+        let discarded = t.set_have(&have);
         t.stats.redundant += discarded;
         t.checking = false;
         t.finished_emitted = t.is_complete();
@@ -2242,6 +2340,11 @@ async fn build_resume(
         last_seen_complete: t.last_seen_complete,
         last_download: t.last_download,
         last_upload: t.last_upload,
+        piece_priorities: if t.piece_priorities_set {
+            (0..t.piece_count()).map(|i| t.picker.priority(i)).collect()
+        } else {
+            Vec::new()
+        },
     };
     if let Some(r) = &t.kept_resume {
         // Not applied yet (the content is missing, or the torrent is held):
@@ -2537,7 +2640,15 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32, e
         let id = t.id;
         match result {
             Ok(true) => {
+                let completed = if t.picker.have(piece as usize) {
+                    Vec::new()
+                } else {
+                    t.files_completed_by(piece as usize)
+                };
                 t.picker.piece_verified(piece as usize);
+                for index in completed {
+                    ctx.emit(Event::FileCompleted { id, index });
+                }
                 for (_, ip) in t.suppliers.remove(&piece).unwrap_or_default() {
                     let _ = t.adjust_trust(ip, 1);
                 }
@@ -2698,10 +2809,58 @@ pub async fn set_file_priorities(
         (storage, expanded)
     };
     storage.set_file_priorities(&expanded).await?;
-    let mut t = torrent.borrow_mut();
-    for (i, p) in storage.piece_priorities().into_iter().enumerate() {
-        t.picker.set_priority(i, p);
+    {
+        let mut t = torrent.borrow_mut();
+        // File priorities decide every piece again (libtorrent's
+        // `prioritize_files` overrides `prioritize_pieces`).
+        for (i, p) in storage.piece_priorities().into_iter().enumerate() {
+            t.picker.set_priority(i, p);
+        }
+        t.piece_priorities_set = false;
     }
+    priorities_changed(ctx, torrent);
+    Ok(())
+}
+
+/// `Session::set_piece_priorities`: one priority per piece (0 = skip,
+/// 1..=7), over what the file priorities gave, until file priorities are
+/// set again. Pieces raised in a skipped file are stored in the parts file.
+pub fn set_piece_priorities(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    prios: Vec<u8>,
+) -> Result<(), Error> {
+    {
+        let mut t = torrent.borrow_mut();
+        if t.info.is_none() {
+            return Err(Error::Busy("metadata not known yet"));
+        }
+        let n = t.piece_count();
+        if prios.len() != n {
+            return Err(Error::InvalidArgument(format!(
+                "expected {n} piece priorities, got {}",
+                prios.len()
+            )));
+        }
+        if prios.iter().any(|p| *p > storage::MAX_PRIORITY) {
+            return Err(Error::InvalidArgument(format!(
+                "piece priorities must be 0..={}",
+                storage::MAX_PRIORITY
+            )));
+        }
+        for (i, p) in prios.into_iter().enumerate() {
+            t.picker.set_priority(i, p);
+        }
+        t.piece_priorities_set = true;
+    }
+    priorities_changed(ctx, torrent);
+    Ok(())
+}
+
+/// What changes with the wanted set: completion, `upload_only`, interest,
+/// requests, dialling.
+fn priorities_changed(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
+    let mut t = torrent.borrow_mut();
     t.resume_dirty = true;
     let now = Instant::now();
     if !t.is_complete() {
@@ -2729,7 +2888,6 @@ pub async fn set_file_priorities(
     if running {
         super::webseed::start(ctx, torrent);
     }
-    Ok(())
 }
 
 /// `Session::move_storage`: hold disk I/O, wait for in-flight writes and
@@ -2956,7 +3114,7 @@ pub async fn recover(
                 let mut t = torrent.borrow_mut();
                 let open: Vec<usize> = t.picker.open_piece_indices().collect();
                 let have = t.picker.have_bitfield();
-                let discarded = t.picker.set_have(&have);
+                let discarded = t.set_have(&have);
                 t.stats.redundant += discarded;
                 t.suppliers.retain(|p, _| have.get(*p as usize));
                 open

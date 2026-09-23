@@ -330,6 +330,9 @@ pub struct PieceInfo {
     pub state: PieceState,
     /// Connected peers (and web seeds) that have it.
     pub availability: u32,
+    /// Its download priority (0 = skipped, 1..=7): the highest of the files
+    /// it touches, unless set by [`Session::set_piece_priorities`].
+    pub priority: u8,
 }
 
 /// One content file in a status snapshot.
@@ -423,6 +426,34 @@ pub struct TrackerStatus {
     /// Completed downloads reported by a scrape.
     pub downloaded: Option<u32>,
     /// Time until the next scheduled announce.
+    pub next_announce_in: Option<Duration>,
+    /// An announce is in flight (any endpoint).
+    pub updating: bool,
+    /// The tracker per listen endpoint: it is announced once per listen
+    /// socket (libtorrent's `announce_endpoint`; docs/quirks.md Q9).
+    pub endpoints: Vec<TrackerEndpoint>,
+}
+
+/// One tracker as announced through one listen socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TrackerEndpoint {
+    /// The listen address announced from (unspecified when listening on
+    /// every address of the family).
+    pub local: SocketAddr,
+    /// The last announce through it succeeded.
+    pub working: bool,
+    /// An announce through it is in flight.
+    pub updating: bool,
+    /// Consecutive failures.
+    pub fails: u32,
+    /// Last error text.
+    pub last_error: Option<String>,
+    /// Seeders reported to this endpoint.
+    pub seeders: Option<u32>,
+    /// Leechers reported to this endpoint.
+    pub leechers: Option<u32>,
+    /// Time until its next scheduled announce.
     pub next_announce_in: Option<Duration>,
 }
 
@@ -915,6 +946,15 @@ pub enum Event {
         error: String,
         /// What kind of error (what brings the torrent back).
         kind: ErrorKind,
+    },
+    /// A content file became complete: the verify of its last missing
+    /// piece passed (libtorrent's `file_completed_alert`). Not sent for
+    /// files a check finds complete.
+    FileCompleted {
+        /// The torrent.
+        id: TorrentId,
+        /// The content file, numbered as in [`Session::files`].
+        index: usize,
     },
     /// The engine banned a peer on its own (it supplied pieces that failed
     /// their hash). Bans made through [`Session::ban_ip`] are not reported.
@@ -1414,6 +1454,21 @@ impl Session {
         self.send(|tx| Command::Pieces(id, tx)).await?
     }
 
+    /// Set every piece's priority (0 = skip, 1..=7; libtorrent's
+    /// `prioritize_pieces`), e.g. the first and last pieces of each file
+    /// first. It holds until file priorities are set again, which decide
+    /// every piece anew; resume data keeps it. [`Error::Busy`] before the
+    /// metadata is known.
+    pub async fn set_piece_priorities(&self, id: TorrentId, prios: Vec<u8>) -> Result<(), Error> {
+        self.send(|tx| Command::SetPiecePriorities(id, prios, tx))
+            .await?
+    }
+
+    /// Every piece's priority (empty until the metadata is known).
+    pub async fn piece_priorities(&self, id: TorrentId) -> Result<Vec<u8>, Error> {
+        self.send(|tx| Command::PiecePriorities(id, tx)).await?
+    }
+
     /// The torrent as a `.torrent` file: the info dictionary as received
     /// (byte-exact, so the info-hash matches), the current trackers as
     /// `announce` / `announce-list`, the web seeds as `url-list`, and the
@@ -1469,6 +1524,26 @@ impl Session {
     /// The addresses banned with [`Session::ban_ip`].
     pub async fn banned_ips(&self) -> Result<Vec<IpAddr>, Error> {
         self.send(Command::BannedIps).await
+    }
+
+    /// Ban every address in `first..=last` (one family; libtorrent's
+    /// `ip_filter` blocking rules, as an IP filter file lists them; reading
+    /// such files is the frontend's). Connected peers in the range are
+    /// dropped. [`Error::InvalidArgument`] for a mixed or reversed range.
+    pub async fn ban_ip_range(&self, first: IpAddr, last: IpAddr) -> Result<(), Error> {
+        self.send(|tx| Command::BanIpRange(first, last, true, tx))
+            .await?
+    }
+
+    /// Lift a ban on `first..=last`, splitting ranges it cuts through.
+    pub async fn unban_ip_range(&self, first: IpAddr, last: IpAddr) -> Result<(), Error> {
+        self.send(|tx| Command::BanIpRange(first, last, false, tx))
+            .await?
+    }
+
+    /// The banned ranges (merged, IPv4 first), as `(first, last)`.
+    pub async fn banned_ip_ranges(&self) -> Result<Vec<(IpAddr, IpAddr)>, Error> {
+        self.send(Command::BannedIpRanges).await
     }
 
     /// Hand a torrent to the queue (`true`: it runs when the

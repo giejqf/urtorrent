@@ -139,8 +139,32 @@ pub struct TrackerSnapshot {
     pub incomplete: Option<u32>,
     /// Completed downloads reported (scrape).
     pub downloaded: Option<u32>,
-    /// Per-endpoint `(enabled, working, start_sent)`.
-    pub endpoints: Vec<(bool, bool, bool)>,
+    /// Per listen endpoint, in the announcer's endpoint order.
+    pub endpoints: Vec<EndpointSnapshot>,
+}
+
+/// One tracker's state for one listen endpoint (libtorrent's
+/// `announce_endpoint`: a tracker is announced once per listen socket).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointSnapshot {
+    /// Announcing through this endpoint at all.
+    pub enabled: bool,
+    /// The last announce succeeded (after at least one success).
+    pub working: bool,
+    /// An announce is in flight.
+    pub updating: bool,
+    /// `started` has been sent.
+    pub start_sent: bool,
+    /// Consecutive failures.
+    pub fails: u32,
+    /// Next scheduled announce.
+    pub next_announce: Option<Instant>,
+    /// Last error message.
+    pub last_error: Option<String>,
+    /// Seeders reported to this endpoint.
+    pub complete: Option<u32>,
+    /// Leechers reported to this endpoint.
+    pub incomplete: Option<u32>,
 }
 
 /// The announce scheduler for one torrent.
@@ -564,7 +588,17 @@ impl Announcer {
                     endpoints: t
                         .endpoints
                         .iter()
-                        .map(|e| (e.enabled, e.is_working(), e.start_sent))
+                        .map(|e| EndpointSnapshot {
+                            enabled: e.enabled,
+                            working: e.is_working(),
+                            updating: e.updating,
+                            start_sent: e.start_sent,
+                            fails: e.fails,
+                            next_announce: e.next_announce,
+                            last_error: e.last_error.clone(),
+                            complete: e.complete,
+                            incomplete: e.incomplete,
+                        })
                         .collect(),
                 });
             }
@@ -739,7 +773,11 @@ mod tests {
         let snap = a.snapshot();
         assert!(snap[0].working);
         assert_eq!(
-            snap[0].endpoints,
+            snap[0]
+                .endpoints
+                .iter()
+                .map(|e| (e.enabled, e.working, e.start_sent))
+                .collect::<Vec<_>>(),
             vec![(true, true, true), (true, false, false)]
         );
         a.completed(t0 + Duration::from_secs(1));

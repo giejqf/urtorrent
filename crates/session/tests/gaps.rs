@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 urtorrent contributors
 
-//! What a daemon in front of the library needs (0.12.0): torrents outside
+//! What a daemon in front of the library needs. 0.12.0: torrents outside
 //! the queue start, errored torrents recover, a torrent whose content went
-//! missing says so instead of starting over, and removal leaves no resume
-//! file behind.
+//! missing says so instead of starting over, removal leaves no resume file
+//! behind, torrents hold at their metadata, list views get what they show.
+//! 0.13.0: tracker rows per listen endpoint, file completion, piece
+//! priorities, banned address ranges.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -521,5 +523,151 @@ fn a_peer_the_engine_bans_is_reported() {
         }
     }
     block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trackers_show_each_listen_endpoint() {
+    let dir = tmp("endpoints");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_tracker(SocketAddr::from(([127, 0, 0, 9], 9)), log);
+    let (bytes, data) = make_torrent("e.bin", 128 * 1024, 64 * 1024, &url);
+    std::fs::write(dir.join("e.bin"), &data).unwrap();
+    let s = block_on(builder(1).build()).unwrap();
+    let id = block_on(s.add_torrent(AddTorrent::metainfo(bytes, &dir))).unwrap();
+    wait_for("a working endpoint", 10, || {
+        block_on(s.trackers(id))
+            .unwrap()
+            .first()
+            .is_some_and(|t| t.endpoints.first().is_some_and(|e| e.working))
+    });
+    let t = block_on(s.trackers(id)).unwrap().remove(0);
+    assert_eq!(t.endpoints.len(), 1, "IPv4 only: one endpoint");
+    assert_eq!(t.endpoints[0].local, addr_of(1, &s));
+    assert!(!t.updating && !t.endpoints[0].updating);
+    assert_eq!(t.endpoints[0].seeders, Some(1));
+    assert!(t.endpoints[0].next_announce_in.is_some());
+    block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn each_file_completes_once_and_piece_priorities_hold_until_files_are_set() {
+    let dir = tmp("files");
+    let files = [
+        ("f0.bin", 150_000usize),
+        ("f1.bin", 200_000),
+        ("f2.bin", 250_000),
+    ];
+    let (bytes, data) = make_multi_torrent("fc", &files, 64 * 1024, "http://127.0.0.1:1/x");
+    let a_dir = dir.join("a");
+    std::fs::create_dir_all(a_dir.join("fc")).unwrap();
+    let mut off = 0;
+    for (name, len) in files {
+        std::fs::write(a_dir.join("fc").join(name), &data[off..off + len]).unwrap();
+        off += len;
+    }
+    let a = block_on(builder(1).build()).unwrap();
+    let mut a_events = a.events();
+    let a_id = block_on(a.add_torrent(AddTorrent::metainfo(bytes.clone(), &a_dir))).unwrap();
+    wait_state(&a, a_id, TorrentState::Seeding, 10);
+
+    // B wants the first two pieces only (f0 is 150 000 bytes: pieces 0-2).
+    let b_dir = dir.join("b");
+    let b = block_on(builder(2).build()).unwrap();
+    let mut events = b.events();
+    let id =
+        block_on(b.add_torrent(AddTorrent::metainfo(bytes.clone(), &b_dir).paused(true))).unwrap();
+    wait_state(&b, id, TorrentState::Paused, 10);
+    let n = status(&b, id).pieces_total;
+    let mut prios = vec![0u8; n];
+    prios[0] = 7;
+    prios[1] = 7;
+    assert!(matches!(
+        block_on(b.set_piece_priorities(id, vec![4; n - 1])),
+        Err(session::Error::InvalidArgument(_))
+    ));
+    block_on(b.set_piece_priorities(id, prios.clone())).unwrap();
+    assert_eq!(block_on(b.piece_priorities(id)).unwrap(), prios);
+    block_on(b.resume(id)).unwrap();
+    block_on(b.add_peer(id, addr_of(1, &a))).unwrap();
+    wait_state(&b, id, TorrentState::Seeding, 30);
+    assert_eq!(status(&b, id).pieces_have, 2, "only the wanted pieces");
+
+    // The pieces survive in resume data.
+    let blob = block_on(b.resume_data(id)).unwrap();
+    assert_eq!(
+        storage::ResumeData::decode(&blob).unwrap().piece_priorities,
+        prios
+    );
+
+    // File priorities decide every piece again: everything is wanted.
+    block_on(b.set_file_priorities(id, vec![4, 4, 4])).unwrap();
+    assert!(
+        block_on(b.piece_priorities(id))
+            .unwrap()
+            .iter()
+            .all(|p| *p == 4)
+    );
+    wait_state(&b, id, TorrentState::Seeding, 30);
+    let st = status(&b, id);
+    assert_eq!(st.pieces_have, st.pieces_total);
+
+    // Each file completed once, through a verify; the seed found its files
+    // by checking, which reports none.
+    let mut completed = Vec::new();
+    while let Some(e) = events.try_recv() {
+        if let session::Event::FileCompleted { id: fid, index } = e {
+            assert_eq!(fid, id);
+            completed.push(index);
+        }
+    }
+    completed.sort_unstable();
+    assert_eq!(completed, vec![0, 1, 2]);
+    while let Some(e) = a_events.try_recv() {
+        assert!(!matches!(e, session::Event::FileCompleted { .. }), "{e:?}");
+    }
+    block_on(b.shutdown()).unwrap();
+    block_on(a.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_banned_range_keeps_peers_out_until_lifted() {
+    let dir = tmp("ranges");
+    let (bytes, data) = make_torrent("r.bin", 256 * 1024, 64 * 1024, "http://127.0.0.1:1/x");
+    let a_dir = dir.join("a");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("r.bin"), &data).unwrap();
+    let a = block_on(builder(1).build()).unwrap();
+    let a_id = block_on(a.add_torrent(AddTorrent::metainfo(bytes.clone(), &a_dir))).unwrap();
+    wait_state(&a, a_id, TorrentState::Seeding, 10);
+
+    let b = block_on(builder(2).build()).unwrap();
+    let lo: std::net::IpAddr = "127.0.0.0".parse().unwrap();
+    let hi: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let v6: std::net::IpAddr = "::1".parse().unwrap();
+    assert!(matches!(
+        block_on(b.ban_ip_range(lo, v6)),
+        Err(session::Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        block_on(b.ban_ip_range(hi, lo)),
+        Err(session::Error::InvalidArgument(_))
+    ));
+    block_on(b.ban_ip_range(lo, hi)).unwrap();
+    assert_eq!(block_on(b.banned_ip_ranges()).unwrap(), vec![(lo, hi)]);
+    let id = block_on(b.add_torrent(AddTorrent::metainfo(bytes, dir.join("b")))).unwrap();
+    block_on(b.add_peer(id, addr_of(1, &a))).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let st = status(&b, id);
+    assert_eq!((st.peers, st.pieces_have), (0, 0), "{st:?}");
+
+    block_on(b.unban_ip_range(hi, hi)).unwrap();
+    assert_eq!(block_on(b.banned_ip_ranges()).unwrap(), vec![(lo, lo)]);
+    block_on(b.add_peer(id, addr_of(1, &a))).unwrap();
+    wait_state(&b, id, TorrentState::Seeding, 30);
+    block_on(b.shutdown()).unwrap();
+    block_on(a.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

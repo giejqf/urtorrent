@@ -28,10 +28,10 @@ docs/quirks.md Q28). The data is kept and saved back as it was:
 `Session::resume` tries it again once the files are back, and
 `Session::force_recheck` accepts what the disk holds instead.
 
-## What the blob holds (format 7)
+## What the blob holds (format 8)
 
-Bencoded dictionary, `format` = 7; every version reads every older version
-(format 1 → 7 are all accepted; fields absent in an older file take their
+Bencoded dictionary, `format` = 8; every version reads every older version
+(format 1 → 8 are all accepted; fields absent in an older file take their
 defaults).
 
 | Key | Meaning |
@@ -43,6 +43,7 @@ defaults).
 | `added_time`, `completed_time` | unix seconds |
 | `last_seen_complete`, `last_download`, `last_upload` | unix seconds (v7): a complete copy last seen (a connected seed, or ours), payload last received and sent, as libtorrent keeps them |
 | `file_priorities`, `mapped_files` | selection and renames (v2, v5) |
+| `piece_priorities` | one byte per piece, only when set with `set_piece_priorities` (v8); ignored when the caller gives file priorities on add |
 | `sequential`, `upload_limit`, `download_limit`, `max_peers`, `max_uploads` | per-torrent settings (v5); `AddTorrent`'s explicit values win |
 | `auto_managed`, `queue_position` | queue standing (v4) |
 | `trackers`, `web_seeds` | the lists as they stood (v6); they replace the metainfo's on load, like libtorrent's resume trackers, so trackers added or removed at runtime persist |

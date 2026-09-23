@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-09-23
+
+The optional items of the daemon's gap list (`../urtorrentd/docs/gaps.md`).
+Breaking: `TrackerStatus` gains fields (it is `#[non_exhaustive]`, so only
+struct literals outside the crate break) and `PieceInfo` gains `priority`.
+
+### Added
+
+- **Tracker rows per listen endpoint**: `TrackerStatus::endpoints`
+  (`TrackerEndpoint { local, working, updating, fails, last_error, seeders,
+  leechers, next_announce_in }`) and `TrackerStatus::updating`. A tracker is
+  announced once per listen socket (libtorrent's `announce_endpoint`, Q9);
+  the rows show each.
+- **`Event::FileCompleted { id, index }`** when the verify of a file's last
+  missing piece passes (libtorrent's `file_completed_alert`); per-file
+  counters keep it O(files touched) per piece. Not sent for files a check
+  finds complete.
+- **Piece priorities**: `Session::set_piece_priorities` /
+  `piece_priorities`, `PieceInfo::priority` (libtorrent's
+  `prioritize_pieces`; setting file priorities decides every piece again).
+  Resume data format 8 keeps priorities set this way (1-7 still load).
+  First-and-last-piece-first is then the frontend's, as in qBittorrent.
+- **Banned address ranges**: `Session::ban_ip_range` / `unban_ip_range` /
+  `banned_ip_ranges` (libtorrent's `ip_filter` blocking rules; reading
+  filter files stays the frontend's). Sorted, merged ranges per family:
+  a binary search per accept, dial and candidate.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0D00-` / `urtorrent/0.13.0`
+  / DHT `UR\x00\x0d`.
+
 ## [0.12.0] - 2026-09-23
 
 What a daemon in front of the library needs (`../urtorrentd/docs/gaps.md`).
