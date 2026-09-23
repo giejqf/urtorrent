@@ -383,6 +383,7 @@ impl Drop for Lab {
             return;
         }
         for ns in &self.actors {
+            kill_netns_processes(ns);
             let _ = ip(&["netns", "del", ns]);
         }
         firewall_allow(&self.bridge, false);
@@ -455,6 +456,7 @@ pub fn clean_all() -> Result<Vec<String>> {
     for l in nss.lines() {
         let name = l.split_whitespace().next().unwrap_or("");
         if name.starts_with(BRIDGE_PREFIX) && name.contains('-') {
+            kill_netns_processes(name);
             let _ = ip(&["netns", "del", name]);
             removed.push(name.to_string());
         }
@@ -634,6 +636,13 @@ impl Proc {
             stderr_path,
         };
         p.leaf = p.find_leaf(Duration::from_secs(5));
+        if p.leaf.is_none() {
+            tracing::warn!(
+                name,
+                sudo_pid = p.child.id(),
+                "no program pid found under the wrapper"
+            );
+        }
         tracing::debug!(name, sudo_pid = p.child.id(), leaf = ?p.leaf, "spawned");
         Ok(p)
     }
@@ -726,14 +735,37 @@ impl Proc {
         self.kill9()
     }
 
-    /// SIGKILL the program (simulates a crash) and reap the wrapper.
+    /// SIGKILL the program (simulates a crash) and reap the wrapper. Every
+    /// process under the wrapper is killed, not only the leaf found at spawn
+    /// time: a `kill -9` scenario whose program survived would read the
+    /// survivor's status and its relaunch would find the port taken (and
+    /// the namespace could not be torn down). Fails if anything survives.
     pub fn kill9(&mut self) -> Result<()> {
-        if let Some(pid) = self.leaf {
-            let _ = run(Command::new("kill").arg("-KILL").arg(pid.to_string()));
+        let mut pids: Vec<u32> = self.leaf.into_iter().collect();
+        pids.extend(descendants(self.child.id()));
+        pids.sort_unstable();
+        pids.dedup();
+        if !pids.is_empty() {
+            let mut k = sudo();
+            k.arg("kill").arg("-KILL");
+            for p in &pids {
+                k.arg(p.to_string());
+            }
+            let _ = run(&mut k);
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        Ok(())
+        let start = Instant::now();
+        loop {
+            let alive: Vec<u32> = pids.iter().copied().filter(|p| is_alive(*p)).collect();
+            if alive.is_empty() {
+                return Ok(());
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                bail!("{}: pids {alive:?} survived SIGKILL", self.name);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     pub fn stdout_log(&self) -> String {
@@ -747,6 +779,70 @@ impl Proc {
 impl Drop for Proc {
     fn drop(&mut self) {
         let _ = self.terminate(Duration::from_secs(10));
+    }
+}
+
+/// Every process below `pid` (children of all its threads, recursively).
+fn descendants(pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut todo = vec![pid];
+    while let Some(p) = todo.pop() {
+        let tasks: Vec<u32> = fs::read_dir(format!("/proc/{p}/task"))
+            .map(|d| {
+                d.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for t in tasks {
+            for c in fs::read_to_string(format!("/proc/{p}/task/{t}/children"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|s| s.parse::<u32>().ok())
+            {
+                if !out.contains(&c) {
+                    out.push(c);
+                    todo.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A process exists and is not a zombie waiting to be reaped.
+fn is_alive(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            // `pid (comm) S ...`: the state follows the last ')'.
+            s.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+        })
+        .is_some_and(|state| state != "Z" && state != "X")
+}
+
+/// Kill whatever still runs inside network namespace `ns` (an actor that
+/// outlived its scenario keeps the namespace and its veth alive, and the
+/// next lab could not create them), waiting until it is gone.
+fn kill_netns_processes(ns: &str) {
+    let pids = |ns: &str| -> Vec<String> {
+        ip(&["netns", "pids", ns])
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    let left = pids(ns);
+    if left.is_empty() {
+        return;
+    }
+    tracing::warn!(ns, ?left, "processes outlived their scenario; killing");
+    let mut k = sudo();
+    k.arg("kill").arg("-KILL").args(&left);
+    let _ = run(&mut k);
+    let start = Instant::now();
+    while !pids(ns).is_empty() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
