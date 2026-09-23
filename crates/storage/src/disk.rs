@@ -746,12 +746,14 @@ impl DiskStore {
     }
 
     /// Restore a piece's written ranges from resume data (see
-    /// [`Storage::restore_unfinished`]).
-    pub async fn restore_unfinished(
+    /// [`Storage::restore_unfinished`]). Queued now, so a write submitted
+    /// after this call runs behind the restore (it is a barrier), whenever
+    /// the result is awaited.
+    pub fn restore_unfinished(
         &self,
         piece: usize,
         ranges: Vec<(u32, u32)>,
-    ) -> Result<(), Error> {
+    ) -> impl std::future::Future<Output = Result<(), Error>> + 'static {
         let (t, done) = self.ticket();
         self.ring.submit(Job::RestoreUnfinished {
             id: self.id,
@@ -759,7 +761,7 @@ impl DiskStore {
             ranges,
             done,
         });
-        unit(t.await)
+        async move { unit(t.await) }
     }
 }
 

@@ -60,8 +60,10 @@ jobs:
       - name: Install lab tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q opentracker transmission-daemon transmission-cli tcpdump strace jq
-          sudo systemctl disable --now opentracker || true
+          # noble builds opentracker per family: `opentracker` is IPv4-only,
+          # the v6 and dual shapes also need `opentracker-ipv6`.
+          sudo apt-get install -y -q opentracker opentracker-ipv6 transmission-daemon transmission-cli tcpdump strace jq
+          sudo systemctl disable --now opentracker opentracker-ipv6 || true
       - name: Cache oracle binaries
         uses: actions/cache@v4
         with:

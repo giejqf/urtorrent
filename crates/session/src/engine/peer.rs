@@ -1249,15 +1249,17 @@ async fn process_events(
     let mut writes = Vec::new();
     let mut result = Ok(());
     for ev in events {
+        // Checked before every event, the first included: the receive loop
+        // takes a batch that is ready even when the close is too.
+        if handle.close.is_set() {
+            break;
+        }
         match handle_event(ctx, torrent, handle, ev, &mut writes).await {
             Ok(()) => {}
             Err(e) => {
                 result = Err(e);
                 break;
             }
-        }
-        if handle.close.is_set() {
-            break;
         }
     }
     if handle.conn.borrow().has_outbound() {

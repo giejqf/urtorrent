@@ -1414,94 +1414,145 @@ async fn initial_check(
             }
         }
     }
-    finish_check(&ctx, &torrent, have.clone(), carried);
-    if !unfinished.is_empty() {
-        restore_unfinished(&ctx, &torrent, &storage, &have, unfinished).await;
+    {
+        let t = torrent.borrow();
+        if let Some(s) = &t.storage {
+            s.set_have(have.clone());
+        }
     }
+    // (The initial check: nothing was received into the picker yet.)
+    let _ = torrent.borrow_mut().picker.set_have(&have);
+    let restores = begin_restore(&torrent, &storage, &have, unfinished);
+    finish_check(&ctx, &torrent, have, carried);
+    finish_restore(&ctx, &torrent, &storage, restores).await;
+}
+
+/// A partly written piece being brought back from resume data.
+struct Restore {
+    piece: usize,
+    /// Its blocks are all there: verify once restored.
+    complete: bool,
+    /// The picture the restore belongs to (a recheck meanwhile voids it).
+    epoch: u64,
+    /// The storage job, queued already.
+    job: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), storage::Error>>>>,
 }
 
 /// Bring back the pieces that were partly written when the resume data was
 /// saved: their synced ranges become downloaded blocks (not requested
-/// again) and the storage's hash cursor reads them back as it advances;
-/// a piece whose blocks are all there is verified now.
-async fn restore_unfinished(
-    ctx: &Rc<Ctx>,
+/// again) and the storage's hash cursor reads them back as it advances.
+/// This half runs before the torrent starts: the picker learns the blocks
+/// and the disk jobs are queued, so a peer is never asked for a restored
+/// block (had it sent one, the disk would no longer count among the
+/// piece's suppliers and a torn write would get the peer banned alone),
+/// and every write a peer causes runs behind the restore on the disk
+/// thread.
+fn begin_restore(
     torrent: &Rc<RefCell<Torrent>>,
     storage: &Rc<DiskStore>,
     have: &Bitfield,
     unfinished: Vec<(u32, Vec<(u32, u32)>)>,
-) {
+) -> Vec<Restore> {
     const BLOCK: u32 = 16 * 1024;
-    let piece_count = torrent.borrow().piece_count();
+    let mut t = torrent.borrow_mut();
+    let piece_count = t.piece_count();
     let mut restored = 0u64;
+    let mut restores = Vec::new();
     for (piece, ranges) in unfinished {
         let piece = piece as usize;
         if piece >= piece_count || have.get(piece) {
             continue;
         }
-        if let Err(e) = storage.restore_unfinished(piece, ranges.clone()).await {
-            tracing::warn!(piece, "unfinished piece not restored: {e}");
-            continue;
-        }
-        let complete = {
-            let mut t = torrent.borrow_mut();
-            let piece_size = t.picker.piece_size(piece);
-            let mut complete = false;
-            let mut piece_restored = 0u64;
-            for (s, e) in ranges {
-                let e = e.min(piece_size);
-                // Whole blocks only; a partial block is downloaded again.
-                let mut b = s.div_ceil(BLOCK) * BLOCK;
-                while b < e {
-                    let len = BLOCK.min(piece_size - b);
-                    if b + len > e {
-                        break;
-                    }
-                    let block = picker::Block {
-                        piece: piece as u32,
-                        offset: b,
-                        length: len,
-                    };
-                    if let picker::Received::Accepted { piece_complete, .. } =
-                        t.picker.block_received(RESUME_PEER_KEY, &block)
-                    {
-                        piece_restored += u64::from(len);
-                        complete |= piece_complete;
-                    }
-                    b += BLOCK;
+        let piece_size = t.picker.piece_size(piece);
+        let mut complete = false;
+        let mut piece_restored = 0u64;
+        for &(s, e) in &ranges {
+            let e = e.min(piece_size);
+            // Whole blocks only; a partial block is downloaded again.
+            let mut b = s.div_ceil(BLOCK) * BLOCK;
+            while b < e {
+                let len = BLOCK.min(piece_size - b);
+                if b + len > e {
+                    break;
                 }
+                let block = picker::Block {
+                    piece: piece as u32,
+                    offset: b,
+                    length: len,
+                };
+                if let picker::Received::Accepted { piece_complete, .. } =
+                    t.picker.block_received(RESUME_PEER_KEY, &block)
+                {
+                    piece_restored += u64::from(len);
+                    complete |= piece_complete;
+                }
+                b += BLOCK;
             }
-            restored += piece_restored;
-            if piece_restored > 0 {
-                // The disk is a supplier of this piece too: should the piece
-                // fail its hash, the peers that send the rest are not the
-                // sole suspects (a torn write is as likely).
-                t.note_supplier(
-                    piece as u32,
-                    RESUME_PEER_KEY,
-                    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                );
-            }
-            if complete {
-                t.verifying.insert(piece as u32);
-            }
-            complete.then_some(t.epoch)
-        };
-        if let Some(epoch) = complete {
-            uring::spawn(verify_piece(
-                ctx.clone(),
-                torrent.clone(),
-                piece as u32,
-                epoch,
-            ));
         }
+        restored += piece_restored;
+        if piece_restored > 0 {
+            // The disk is a supplier of this piece too: should the piece
+            // fail its hash, the peers that send the rest are not the sole
+            // suspects (a torn write is as likely).
+            t.note_supplier(
+                piece as u32,
+                RESUME_PEER_KEY,
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            );
+        }
+        if complete {
+            t.verifying.insert(piece as u32);
+        }
+        restores.push(Restore {
+            piece,
+            complete,
+            epoch: t.epoch,
+            job: Box::pin(storage.restore_unfinished(piece, ranges)),
+        });
     }
     if restored > 0 {
         tracing::info!(
-            torrent = torrent.borrow().id.0,
+            torrent = t.id.0,
             bytes = restored,
             "unfinished pieces restored from resume data"
         );
+    }
+    restores
+}
+
+/// The other half of [`begin_restore`], once the torrent runs: wait for the
+/// storage jobs, verify the pieces whose blocks are all there, and start
+/// over a piece the storage could not restore.
+async fn finish_restore(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    storage: &Rc<DiskStore>,
+    restores: Vec<Restore>,
+) {
+    for r in restores {
+        let result = r.job.await;
+        if torrent.borrow().epoch != r.epoch {
+            continue;
+        }
+        if let Err(e) = result {
+            tracing::warn!(piece = r.piece, "unfinished piece not restored: {e}");
+            {
+                let mut t = torrent.borrow_mut();
+                t.verifying.remove(&(r.piece as u32));
+                t.suppliers.remove(&(r.piece as u32));
+                t.picker.piece_failed(r.piece);
+            }
+            let _ = storage.discard_piece(r.piece).await;
+            continue;
+        }
+        if r.complete {
+            uring::spawn(verify_piece(
+                ctx.clone(),
+                torrent.clone(),
+                r.piece as u32,
+                r.epoch,
+            ));
+        }
     }
 }
 
@@ -1532,9 +1583,9 @@ where
     Some(r)
 }
 
-/// Apply a check result and start (unless paused). When the tasks are already
-/// running (metadata arrived on a running magnet torrent) they are refreshed
-/// instead.
+/// Start after the initial check (unless paused), the have-set already
+/// applied. When the tasks are already running (metadata arrived on a
+/// running magnet torrent) they are refreshed instead.
 fn finish_check(
     ctx: &Rc<Ctx>,
     torrent: &Rc<RefCell<Torrent>>,
@@ -1543,11 +1594,6 @@ fn finish_check(
 ) {
     let (id, start, running, kick) = {
         let mut t = torrent.borrow_mut();
-        if let Some(s) = &t.storage {
-            s.set_have(have.clone());
-        }
-        // (The initial check: nothing was received into the picker yet.)
-        let _ = t.picker.set_have(&have);
         if let Some((d, u)) = carried {
             t.stats.downloaded = d;
             t.stats.uploaded = u;
@@ -2150,6 +2196,16 @@ pub async fn on_block_from(
     let (storage, outcome) = {
         let mut t = torrent.borrow_mut();
         t.stats.downloaded += u64::from(request.length);
+        if t.checking {
+            // A recheck is replacing the picture. Its disk read runs behind
+            // the writes queued before it, not this one: accepted now, the
+            // block would land after the check looked, the check would void
+            // its piece as wasted bytes, and a later check could find the
+            // piece whole on disk — bytes counted both wasted and present.
+            // The block came off the wire and goes nowhere.
+            t.stats.redundant += u64::from(request.length);
+            return None;
+        }
         let outcome = t.picker.block_received(key, &block);
         if let Received::Accepted { cancel, .. } = &outcome {
             for k in cancel {

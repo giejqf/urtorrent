@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.3] - 2026-09-23
+
+### Fixed
+
+- **A file that became wanted mid-piece lost bytes held in the parts
+  file.** A piece that straddles a skipped file keeps that file's share in
+  the parts file; when the file was wanted again, only *verified* pieces
+  were exported into it. The blocks of a piece still being downloaded
+  stayed behind although they had already been hashed, so the piece
+  verified and the real file read zeros there. The written ranges of
+  pieces in progress are exported too.
+- **A block that arrived as a recheck started was written behind the
+  check.** The check never saw it, voided its piece as wasted bytes, and a
+  later check could find the piece whole on disk: after repeated rechecks
+  `downloaded - corrupt - redundant` came out a piece short of the torrent.
+  A block arriving while a torrent checks is now counted as downloaded and
+  redundant and not written, and a connection being closed acts on no
+  further message (the first one of a ready batch slipped through).
+- **A torn write restored from resume data could get an honest peer
+  banned.** The torrent started before its unfinished pieces were restored,
+  so a peer could be asked for the restored blocks. Once it had sent them
+  the disk no longer counted among the piece's suppliers, and when the
+  garbage the restore had already hashed failed the piece, the peer was
+  blamed alone, banned at once, and the torrent stalled. The picker learns
+  the restored blocks and the disk jobs are queued before the torrent
+  starts; `DiskStore::restore_unfinished` queues its job when called.
+- The netns lab starts one opentracker per family where the distribution
+  splits the builds (Ubuntu 24.04, GitHub's runners: `opentracker` is
+  IPv4-only, `opentracker-ipv6` a separate package); `cargo xtask doctor`
+  flags an IPv4-only build without it. CI installs both.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0B30-` / `urtorrent/0.11.3`
+  / DHT `UR\x00\x0b`.
+
 ## [0.11.2] - 2026-09-22
 
 Benchmarked against the oracle (`cargo xtask bench`, numbers and caveats

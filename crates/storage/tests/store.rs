@@ -336,6 +336,59 @@ fn file_priorities_parts_file_and_move() {
     std::fs::remove_dir_all(&root2).ok();
 }
 
+/// A skipped file becomes wanted while a piece straddling it is half
+/// written: the blocks already in the parts file (and already hashed) must
+/// follow the file, or the piece verifies with zeros on disk.
+#[test]
+fn parts_of_a_piece_in_progress_follow_the_file_when_it_becomes_wanted() {
+    // 64 KiB pieces of 4 blocks: a (20000) | b (60000) | c (14000). Piece 0
+    // is wanted through a; its blocks 1..3 fall (partly) into b.
+    let fx = fixture::multi(
+        "inprog",
+        &[("a.bin", 20_000), ("b.bin", 60_000), ("c.bin", 14_000)],
+        65536,
+        11,
+    );
+    let torrent = Torrent::parse(&fx.torrent).unwrap();
+    let info = Arc::new(torrent.info);
+    let root = tmpdir("prio-inprog");
+    let pool = Rc::new(HashPool::new(2));
+    let rt = Runtime::with_defaults().unwrap();
+    rt.block_on({
+        let content = fx.content.clone();
+        let root = root.clone();
+        async move {
+            let store = Storage::new(info, root.clone(), pool);
+            store.init_priorities(&[4, 0, 4]);
+            store.create_files().await.unwrap();
+            let block = |i: usize| Buffer::from_vec(content[i * 16384..(i + 1) * 16384].to_vec());
+            // Blocks 0..2 in order: the hash cursor passes over them, and
+            // the b bytes of blocks 1 and 2 go to the parts file.
+            for i in 0..3 {
+                store
+                    .write_block(0, (i * 16384) as u32, block(i))
+                    .await
+                    .unwrap();
+            }
+            assert!(!root.join("inprog/b.bin").exists());
+            store.set_file_priorities(&[4, 4, 4]).await.unwrap();
+            // The last block goes to the real file and completes the piece.
+            store.write_block(0, 3 * 16384, block(3)).await.unwrap();
+            assert!(store.verify_piece(0).await.unwrap());
+            let b_disk = std::fs::read(root.join("inprog/b.bin")).unwrap();
+            assert!(
+                b_disk.len() >= 65536 - 20_000,
+                "b is {} bytes",
+                b_disk.len()
+            );
+            assert_eq!(&b_disk[..65536 - 20_000], &content[20_000..65536]);
+            // The disk agrees with the verdict.
+            assert!(store.check_all().await.unwrap().get(0));
+        }
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Hash-as-you-write: blocks landing in any order, beyond the in-memory
 /// stash, a bad block detected and the piece re-downloaded, padding hashed as
 /// zeros whatever a peer sent.

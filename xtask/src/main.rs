@@ -11,7 +11,8 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -594,6 +595,32 @@ fn have(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Debian and Ubuntu builds before the 2025 upstream snapshot are IPv4-only
+/// and ship the IPv6 build as `opentracker-ipv6`. Such a build rejects an
+/// IPv6 bind while it parses its arguments; a dual-stack build binds and keeps
+/// running until it is killed.
+fn opentracker_v4_only() -> bool {
+    let Ok(mut child) = Command::new("opentracker")
+        .args(["-i", "::1", "-p", "0"])
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    child
+        .wait_with_output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).contains("V4 Tracker is V4 only"))
+        .unwrap_or(false)
+}
+
 fn doctor() -> Result<()> {
     println!("urtorrent doctor");
     let mut r = Report { problems: 0 };
@@ -687,6 +714,17 @@ fn doctor() -> Result<()> {
         } else {
             r.warn(bin, &format!("missing: {why}"));
         }
+    }
+    if have("opentracker-ipv6") {
+        r.ok(
+            "opentracker-ipv6",
+            "separate IPv6 build; the lab runs one opentracker per family",
+        );
+    } else if have("opentracker") && opentracker_v4_only() {
+        r.fail(
+            "opentracker-ipv6",
+            "this opentracker is IPv4-only (Debian/Ubuntu split build); the v6 and dual lab shapes need apt install opentracker-ipv6",
+        );
     }
     // Ubuntu confines transmission-daemon with AppArmor to /var/lib; the lab
     // runs it from testkit/runs, which needs a local override.

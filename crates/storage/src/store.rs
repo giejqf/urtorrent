@@ -494,27 +494,42 @@ impl Storage {
         crate::layout::piece_priorities(&self.info, &self.priorities.borrow())
     }
 
-    /// Copy the bytes of verified pieces that fall into file `i` from the
-    /// parts file into the real file (the file became wanted).
+    /// Copy the bytes the parts file holds for file `i` into the real file
+    /// (the file became wanted): whole verified pieces, and the written
+    /// ranges of pieces still in progress. The latter were hashed as they
+    /// were written, so their piece verifies without them being written
+    /// again; left behind, the real file would claim zeros for them.
     async fn export_parts(&self, i: usize) -> Result<(), Error> {
         let f = &self.info.files[i];
         if f.length == 0 {
             return Ok(());
         }
-        let have = self.have.borrow().clone();
         let piece_len = u64::from(self.info.piece_length);
         let first = (f.offset / piece_len) as usize;
         let last = ((f.offset + f.length - 1) / piece_len) as usize;
+        // Torrent-offset ranges held in the parts file.
+        let mut held = Vec::new();
+        {
+            let have = self.have.borrow();
+            let progress = self.progress.borrow();
+            for piece in first..=last {
+                let ps = piece as u64 * piece_len;
+                if have.get(piece) {
+                    held.push((ps, (ps + piece_len).min(self.info.total_length)));
+                } else if let Some(p) = progress.get(&piece) {
+                    held.extend(
+                        p.written
+                            .iter()
+                            .map(|&(s, e)| (ps + u64::from(s), ps + u64::from(e))),
+                    );
+                }
+            }
+        }
         let parts = self.parts_file().await?;
         let target = self.file(i).await?;
-        for piece in first..=last {
-            if !have.get(piece) {
-                continue;
-            }
-            let ps = piece as u64 * piece_len;
-            let pe = (ps + piece_len).min(self.info.total_length);
-            let s = ps.max(f.offset);
-            let e = pe.min(f.offset + f.length);
+        for (s, e) in held {
+            let s = s.max(f.offset);
+            let e = e.min(f.offset + f.length);
             if e <= s {
                 continue;
             }
