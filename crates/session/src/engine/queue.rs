@@ -164,7 +164,7 @@ pub fn recalculate(ctx: &Rc<Ctx>, now: Instant) {
 /// for the next round to start it if the limits allow.
 pub fn mark_eligible(t: &Rc<RefCell<Torrent>>) {
     let mut tb = t.borrow_mut();
-    tb.auto_managed = true;
+    tb.set_auto_managed(true);
     if tb.paused && tb.error.is_none() && !tb.held {
         tb.auto_paused = true;
     }
@@ -177,7 +177,7 @@ pub fn set_auto_managed(ctx: &Rc<Ctx>, t: &Rc<RefCell<Torrent>>, on: bool) {
         recalculate(ctx, Instant::now());
     } else {
         let mut tb = t.borrow_mut();
-        tb.auto_managed = false;
+        tb.set_auto_managed(false);
         // A queued torrent becomes a plainly paused one.
         tb.auto_paused = false;
     }
@@ -235,10 +235,11 @@ pub fn move_in_queue(ctx: &Rc<Ctx>, id: TorrentId, to: QueueMove) -> Result<(), 
         QueueMove::Bottom => ids.len(),
     };
     ids.insert(at, moved);
-    // Renumber densely, keeping the allocator ahead of every position.
+    // Renumber densely, keeping the allocator ahead of every position;
+    // each torrent whose key changes has its resume data marked.
     for (i, tid) in ids.iter().enumerate() {
         if let Some(t) = ctx.torrent(*tid) {
-            t.borrow_mut().queue_position = i as u64;
+            t.borrow_mut().set_queue_position(i as u64);
         }
     }
     ctx.reset_queue_positions(ids.len() as u64);

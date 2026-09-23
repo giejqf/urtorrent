@@ -19,7 +19,7 @@ default = ["tokio"]
 tokio = ["dep:tokio-stream"]
 
 [dependencies]
-session = { path = "../session", version = "0.13.1" }
-metainfo = { path = "../metainfo", version = "0.13.1" }
-profile = { path = "../profile", version = "0.13.1" }
+session = { path = "../session", version = "0.13.2" }
+metainfo = { path = "../metainfo", version = "0.13.2" }
+profile = { path = "../profile", version = "0.13.2" }
 tokio-stream = { version = "0.1", default-features = false, optional = true }

@@ -1166,7 +1166,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         Command::PauseAll(reply) => {
             let all: Vec<Rc<RefCell<Torrent>>> = ctx.torrents.borrow().values().cloned().collect();
             for t in &all {
-                t.borrow_mut().auto_managed = false;
+                t.borrow_mut().set_auto_managed(false);
             }
             let ctx2 = ctx.clone();
             uring::spawn(async move {
@@ -1181,7 +1181,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             for t in all {
                 if t.borrow().held {
                     // Held torrents are released and started too.
-                    t.borrow_mut().auto_managed = true;
+                    t.borrow_mut().set_auto_managed(true);
                     let ctx2 = ctx.clone();
                     uring::spawn(async move {
                         let _ = torrent::release(&ctx2, &t, true).await;
@@ -1200,6 +1200,8 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                     let added = t.announcer.add_tracker(&url, tier);
                     if added {
                         t.tracker_kick.notify();
+                        // The tracker list is in the resume data (v6).
+                        t.resume_dirty = true;
                     }
                     added
                 };
@@ -1218,6 +1220,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 let jobs = t.borrow_mut().announcer.remove_tracker(&url);
                 match jobs {
                     Some(jobs) => {
+                        t.borrow_mut().resume_dirty = true;
                         torrent::announce_stopped(ctx, &t, jobs);
                         let _ = reply.send(Ok(()));
                     }
@@ -1241,7 +1244,11 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         }
         Command::SetMaxUploads(id, max, reply) => match ctx.torrent(id) {
             Some(t) => {
-                t.borrow_mut().max_uploads = max;
+                let mut t = t.borrow_mut();
+                if t.max_uploads != max {
+                    t.max_uploads = max;
+                    t.resume_dirty = true;
+                }
                 let _ = reply.send(Ok(()));
             }
             None => {
@@ -1398,18 +1405,18 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
                     if t.borrow().held {
-                        t.borrow_mut().auto_managed = false;
+                        t.borrow_mut().set_auto_managed(false);
                         let _ = reply.send(torrent::release(&ctx2, &t, true).await);
                         return;
                     }
                     if t.borrow().error.is_some() {
-                        t.borrow_mut().auto_managed = false;
+                        t.borrow_mut().set_auto_managed(false);
                         t.borrow_mut().auto_paused = false;
                         let r = torrent::recover(&ctx2, &t, torrent::Recovery::Resume).await;
                         let _ = reply.send(r.map(|_| ()));
                         return;
                     }
-                    t.borrow_mut().auto_managed = false;
+                    t.borrow_mut().set_auto_managed(false);
                     torrent::resume(&ctx2, &t);
                     let _ = reply.send(Ok(()));
                 });
@@ -1424,7 +1431,11 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         }
         Command::SetMaxPeers(id, max, reply) => match ctx.torrent(id) {
             Some(t) => {
-                t.borrow_mut().max_peers = max;
+                let mut t = t.borrow_mut();
+                if t.max_peers != max {
+                    t.max_peers = max;
+                    t.resume_dirty = true;
+                }
                 let _ = reply.send(Ok(()));
             }
             None => {
@@ -1435,7 +1446,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             Some(t) => {
                 // A paused auto-managed torrent would be restarted by the
                 // queue: pausing takes it out of the queue's hands.
-                t.borrow_mut().auto_managed = false;
+                t.borrow_mut().set_auto_managed(false);
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
                     torrent::pause(&ctx2, &t).await;
@@ -1452,7 +1463,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                     let ctx2 = ctx.clone();
                     uring::spawn(async move {
                         // Released into the queue's hands.
-                        t.borrow_mut().auto_managed = true;
+                        t.borrow_mut().set_auto_managed(true);
                         let _ = reply.send(torrent::release(&ctx2, &t, true).await);
                     });
                 } else if t.borrow().error.is_some() {
@@ -1460,7 +1471,7 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                     uring::spawn(async move {
                         // Back in the queue's hands, then recovered: the
                         // restart goes through the queue.
-                        t.borrow_mut().auto_managed = true;
+                        t.borrow_mut().set_auto_managed(true);
                         let r = torrent::recover(&ctx2, &t, torrent::Recovery::Resume).await;
                         let _ = reply.send(r.map(|_| ()));
                     });
@@ -1773,7 +1784,10 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         Command::SetTorrentRateLimits(id, up, down, reply) => match ctx.torrent(id) {
             Some(t) => {
                 let now = Instant::now();
-                let t = t.borrow();
+                let mut t = t.borrow_mut();
+                if t.up_limit.rate() != up || t.down_limit.rate() != down {
+                    t.resume_dirty = true;
+                }
                 t.up_limit.set_rate(up, now);
                 t.down_limit.set_rate(down, now);
                 let _ = reply.send(Ok(()));

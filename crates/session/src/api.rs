@@ -578,7 +578,15 @@ pub struct TorrentStatus {
     pub peer_list_size: usize,
     /// Something the resume data records has changed since it was last
     /// saved or returned (libtorrent `need_save_resume`): a caller storing
-    /// blobs itself fetches [`Session::resume_data`] when this is set.
+    /// blobs itself fetches [`Session::resume_data`] when this is set. Set
+    /// by a verified piece, a completion, a check, file or piece priorities,
+    /// renames, storage moves, trackers and web seeds added or removed, the
+    /// per-torrent settings (sequential, rate limits, peer and upload caps),
+    /// the queue flag (`pause`, `resume`, `force_resume`,
+    /// `set_auto_managed`) and queue moves (on every torrent whose position
+    /// moved); a call that changes nothing leaves it. Transfer counters and
+    /// activity times do not set it: they change all the time, and the next
+    /// save carries them.
     pub needs_resume_save: bool,
     /// When the torrent was added, unix seconds (restored from resume
     /// data).

@@ -872,8 +872,30 @@ impl Torrent {
 
     /// Toggle sequential download (applies to future picks).
     pub fn set_sequential(&mut self, on: bool) {
+        if self.sequential != on {
+            // Recorded in the resume data (v5).
+            self.resume_dirty = true;
+        }
         self.sequential = on;
         self.picker.set_sequential(on);
+    }
+
+    /// Hand the torrent to the queue or take it out of its hands; the
+    /// resume data records the flag (v4), so a change marks it
+    /// (`needs_resume_save`, libtorrent's `need_save_resume_data`).
+    pub fn set_auto_managed(&mut self, on: bool) {
+        if self.auto_managed != on {
+            self.auto_managed = on;
+            self.resume_dirty = true;
+        }
+    }
+
+    /// Move the torrent in the queue; the resume data records the key (v4).
+    pub fn set_queue_position(&mut self, position: u64) {
+        if self.queue_position != position {
+            self.queue_position = position;
+            self.resume_dirty = true;
+        }
     }
 
     /// Where an address was learned (for `PeerInfo::source`).
@@ -1257,7 +1279,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
                 t.kept_resume = resume;
                 t.checking = false;
                 t.paused = true;
-                t.auto_managed = false;
+                t.set_auto_managed(false);
                 return Ok(id);
             }
             // Before any file is created: does the disk still hold what the
@@ -1658,7 +1680,7 @@ fn hold_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, resume: Option<Re
         t.kept_resume = resume;
         t.checking = false;
         t.check_queued = false;
-        t.auto_managed = false;
+        t.set_auto_managed(false);
         t.auto_paused = false;
         // Stopped from this moment (no dial, no request); the wind-down
         // below finishes the job and clears `stopping`.

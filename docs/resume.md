@@ -13,7 +13,10 @@ libtorrent's `write_resume_data_buf()` / `read_resume_data()`.
   returns the same data as bytes; the caller stores them (a database, its
   own files) and passes them back through `AddTorrent::resume_data(bytes)`.
   `TorrentStatus::needs_resume_save` (libtorrent `need_save_resume`) says
-  when a fresh blob is worth fetching; fetching clears it. A blob given at
+  when a fresh blob is worth fetching; fetching clears it. Every change to
+  a field the blob records sets it (the list is on the field; a queue move
+  marks each torrent it shifts), except the transfer counters and activity
+  times, which change continuously and ride along with the next save. A blob given at
   add time wins over a `resume_dir` file. The info-hash inside must match
   the torrent being added, or the blob is ignored.
 

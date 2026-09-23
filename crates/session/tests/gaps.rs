@@ -721,3 +721,96 @@ fn add_peer_redials_the_metadata_peer_after_a_hold() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn every_change_the_resume_data_records_marks_it() {
+    // ../urtorrentd/docs/gaps.md: a caller storing the blob itself learns of
+    // changes only through `needs_resume_save` (libtorrent's
+    // `need_save_resume_data`). Each operation that changes what the blob
+    // records sets it; one that changes nothing does not; a queue move marks
+    // every torrent whose position moved.
+    let dir = tmp("dirty");
+    let s = block_on(builder(1).build()).unwrap();
+    let mut ids = Vec::new();
+    for name in ["x.bin", "y.bin", "z.bin"] {
+        let (bytes, data) = make_torrent(name, 128 * 1024, 64 * 1024, "http://127.0.0.1:1/x");
+        std::fs::write(dir.join(name), &data).unwrap();
+        let id = block_on(s.add_torrent(AddTorrent::metainfo(bytes, &dir))).unwrap();
+        wait_state(&s, id, TorrentState::Seeding, 10);
+        ids.push(id);
+    }
+    let dirty = |id| status(&s, id).needs_resume_save;
+    let save = |id| {
+        let _ = block_on(s.resume_data(id)).unwrap();
+        assert!(!dirty(id));
+    };
+    let x = ids[0];
+    type Op<'a> = (&'a str, Box<dyn Fn() + 'a>);
+    let ops: Vec<Op> = vec![
+        (
+            "add_tracker",
+            Box::new(|| block_on(s.add_tracker(x, "http://127.0.0.1:1/b".into(), 1)).unwrap()),
+        ),
+        (
+            "remove_tracker",
+            Box::new(|| block_on(s.remove_tracker(x, "http://127.0.0.1:1/b".into())).unwrap()),
+        ),
+        (
+            "set_sequential",
+            Box::new(|| block_on(s.set_sequential(x, true)).unwrap()),
+        ),
+        (
+            "set_torrent_rate_limits",
+            Box::new(|| block_on(s.set_torrent_rate_limits(x, 1000, 0)).unwrap()),
+        ),
+        (
+            "set_max_peers",
+            Box::new(|| block_on(s.set_max_peers(x, Some(10))).unwrap()),
+        ),
+        (
+            "set_max_uploads",
+            Box::new(|| block_on(s.set_max_uploads(x, Some(2))).unwrap()),
+        ),
+        ("pause", Box::new(|| block_on(s.pause(x)).unwrap())),
+        ("resume", Box::new(|| block_on(s.resume(x)).unwrap())),
+        (
+            "force_resume",
+            Box::new(|| block_on(s.force_resume(x)).unwrap()),
+        ),
+        (
+            "set_auto_managed",
+            Box::new(|| block_on(s.set_auto_managed(x, true)).unwrap()),
+        ),
+    ];
+    for (name, op) in &ops {
+        save(x);
+        op();
+        assert!(dirty(x), "{name} left needs_resume_save unset");
+    }
+    // Changing nothing marks nothing.
+    save(x);
+    block_on(s.set_sequential(x, true)).unwrap();
+    block_on(s.set_max_peers(x, Some(10))).unwrap();
+    block_on(s.set_auto_managed(x, true)).unwrap();
+    assert!(!dirty(x), "a no-op marked the resume data");
+
+    // A queue move marks the moved torrent and every one it shifts.
+    for &id in &ids {
+        save(id);
+    }
+    block_on(s.move_in_queue(ids[2], session::QueueMove::Top)).unwrap();
+    for &id in &ids {
+        assert!(dirty(id), "queue position of {id:?} changed unmarked");
+    }
+    // Moving the last one down: nothing shifts.
+    for &id in &ids {
+        save(id);
+    }
+    let last = ids[1];
+    block_on(s.move_in_queue(last, session::QueueMove::Bottom)).unwrap();
+    for &id in &ids {
+        assert!(!dirty(id), "{id:?} marked though its position stayed");
+    }
+    block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

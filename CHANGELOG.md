@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.2] - 2026-09-23
+
+### Fixed
+
+- **`needs_resume_save` missed changes the resume data records**
+  (`../urtorrentd/docs/gaps.md`): adding or removing a tracker, the
+  per-torrent settings (`set_sequential`, `set_torrent_rate_limits`,
+  `set_max_peers`, `set_max_uploads`), the queue flag (`pause`, `resume`,
+  `force_resume`, `set_auto_managed`) and queue moves left it unset, so a
+  caller storing blobs itself lost them on a crash (and never saw them for
+  an idle seed until a clean shutdown). Each now marks the data when it
+  changes something, a queue move on every torrent whose position moved,
+  as libtorrent's `need_save_resume_data` does; a call that changes nothing
+  does not. The engine's own `resume_dir` saves were unaffected (every
+  torrent is saved when it stops).
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0D20-` / `urtorrent/0.13.2`
+  / DHT `UR\x00\x0d`.
+
 ## [0.13.1] - 2026-09-23
 
 ### Fixed
