@@ -1115,12 +1115,11 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             Some(t) => {
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
-                    torrent::stop(&ctx2, &t, true).await;
-                    let r = if delete_files {
-                        torrent::delete_files(&t).await
-                    } else {
-                        Ok(())
-                    };
+                    torrent::stop(&ctx2, &t, false).await;
+                    let mut r = torrent::delete_resume_file(&t);
+                    if delete_files && r.is_ok() {
+                        r = torrent::delete_files(&t).await;
+                    }
                     ctx2.emit(Event::TorrentRemoved { id });
                     let _ = reply.send(r);
                 });
@@ -1329,9 +1328,19 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         },
         Command::ForceResume(id, reply) => match ctx.torrent(id) {
             Some(t) => {
-                t.borrow_mut().auto_managed = false;
-                torrent::resume(ctx, &t);
-                let _ = reply.send(Ok(()));
+                let ctx2 = ctx.clone();
+                uring::spawn(async move {
+                    if t.borrow().error.is_some() {
+                        t.borrow_mut().auto_managed = false;
+                        t.borrow_mut().auto_paused = false;
+                        let r = torrent::recover(&ctx2, &t, torrent::Recovery::Resume).await;
+                        let _ = reply.send(r.map(|_| ()));
+                        return;
+                    }
+                    t.borrow_mut().auto_managed = false;
+                    torrent::resume(&ctx2, &t);
+                    let _ = reply.send(Ok(()));
+                });
             }
             None => {
                 let _ = reply.send(Err(Error::NoSuchTorrent));
@@ -1367,8 +1376,19 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         },
         Command::Resume(id, reply) => match ctx.torrent(id) {
             Some(t) => {
-                queue::set_auto_managed(ctx, &t, true);
-                let _ = reply.send(Ok(()));
+                if t.borrow().error.is_some() {
+                    let ctx2 = ctx.clone();
+                    uring::spawn(async move {
+                        // Back in the queue's hands, then recovered: the
+                        // restart goes through the queue.
+                        t.borrow_mut().auto_managed = true;
+                        let r = torrent::recover(&ctx2, &t, torrent::Recovery::Resume).await;
+                        let _ = reply.send(r.map(|_| ()));
+                    });
+                } else {
+                    queue::set_auto_managed(ctx, &t, true);
+                    let _ = reply.send(Ok(()));
+                }
             }
             None => {
                 let _ = reply.send(Err(Error::NoSuchTorrent));
@@ -1594,8 +1614,15 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             Some(t) => {
                 let ctx2 = ctx.clone();
                 uring::spawn(async move {
-                    torrent::recheck(ctx2, t).await;
-                    let _ = reply.send(Ok(()));
+                    let r = match torrent::recover(&ctx2, &t, torrent::Recovery::Recheck).await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => {
+                            torrent::recheck(ctx2, t).await;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    };
+                    let _ = reply.send(r);
                 });
             }
             None => {

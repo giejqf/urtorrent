@@ -160,8 +160,9 @@ fn leech_from_seeder_via_tracker() {
     assert_eq!(st.downloaded, size as u64);
     block_on(session.shutdown()).unwrap();
 
-    // Delete the content: the resume data must not be trusted any more and a
-    // recheck finds nothing (never claim pieces we do not have).
+    // Delete the content: the resume data must not be trusted any more
+    // (never claim pieces we do not have). The torrent reports the missing
+    // content (libtorrent's rejected fast resume) instead of starting over.
     std::fs::remove_file(dir.join("save").join("leech.bin")).unwrap();
     let session = block_on(
         Session::builder()
@@ -180,10 +181,19 @@ fn leech_from_seeder_via_tracker() {
         ),
     )
     .unwrap();
-    let st = block_on(session.status(id)).unwrap();
-    assert_eq!(st.state, TorrentState::Paused);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let st = loop {
+        let st = block_on(session.status(id)).unwrap();
+        if st.state != TorrentState::Checking || Instant::now() > deadline {
+            break st;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(st.state, TorrentState::Error, "{st:?}");
+    assert_eq!(st.error_kind, Some(session::ErrorKind::ContentMissing));
     assert_eq!(st.pieces_have, 0);
     assert_eq!(st.left, size as u64);
+    assert!(!dir.join("save").join("leech.bin").exists());
     block_on(session.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

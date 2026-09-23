@@ -126,6 +126,8 @@ pub struct AddTorrent {
     pub skip_checking: bool,
     pub sequential: bool,
     pub tags: Option<String>,
+    /// `stopCondition`: `MetadataReceived`, `FilesChecked` or `None`.
+    pub stop_condition: Option<String>,
 }
 
 impl AddTorrent {
@@ -151,6 +153,10 @@ impl AddTorrent {
     }
     pub fn skip_checking(mut self, v: bool) -> Self {
         self.skip_checking = v;
+        self
+    }
+    pub fn stop_condition(mut self, c: &str) -> Self {
+        self.stop_condition = Some(c.to_string());
         self
     }
 }
@@ -284,6 +290,9 @@ impl WebApi {
         fields.push(("sequentialDownload".into(), add.sequential.to_string()));
         if let Some(t) = &add.tags {
             fields.push(("tags".into(), t.clone()));
+        }
+        if let Some(c) = &add.stop_condition {
+            fields.push(("stopCondition".into(), c.clone()));
         }
         if let Some(m) = &add.magnet {
             fields.push(("urls".into(), m.clone()));

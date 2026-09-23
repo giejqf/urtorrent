@@ -1,0 +1,54 @@
+{
+  "after_start_announces": [
+    {
+      "event": "started",
+      "left": "16384"
+    },
+    {
+      "event": "stopped",
+      "left": "1048576"
+    },
+    {
+      "event": "started",
+      "left": "1048576"
+    },
+    {
+      "event": "completed",
+      "left": "0"
+    }
+  ],
+  "held": {
+    "announces": [
+      {
+        "event": "started",
+        "left": "16384"
+      },
+      {
+        "event": "stopped",
+        "left": "1048576"
+      }
+    ],
+    "connections": [
+      {
+        "close_reason": "peer closed",
+        "closed": true,
+        "events": [
+          "recv:handshake",
+          "send:handshake",
+          "send:extended[0]",
+          "send:have_all",
+          "recv:extended[0]",
+          "recv:extended[2]",
+          "send:extended[2]"
+        ]
+      }
+    ],
+    "file_exists": false,
+    "piece_messages_received": 0,
+    "progress": 0.0,
+    "state": "stoppedDL",
+    "states": [
+      "stoppedDL"
+    ]
+  }
+}

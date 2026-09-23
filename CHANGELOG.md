@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+What a daemon in front of the library needs (`../urtorrentd/docs/gaps.md`).
+Breaking: `Event` and `TorrentState` are `#[non_exhaustive]` now, and
+`Event::TorrentError` carries a `kind`.
+
+### Added
+
+- `ErrorKind` (`ContentMissing`, `Io`, `Metadata`) in
+  `TorrentStatus::error_kind` and `Event::TorrentError::kind`.
+- Errored torrents recover. `Session::resume` and `force_resume` look for
+  missing content again, or restart after an I/O error (the pieces that
+  were in progress are downloaded again; a torrent that failed while
+  checking checks again); `force_recheck` clears either and rechecks,
+  creating files where missing. Metadata errors are refused with
+  `Error::Busy`. Before, all three returned `Ok` and did nothing.
+- `crates/session/tests/gaps.rs`; oracle captures `capture_missing_files`
+  and `capture_magnet_hold` (goldens committed).
+
+### Changed
+
+- **Resume data that vouches for files that are gone stops the torrent
+  with `ErrorKind::ContentMissing`** (libtorrent's rejected fast resume,
+  qBittorrent's "missing files"; docs/quirks.md Q28) instead of starting
+  the download over: nothing is announced or created, and the resume data
+  is kept and saved back unchanged.
+- A failed upload read stops the torrent with `ErrorKind::Io`
+  (libtorrent's `handle_disk_error`); it only rejected the request before,
+  so a seed whose drive vanished failed silently.
+- `remove_torrent` deletes the torrent's resume file (the final save while
+  stopping is skipped); `remove_torrent_with_files` already did.
+
+### Fixed
+
+- **A torrent outside the queue never started.** Added with
+  `auto_managed(false)` and not paused, it reported `Seeding` or
+  `Downloading` after its check but never announced or ran its tick:
+  `activate` handed it to `resume`, which only started paused torrents.
+
 ## [0.11.4] - 2026-09-23
 
 ### Changed

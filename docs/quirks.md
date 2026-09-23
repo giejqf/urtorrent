@@ -562,3 +562,34 @@ Source: libtorrent 2.0.14 `session_impl.cpp` (`reopen_listen_sockets`,
   (its fingerprint is fixed at construction); a session with two identities
   in flight is a state the oracle never shows a tracker or a peer, which is
   why `set_profile` re-announces every torrent under one identity at once.
+
+## Q28. Missing content and disk errors
+
+Source: capture `capture_missing_files` (golden
+`testkit/golden/capture_missing_files/v4/missing-files.json`), libtorrent
+2.0.14 `torrent.cpp` (`handle_disk_error`, `clear_error`), qBittorrent 5.2.3's
+torrent states.
+
+- **Resume data vouching for files that are gone is rejected, not trusted
+  and not silently replaced.** The oracle's fast resume check fails
+  ("mismatching file size"), the torrent shows `missingFiles`, nothing is
+  announced and no file is created. We stop with
+  `ErrorKind::ContentMissing`, announce nothing, create nothing (a drive that
+  is not mounted must not have a fresh copy written into its mount point),
+  and keep the resume data as loaded. "Start" on the oracle checks the
+  resume data again (`checkingResumeData` → `missingFiles` while the files
+  are still gone); `Session::resume` does the same. "Recheck" on the oracle
+  clears the error, finds nothing and downloads from scratch;
+  `Session::force_recheck` does the same.
+- **A read or write that fails stops the torrent** (`ErrorKind::Io`),
+  libtorrent's `handle_disk_error`. Upload reads included: before 0.12.0 a
+  failed upload read only rejected the request, so a seed whose drive
+  vanished rejected requests forever with no error to show. Pieces in
+  progress when a write failed are downloaded again on `resume` (their
+  bytes count as redundant); libtorrent's `write_failed` resets the blocks
+  the same way. Verifies in flight are dropped (`epoch`): read back after a
+  failed write, a piece would fail and blame its peers for the disk.
+- **Errors are cleared by resume and recheck, not only by removal.**
+  libtorrent's `clear_error` resumes; a torrent that failed while checking
+  checks again. Metadata that cannot be used (`ErrorKind::Metadata`) is the
+  one error only removal clears.

@@ -328,6 +328,7 @@ pub struct FileStatus {
 
 /// A torrent's lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TorrentState {
     /// A magnet link waiting for its metadata (BEP 9).
     FetchingMetadata,
@@ -344,8 +345,28 @@ pub enum TorrentState {
     Queued,
     /// Stopped by the caller.
     Paused,
-    /// Stopped by an error (see `error`).
+    /// Stopped by an error (see `error` and `error_kind`).
     Error,
+}
+
+/// What stopped a torrent in [`TorrentState::Error`], and so what brings it
+/// back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// Files the resume data vouches for are gone: moved, deleted, or on a
+    /// drive that is not mounted (qBittorrent's "missing files"). Nothing is
+    /// created in their place. [`Session::resume`] looks again once they are
+    /// back; [`Session::force_recheck`] accepts what the disk holds and
+    /// downloads the rest.
+    ContentMissing,
+    /// Reading, writing or checking the files failed (disk full, I/O error,
+    /// permissions). [`Session::resume`] restarts, downloading again the
+    /// pieces that were in progress; [`Session::force_recheck`] rechecks.
+    Io,
+    /// The metadata cannot be used (malformed, or v2-only). Only removing
+    /// the torrent helps.
+    Metadata,
 }
 
 /// One tracker's state in a status snapshot.
@@ -386,6 +407,8 @@ pub struct TorrentStatus {
     pub state: TorrentState,
     /// Error text when `state == Error`.
     pub error: Option<String>,
+    /// What kind of error, when `state == Error`.
+    pub error_kind: Option<ErrorKind>,
     /// The metadata is known (always true for a `.torrent`; false while a
     /// magnet link is fetching it).
     pub has_metadata: bool,
@@ -683,6 +706,7 @@ pub struct SessionStats {
 
 /// Something that happened in the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A torrent was added.
     TorrentAdded {
@@ -829,6 +853,8 @@ pub enum Event {
         id: TorrentId,
         /// What went wrong.
         error: String,
+        /// What kind of error (what brings the torrent back).
+        kind: ErrorKind,
     },
     /// A torrent was removed.
     TorrentRemoved {
@@ -1385,7 +1411,8 @@ impl Session {
     }
 
     /// Start a torrent regardless of the active limits ("force start"):
-    /// takes it out of the queue's hands and resumes it.
+    /// takes it out of the queue's hands and resumes it. An errored torrent
+    /// is recovered as [`Session::resume`] describes.
     pub async fn force_resume(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::ForceResume(id, tx)).await?
     }
@@ -1418,6 +1445,12 @@ impl Session {
     /// Resume a paused torrent under the queue (`auto_managed = true`): it
     /// starts when the [`ActiveLimits`] allow, else waits as
     /// `TorrentState::Queued`. [`Session::force_resume`] bypasses the queue.
+    ///
+    /// An errored torrent is recovered first, by [`ErrorKind`]:
+    /// `ContentMissing` looks for the files again (and stays errored while
+    /// they are still gone), `Io` restarts and downloads again the pieces
+    /// that were in progress (a torrent that failed while checking is
+    /// rechecked), `Metadata` is refused with [`Error::Busy`].
     pub async fn resume(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::Resume(id, tx)).await?
     }
@@ -1488,7 +1521,11 @@ impl Session {
     }
 
     /// Drop peers and re-hash everything on disk; the have-set is rebuilt from
-    /// what verifies. Resolves when the check is done.
+    /// what verifies. Resolves when the check is done. An errored torrent
+    /// (other than [`ErrorKind::Metadata`], refused with [`Error::Busy`]) has
+    /// its error cleared and its files created where missing first, so a
+    /// torrent whose content went missing starts over from what the disk
+    /// holds.
     pub async fn force_recheck(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::ForceRecheck(id, tx)).await?
     }

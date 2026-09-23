@@ -31,8 +31,8 @@ use super::rate::Limiter;
 use super::rng::RngRef;
 use crate::Error;
 use crate::api::{
-    AddTorrent, Event, PeerInfo, PeerSource, TorrentId, TorrentSource, TorrentState, TorrentStatus,
-    TrackerStatus,
+    AddTorrent, ErrorKind, Event, PeerInfo, PeerSource, TorrentId, TorrentSource, TorrentState,
+    TorrentStatus, TrackerStatus,
 };
 
 /// Outstanding requests older than this are cancelled and re-picked
@@ -193,6 +193,14 @@ pub struct Torrent {
     /// The check waits for a slot (`max_checking`).
     pub check_queued: bool,
     pub error: Option<String>,
+    pub error_kind: Option<ErrorKind>,
+    /// The resume data of a torrent whose content went missing, kept as it
+    /// was loaded: saved back unchanged, and tried again by `resume`.
+    missing_resume: Option<ResumeData>,
+    /// The error struck while checking: recovering rechecks.
+    recheck_on_recover: bool,
+    /// The wind-down an error started is still running.
+    error_stopping: bool,
     pub stats: Stats,
     /// Per-torrent rate limits (0 = unlimited; the session limits apply too).
     pub up_limit: Rc<Limiter>,
@@ -529,6 +537,7 @@ impl Torrent {
             name: self.name.clone(),
             state: self.state(),
             error: self.error.clone(),
+            error_kind: self.error.as_ref().and(self.error_kind),
             has_metadata: self.info.is_some(),
             private: self.private,
             pieces_have: self.picker.have_count(),
@@ -1022,6 +1031,10 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         checking: parsed.is_some(),
         check_queued: false,
         error: None,
+        error_kind: None,
+        missing_resume: None,
+        recheck_on_recover: false,
+        error_stopping: false,
         stats: Stats::default(),
         up_limit: Limiter::new(params.upload_limit.unwrap_or(0), now),
         down_limit: Limiter::new(params.download_limit.unwrap_or(0), now),
@@ -1063,9 +1076,12 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
                 return Err(e);
             }
             // Before any file is created: does the disk still hold what the
-            // resume data describes?
+            // resume data describes? When it vouches for files that are gone,
+            // nothing is created in their place (`ContentMissing`).
             let files_present = wanted_files_present(&torrent);
-            if let Err(e) = create_files(&torrent).await {
+            if !content_missing(&torrent, files_present, resume.as_ref())
+                && let Err(e) = create_files(&torrent).await
+            {
                 ctx.remove_torrent_entry(id);
                 return Err(e);
             }
@@ -1115,19 +1131,67 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
 /// skipped files are never created, so they do not count.
 fn wanted_files_present(torrent: &Rc<RefCell<Torrent>>) -> bool {
     let t = torrent.borrow();
+    t.info.is_some() && t.storage.is_some() && first_missing_file(&t).is_none()
+}
+
+/// The first wanted content file that does not exist on disk.
+fn first_missing_file(t: &Torrent) -> Option<PathBuf> {
     let (Some(info), Some(storage)) = (&t.info, &t.storage) else {
-        return false;
+        return None;
     };
     let prios = storage.file_priorities();
     info.files
         .iter()
         .enumerate()
         .filter(|(i, f)| !f.is_padding() && prios.get(*i).copied().unwrap_or(0) > 0)
-        .all(|(i, _)| {
+        .find_map(|(i, _)| {
             storage
                 .file_path(i)
-                .is_some_and(|p| std::fs::metadata(p).is_ok())
+                .filter(|p| std::fs::metadata(p).is_err())
         })
+}
+
+/// The resume data vouches for content (verified pieces, or written ranges
+/// of unfinished ones) and a wanted file is gone: libtorrent rejects such a
+/// fast resume and qBittorrent shows "missing files".
+fn content_missing(
+    torrent: &Rc<RefCell<Torrent>>,
+    files_present: bool,
+    resume: Option<&ResumeData>,
+) -> bool {
+    if files_present {
+        return false;
+    }
+    let t = torrent.borrow();
+    let Some(info) = &t.info else {
+        return false;
+    };
+    resume.is_some_and(|r| r.matches(info) && (r.have.count() > 0 || !r.unfinished.is_empty()))
+}
+
+/// Stop with [`ErrorKind::ContentMissing`]: nothing announced, nothing
+/// created, and the resume data kept as it was loaded (saved back unchanged,
+/// tried again by `resume`). The transfer totals and times it carries still
+/// show.
+fn report_content_missing(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, r: ResumeData) {
+    let missing = {
+        let mut t = torrent.borrow_mut();
+        t.stats.downloaded = r.downloaded;
+        t.stats.uploaded = r.uploaded;
+        t.active_time = Duration::from_secs(r.active_time);
+        t.seeding_time = Duration::from_secs(r.seeding_time);
+        t.checking = false;
+        t.check_queued = false;
+        t.missing_resume = Some(r);
+        first_missing_file(&t)
+    };
+    let what = missing.map_or_else(|| "a content file".to_string(), |p| p.display().to_string());
+    fail_torrent(
+        ctx,
+        torrent,
+        ErrorKind::ContentMissing,
+        format!("content missing: {what} is gone (moved, deleted, or not mounted)"),
+    );
 }
 
 /// Load the resume file, if any (unreadable data is ignored with a warning).
@@ -1315,22 +1379,34 @@ pub async fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec
     let info = match metainfo::Info::from_info_dict(&raw) {
         Ok(i) => i,
         Err(e) => {
-            fail_torrent(ctx, torrent, format!("metadata unusable: {e}"));
+            fail_torrent(
+                ctx,
+                torrent,
+                ErrorKind::Metadata,
+                format!("metadata unusable: {e}"),
+            );
             return;
         }
     };
     if info.has_v2 && info.piece_hashes.is_empty() {
-        fail_torrent(ctx, torrent, "v2-only metadata (BEP 52) is deferred".into());
+        fail_torrent(
+            ctx,
+            torrent,
+            ErrorKind::Metadata,
+            "v2-only metadata (BEP 52) is deferred".into(),
+        );
         return;
     }
     let resume = load_resume(ctx, torrent);
     if let Err(e) = attach_metadata(ctx, torrent, info, raw, resume.as_ref()) {
-        fail_torrent(ctx, torrent, e.to_string());
+        fail_torrent(ctx, torrent, ErrorKind::Metadata, e.to_string());
         return;
     }
     let files_present = wanted_files_present(torrent);
-    if let Err(e) = create_files(torrent).await {
-        fail_torrent(ctx, torrent, e.to_string());
+    if !content_missing(torrent, files_present, resume.as_ref())
+        && let Err(e) = create_files(torrent).await
+    {
+        fail_check(ctx, torrent, e.to_string());
         return;
     }
     let (id, private, peers) = {
@@ -1387,6 +1463,10 @@ async fn initial_check(
     let mut carried: Option<(u64, u64)> = None;
     let mut unfinished: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
     match resume {
+        Some(r) if content_missing(&torrent, files_present, Some(&r)) => {
+            report_content_missing(&ctx, &torrent, r);
+            return;
+        }
         Some(r) if r.matches(&info) && files_present => {
             have = r.have.clone();
             carried = Some((r.downloaded, r.uploaded));
@@ -1406,7 +1486,7 @@ async fn initial_check(
                 match result {
                     Some(Ok(h)) => have = h,
                     Some(Err(e)) => {
-                        fail_torrent(&ctx, &torrent, format!("check failed: {e}"));
+                        fail_check(&ctx, &torrent, format!("check failed: {e}"));
                         return;
                     }
                     None => return,
@@ -1666,7 +1746,7 @@ pub async fn recheck(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>) {
         }
         Err(e) => {
             torrent.borrow_mut().checking = false;
-            fail_torrent(&ctx, &torrent, format!("recheck failed: {e}"));
+            fail_check(&ctx, &torrent, format!("recheck failed: {e}"));
         }
     }
 }
@@ -1736,7 +1816,10 @@ fn start_tasks(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
 pub fn resume(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
     {
         let mut t = torrent.borrow_mut();
-        if !t.paused || t.error.is_some() {
+        // A paused torrent starts; so does one that is not paused but not
+        // running either (outside the queue, just checked or added: the
+        // queue's `activate` hands it here).
+        if t.error.is_some() || (!t.paused && t.tasks_running) {
             return;
         }
         t.auto_paused = false;
@@ -1760,7 +1843,7 @@ pub async fn pause(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
         t.paused = true;
         t.stopping = true;
     }
-    stop(ctx, torrent, false).await;
+    stop(ctx, torrent, true).await;
     let restart = {
         let mut t = torrent.borrow_mut();
         t.stopping = false;
@@ -1773,8 +1856,9 @@ pub async fn pause(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
 }
 
 /// Wind a torrent down: send `stopped` to every started tracker, close every
-/// peer, save resume data. Used by pause, remove and shutdown.
-pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, _final: bool) {
+/// peer, and save resume data when `save` (not for a removal, which deletes
+/// it). Used by pause, errors, remove and shutdown.
+pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, save: bool) {
     {
         let t = torrent.borrow();
         t.closing.set();
@@ -1820,17 +1904,13 @@ pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, _final: bool) {
     // their way to the disk: let them land, so the resume data describes
     // the files and a `remove_torrent_with_files` cannot be overtaken by a
     // write that recreates one.
-    // Blocks accepted just before the peers went away may still be on
-    // their way to the disk: let them land, so the resume data describes
-    // the files and a `remove_torrent_with_files` cannot be overtaken by a
-    // write that recreates one.
     for _ in 0..100 {
         if torrent.borrow().writes_in_flight == 0 {
             break;
         }
         uring::sleep(Duration::from_millis(20)).await;
     }
-    if let Err(e) = save_resume(ctx, torrent).await {
+    if save && let Err(e) = save_resume(ctx, torrent).await {
         tracing::warn!("saving resume data failed: {e}");
     }
     // Give peer tasks a moment to observe the flag and release their sockets.
@@ -1859,16 +1939,20 @@ pub fn announce_stopped(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, jobs: Vec
 }
 
 /// Delete a removed torrent's content (files, parts file, emptied
-/// directories) and its resume file.
+/// directories).
 pub async fn delete_files(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
-    let (storage, resume_path) = {
-        let t = torrent.borrow();
-        (t.storage.clone(), t.resume_path.clone())
-    };
+    let storage = torrent.borrow().storage.clone();
     if let Some(s) = storage {
         s.delete_files().await?;
     }
-    if let Some(p) = resume_path
+    Ok(())
+}
+
+/// Delete a removed torrent's resume file (libtorrent leaves resume data to
+/// the caller; qBittorrent deletes its `.fastresume` with the torrent).
+pub fn delete_resume_file(torrent: &Rc<RefCell<Torrent>>) -> Result<(), Error> {
+    let path = torrent.borrow().resume_path.clone();
+    if let Some(p) = path
         && let Err(e) = std::fs::remove_file(&p)
         && e.kind() != std::io::ErrorKind::NotFound
     {
@@ -1965,7 +2049,7 @@ async fn build_resume(
         tiers[tr.tier].push(tr.url);
     }
     tiers.retain(|tier| !tier.is_empty());
-    let data = ResumeData {
+    let mut data = ResumeData {
         format_version: storage::FORMAT_VERSION,
         info_hash: info.info_hash,
         piece_length: info.piece_length,
@@ -2004,6 +2088,12 @@ async fn build_resume(
         peers,
         unfinished,
     };
+    if let Some(r) = &t.missing_resume {
+        // The content is missing: what the resume data vouched for stands
+        // until the files are back or a recheck replaces it.
+        data.have = r.have.clone();
+        data.unfinished = r.unfinished.clone();
+    }
     t.resume_dirty = false;
     t.last_resume_save = Instant::now();
     Ok(Some(data))
@@ -2154,7 +2244,12 @@ impl PendingWrite {
         let r = self.fut.await;
         torrent.borrow_mut().writes_in_flight -= 1;
         if let Err(e) = r {
-            fail_torrent(ctx, torrent, format!("disk write failed: {e}"));
+            fail_torrent(
+                ctx,
+                torrent,
+                ErrorKind::Io,
+                format!("disk write failed: {e}"),
+            );
         }
     }
 }
@@ -2346,7 +2441,12 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32, e
             }
             Err(e) => {
                 drop(t);
-                fail_torrent(&ctx, &torrent, format!("disk read failed: {e}"));
+                fail_torrent(
+                    &ctx,
+                    &torrent,
+                    ErrorKind::Io,
+                    format!("disk read failed: {e}"),
+                );
                 false
             }
         }
@@ -2586,23 +2686,134 @@ pub async fn wait_not_moving(torrent: &Rc<RefCell<Torrent>>) {
     }
 }
 
-/// Put the torrent into the error state and stop its activity.
-pub fn fail_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, error: String) {
+/// Put the torrent into the error state and stop its activity. Work in
+/// flight is void (`epoch`): a verify that reads back a piece whose write
+/// failed would otherwise blame the piece's peers for the disk.
+pub fn fail_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, kind: ErrorKind, error: String) {
     let id = {
         let mut t = torrent.borrow_mut();
         if t.error.is_some() {
             return;
         }
-        tracing::error!(torrent = t.id.0, "{error}");
+        tracing::error!(torrent = t.id.0, ?kind, "{error}");
         t.error = Some(error.clone());
+        t.error_kind = Some(kind);
+        t.error_stopping = true;
+        t.new_epoch();
         t.id
     };
-    ctx.emit(Event::TorrentError { id, error });
+    ctx.emit(Event::TorrentError { id, error, kind });
     let ctx2 = ctx.clone();
     let t2 = torrent.clone();
     uring::spawn(async move {
-        stop(&ctx2, &t2, false).await;
+        stop(&ctx2, &t2, true).await;
+        t2.borrow_mut().error_stopping = false;
     });
+}
+
+/// How [`recover`] was asked to bring an errored torrent back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// `Session::resume` / `force_resume`.
+    Resume,
+    /// `Session::force_recheck`.
+    Recheck,
+}
+
+/// Bring an errored torrent back (see [`ErrorKind`]); `Ok(false)` when it
+/// was not errored. `ContentMissing` resumed looks for the files again with
+/// the kept resume data; `Io` resumed drops the pieces that were in
+/// progress (their writes may have failed; their bytes count as redundant,
+/// as when a check voids them) and restarts, or rechecks when the error
+/// struck while checking; a recheck clears either, creates the files where
+/// missing and rechecks. Resuming also unpauses; the caller has set the
+/// queue flag already.
+pub async fn recover(
+    ctx: &Rc<Ctx>,
+    torrent: &Rc<RefCell<Torrent>>,
+    how: Recovery,
+) -> Result<bool, Error> {
+    let (kind, recheck_needed) = {
+        let t = torrent.borrow();
+        let Some(kind) = t.error.as_ref().and(t.error_kind) else {
+            return Ok(false);
+        };
+        (kind, t.recheck_on_recover)
+    };
+    if kind == ErrorKind::Metadata {
+        return Err(Error::Busy(
+            "the torrent's metadata is unusable; only removing it helps",
+        ));
+    }
+    // The wind-down the error started (stopped announces, resume save) must
+    // be over before anything restarts.
+    for _ in 0..600 {
+        if !torrent.borrow().error_stopping {
+            break;
+        }
+        uring::sleep(Duration::from_millis(50)).await;
+    }
+    let missing_resume = {
+        let mut t = torrent.borrow_mut();
+        t.error = None;
+        t.error_kind = None;
+        t.recheck_on_recover = false;
+        t.checking = false;
+        t.check_queued = false;
+        if how == Recovery::Resume {
+            t.paused = false;
+            t.auto_paused = false;
+        }
+        t.missing_resume.take()
+    };
+    tracing::info!(torrent = torrent.borrow().id.0, ?kind, ?how, "recovering");
+    match (how, kind) {
+        (Recovery::Resume, ErrorKind::ContentMissing) => {
+            torrent.borrow_mut().checking = true;
+            let files_present = wanted_files_present(torrent);
+            if files_present && let Err(e) = create_files(torrent).await {
+                fail_check(ctx, torrent, e.to_string());
+                return Ok(true);
+            }
+            initial_check(ctx.clone(), torrent.clone(), files_present, missing_resume).await;
+        }
+        (Recovery::Resume, _) if !recheck_needed => {
+            let storage = torrent.borrow().storage.clone();
+            let open: Vec<usize> = {
+                let mut t = torrent.borrow_mut();
+                let open: Vec<usize> = t.picker.open_piece_indices().collect();
+                let have = t.picker.have_bitfield();
+                let discarded = t.picker.set_have(&have);
+                t.stats.redundant += discarded;
+                t.suppliers.retain(|p, _| have.get(*p as usize));
+                open
+            };
+            if let Some(s) = storage {
+                for p in open {
+                    let _ = s.discard_piece(p).await;
+                }
+            }
+            let paused = torrent.borrow().paused;
+            if !paused {
+                super::queue::activate(ctx, torrent);
+            }
+        }
+        _ => {
+            if let Err(e) = create_files(torrent).await {
+                fail_check(ctx, torrent, e.to_string());
+                return Ok(true);
+            }
+            recheck(ctx.clone(), torrent.clone()).await;
+        }
+    }
+    Ok(true)
+}
+
+/// [`fail_torrent`] for a check (initial or forced) that could not read the
+/// files: recovering rechecks.
+fn fail_check(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, error: String) {
+    torrent.borrow_mut().recheck_on_recover = true;
+    fail_torrent(ctx, torrent, ErrorKind::Io, error);
 }
 
 /// Most requests in flight towards one peer (4 MiB of blocks).

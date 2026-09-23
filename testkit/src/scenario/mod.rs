@@ -16,6 +16,7 @@ use crate::oracle::{Oracle, OracleConfig};
 
 pub mod bench;
 mod m0;
+pub mod m12;
 pub mod m2;
 pub mod m3;
 pub mod m4;
@@ -141,6 +142,7 @@ pub fn all() -> Vec<ScenarioDef> {
     v.extend(m6::scenarios());
     v.extend(m8::scenarios());
     v.extend(m9::scenarios());
+    v.extend(m12::scenarios());
     v
 }
 

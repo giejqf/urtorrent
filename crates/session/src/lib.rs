@@ -25,10 +25,10 @@ mod api;
 mod engine;
 
 pub use api::{
-    ActiveLimits, AddTorrent, EncryptionMode, Event, EventStream, FileStatus, PeerInfo, PeerSource,
-    PeerTransport, PieceInfo, PieceState, QueueMove, Session, SessionBuilder, SessionSettings,
-    SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus, TrackerStatus,
-    TransportPolicy,
+    ActiveLimits, AddTorrent, EncryptionMode, ErrorKind, Event, EventStream, FileStatus, PeerInfo,
+    PeerSource, PeerTransport, PieceInfo, PieceState, QueueMove, Session, SessionBuilder,
+    SessionSettings, SessionStats, TorrentId, TorrentSource, TorrentState, TorrentStatus,
+    TrackerStatus, TransportPolicy,
 };
 pub use profile::Profile;
 

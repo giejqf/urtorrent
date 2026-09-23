@@ -1,0 +1,41 @@
+{
+  "after_recheck_back": {
+    "states": [
+      "stoppedDL",
+      "stoppedUP"
+    ]
+  },
+  "after_recheck_missing": {
+    "file_exists": false,
+    "progress": 0.0,
+    "states": [
+      "missingFiles",
+      "stalledDL"
+    ]
+  },
+  "after_restart": {
+    "announces": [],
+    "file_exists": false,
+    "states": [
+      "checkingResumeData",
+      "missingFiles"
+    ]
+  },
+  "after_start": {
+    "announces": [],
+    "file_exists": false,
+    "states": [
+      "checkingResumeData",
+      "missingFiles"
+    ]
+  },
+  "log": [
+    "Restored torrent. Torrent: \"missing.bin\"",
+    "Failed to restore torrent. Files were probably moved or storage isn't accessible. Torrent: \"missing.bin\". Reason: \"missing.bin fast resume rejected. file_stat(/home/ubuntu/repos/urtorrent/testkit/runs/1790147792-capture_missing_files-v4/oracle/data/missing.bin): mismatching file size\"",
+    "Failed to restore torrent. Files were probably moved or storage isn't accessible. Torrent: \"missing.bin\". Reason: \"missing.bin fast resume rejected. file_stat(/home/ubuntu/repos/urtorrent/testkit/runs/1790147792-capture_missing_files-v4/oracle/data/missing.bin): mismatching file size\"",
+    "Torrent stopped. Torrent: \"missing.bin\"",
+    "Torrent resumed. Torrent: \"missing.bin\"",
+    "Torrent stopped. Torrent: \"missing.bin\"",
+    "Torrent download finished. Torrent: \"missing.bin\""
+  ]
+}

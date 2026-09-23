@@ -20,8 +20,13 @@ libtorrent's `write_resume_data_buf()` / `read_resume_data()`.
 Either way the data is only written after the torrent's files are
 `fsync`ed, so everything it claims is on disk: `kill -9` at any moment never
 yields a torrent that claims pieces it does not have (AGENTS.md 5.4). If the
-files the data describes are missing (or the data does not match the
-metainfo), the disk is rechecked instead.
+data does not match the metainfo, the disk is rechecked instead. If it
+vouches for content (verified pieces or written ranges) and a wanted file is
+gone, the torrent stops with `ErrorKind::ContentMissing` and creates nothing
+(libtorrent rejects such a fast resume; qBittorrent shows "missing files",
+docs/quirks.md Q28). The data is kept and saved back as it was:
+`Session::resume` tries it again once the files are back, and
+`Session::force_recheck` accepts what the disk holds instead.
 
 ## What the blob holds (format 6)
 

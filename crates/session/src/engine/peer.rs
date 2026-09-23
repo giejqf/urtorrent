@@ -1741,13 +1741,26 @@ async fn uploader(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, handle: Rc<PeerHa
                         handle.out.notify();
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(addr = %handle.addr, "read for upload failed: {e}");
+                Err(storage::Error::OutOfRange) => {
                     handle.conn.borrow_mut().reject(r);
                     handle.out.notify();
+                }
+                Err(e) => {
+                    // The files cannot be read (cut short, deleted, the drive
+                    // gone): libtorrent's `handle_disk_error` stops the
+                    // torrent with the error rather than rejecting requests
+                    // forever with nobody the wiser.
+                    handle.conn.borrow_mut().reject(r);
+                    handle.out.notify();
+                    torrent::fail_torrent(
+                        &ctx,
+                        &torrent,
+                        crate::api::ErrorKind::Io,
+                        format!("disk read failed: {e}"),
+                    );
+                    return;
                 }
             }
         }
     }
-    let _ = &ctx;
 }
