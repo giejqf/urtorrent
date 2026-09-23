@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.3] - 2026-09-23
+
+Gates for seeding from a partial selection, and the difference they found.
+
+### Fixed
+
+- **A partial seed did not say `upload_only` in its LTEP handshake**
+  (BEP 21). The key followed "every piece is here"; libtorrent's follows
+  "every wanted piece is done" (`is_upload_only` = `is_finished`), so a
+  torrent with a file skipped and the rest downloaded announced itself as
+  still downloading, a difference a peer could see (L2). The oracle
+  capture `capture_partial_seed` pinned it; docs/quirks.md Q30.
+  `wire::ConnectionParams::upload_only` carries the engine's view.
+
+### Added
+
+- `crates/session/tests/partial.rs`: a partial seed as a leecher's only
+  source (it gets exactly the pieces held, the straddling ones read back
+  from the parts file, and sees a non-seed with that many pieces), a
+  partial download across a restart, a forced check and a fresh add
+  without resume data (the check finds the pieces through the parts file),
+  and a complete file deselected (still seeded, left on disk, nothing
+  downloaded when selected again).
+- Lab: the oracle capture `capture_partial_seed` and the scenario
+  `partial_seed_shape` (Diff): our partial seed's bitfield, `upload_only`
+  and the `upload_only` 0 on widening match the oracle's, and an oracle
+  downloads the selection from us alone.
+- `wire` unit test: a finished partial connection says `upload_only`; the
+  seeding test's `upload_only` check, which could never run, now does.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0D30-` / `urtorrent/0.13.3`
+  / DHT `UR\x00\x0d`.
+
 ## [0.13.2] - 2026-09-23
 
 ### Fixed

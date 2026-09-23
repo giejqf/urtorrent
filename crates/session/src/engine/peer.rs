@@ -500,6 +500,9 @@ fn connection_params(
         advertise_port: ctx.advertise_port_for(local_ip),
         private: t.private,
         dht_port: ctx.dht().map(|d| d.port()),
+        // BEP 21 in the LTEP handshake: finished, a partial seed included
+        // (libtorrent `is_upload_only` = `is_finished`).
+        upload_only: t.is_complete(),
     }
 }
 

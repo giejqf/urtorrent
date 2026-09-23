@@ -125,6 +125,7 @@ fn replay_oracle_leeching_from_us() {
         advertise_port: true,
         private: false,
         dht_port: None,
+        upload_only: false,
     });
     let mut requests = 0;
     let mut haves = 0;
@@ -434,6 +435,7 @@ fn qbt_magnet_mode_matches_capture() {
         advertise_port: true,
         private: false,
         dht_port: None,
+        upload_only: false,
     });
     let hs_out = conn.take_outbound();
     assert_eq!(hs_out.len(), wire::HANDSHAKE_LEN);

@@ -181,6 +181,7 @@ pub fn spawn_seeder_resetting(
                     advertise_port: true,
                     private: false,
                     dht_port: None,
+                    upload_only: false,
                 });
                 stream
                     .set_read_timeout(Some(Duration::from_secs(20)))

@@ -108,6 +108,10 @@ pub struct ConnectionParams {
     /// DHT is off: then, like the oracle with DHT disabled, `port` is never
     /// sent (the qbt profile still advertises the bit, docs/quirks.md Q1).
     pub dht_port: Option<u16>,
+    /// Every wanted piece is done (libtorrent's `is_finished`), so the LTEP
+    /// handshake says `upload_only` (BEP 21), a partial seed included. A
+    /// complete have-set counts as finished whatever this says.
+    pub upload_only: bool,
 }
 
 /// Something that happened on the connection that the caller must act on.
@@ -692,10 +696,11 @@ impl Connection {
             match step {
                 profile::FirstMessage::ExtendedHandshake => {
                     if self.ltep {
-                        let seeding = self
-                            .params
-                            .piece_count
-                            .is_some_and(|n| n > 0 && self.params.our_have.is_complete());
+                        let seeding = self.params.upload_only
+                            || self
+                                .params
+                                .piece_count
+                                .is_some_and(|n| n > 0 && self.params.our_have.is_complete());
                         let ext = ExtHandshake::build(
                             &self.params.profile.ltep,
                             self.params.profile.ltep_version,
@@ -1123,6 +1128,7 @@ mod tests {
             advertise_port: true,
             private: false,
             dht_port: None,
+            upload_only: false,
         }
     }
 
@@ -1230,11 +1236,11 @@ mod tests {
         let ev = c.receive(&hs[30..]).unwrap();
         assert!(matches!(ev[0], Event::Handshaked { .. }));
         let out = c.take_outbound();
-        let msgs = decode_all(&out, true);
-        assert!(matches!(msgs[0], Message::Extended { id: 0, .. }));
-        assert_eq!(msgs[1], Message::HaveAll);
+        let first = decode_all(&out, true);
+        assert!(matches!(first[0], Message::Extended { id: 0, .. }));
+        assert_eq!(first[1], Message::HaveAll);
         // The allowed-fast set waits for the peer's `interested` (libtorrent).
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(first.len(), 2);
         assert!(c.allowed_fast_granted().is_empty());
         c.receive(&Message::Interested.to_bytes()).unwrap();
         let msgs = decode_all(&c.take_outbound(), false);
@@ -1245,12 +1251,41 @@ mod tests {
         c.receive(&Message::Interested.to_bytes()).unwrap();
         assert!(c.take_outbound().is_empty());
         // Seeding: upload_only is not part of the native profile.
-        if let Message::Extended { payload, .. } = &msgs[0] {
-            let ext = ExtHandshake::parse(payload).unwrap();
-            assert_eq!(ext.upload_only, None);
-            assert_eq!(ext.p, Some(6881));
-            assert_eq!(ext.yourip, Some("10.0.0.2".parse().unwrap()));
-        }
+        let Message::Extended { payload, .. } = &first[0] else {
+            panic!("{first:?}")
+        };
+        let ext = ExtHandshake::parse(payload).unwrap();
+        assert_eq!(ext.upload_only, None);
+        assert_eq!(ext.p, Some(6881));
+        assert_eq!(ext.yourip, Some("10.0.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_finished_partial_torrent_says_upload_only() {
+        // BEP 21 under the qbt profile: libtorrent's `is_upload_only` is
+        // `is_finished` (every wanted piece done), not "every piece": a
+        // partial seed says `upload_only: 1` (capture_partial_seed).
+        let upload_only_of = |finished: bool, have_all: bool| {
+            let mut p = params(Role::Initiator, 12, have_all);
+            p.profile = profile::Profile::qbt_5_2_3_lt2_0_14();
+            p.our_have.set(0);
+            p.our_have.set(1);
+            p.upload_only = finished;
+            let mut c = Connection::new(p);
+            c.take_outbound();
+            c.receive(&peer_hs(FULL)).unwrap();
+            let msgs = decode_all(&c.take_outbound(), false);
+            let Some(Message::Extended { id: 0, payload }) = msgs
+                .iter()
+                .find(|m| matches!(m, Message::Extended { id: 0, .. }))
+            else {
+                panic!("no extension handshake: {msgs:?}")
+            };
+            ExtHandshake::parse(payload).unwrap().upload_only
+        };
+        assert_eq!(upload_only_of(true, false), Some(true), "finished partial");
+        assert_eq!(upload_only_of(false, false), None, "still downloading");
+        assert_eq!(upload_only_of(false, true), Some(true), "every piece");
     }
 
     #[test]

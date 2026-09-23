@@ -12,7 +12,7 @@ description = "Sans-IO uTP (BEP 29, LEDBAT) transport state machine for urtorren
 workspace = true
 
 [dependencies]
-profile = { path = "../profile", version = "0.13.2" }
+profile = { path = "../profile", version = "0.13.3" }
 thiserror.workspace = true
 tracing.workspace = true
 

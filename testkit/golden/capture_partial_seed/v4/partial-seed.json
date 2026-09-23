@@ -1,0 +1,43 @@
+{
+  "after_widen": [
+    {
+      "ext_id": 3,
+      "kind": "extended",
+      "raw": "00"
+    }
+  ],
+  "bitfield": {
+    "bytes": 5,
+    "hex": "ffe00003fe",
+    "set_bits": 20
+  },
+  "ext_keys": [
+    "complete_ago",
+    "m",
+    "metadata_size",
+    "reqq",
+    "upload_only",
+    "v",
+    "yourip"
+  ],
+  "first": [
+    {
+      "kind": "handshake"
+    },
+    {
+      "ext_id": 0,
+      "kind": "extended",
+      "raw": null
+    },
+    {
+      "kind": "bitfield"
+    },
+    {
+      "kind": "unchoke"
+    },
+    {
+      "kind": "choke"
+    }
+  ],
+  "upload_only": 1
+}

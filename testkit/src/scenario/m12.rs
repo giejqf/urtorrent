@@ -14,10 +14,10 @@ use serde_json::json;
 
 use super::{Ctx, ScenarioDef, Tag};
 use crate::client::ClientConfig;
-use crate::fixtures::{Fixture, FixtureSpec};
+use crate::fixtures::{FileSpec, Fixture, FixtureSpec};
 use crate::lab::Shape;
 use crate::oracle::{Encryption, OracleConfig};
-use crate::tap::peer::{Role, TapEncryption, TapPeer, TapPeerConfig};
+use crate::tap::peer::{PeerEvent, Role, TapEncryption, TapPeer, TapPeerConfig};
 use crate::tap::tracker::{TapEvent, TapTracker, TapTrackerConfig};
 use crate::webapi::{AddTorrent, WebApi};
 
@@ -40,6 +40,18 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             shapes: &[Shape::V4],
             tags: &[Tag::It, Tag::Diff],
             run: magnet_hold,
+        },
+        ScenarioDef {
+            name: "capture_partial_seed",
+            shapes: &[Shape::V4],
+            tags: &[Tag::Capture],
+            run: capture_partial_seed,
+        },
+        ScenarioDef {
+            name: "partial_seed_shape",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It, Tag::Diff],
+            run: partial_seed_shape,
         },
     ]
 }
@@ -417,6 +429,269 @@ fn magnet_hold(ctx: &mut Ctx) -> Result<()> {
     ensure!(
         after.starts_with(&oracle_after),
         "announces after resume differ: ours {after:?}, oracle {oracle_after:?}"
+    );
+    client.shutdown()?;
+    Ok(())
+}
+
+/// The selective fixture of the partial-seed scenarios: the middle file is
+/// skipped, so pieces 10 and 30 straddle it and 11-29 lie inside it.
+fn partial_fixture(tracker: &TapTracker) -> Arc<Fixture> {
+    Arc::new(Fixture::generate(
+        FixtureSpec::small("sel")
+            .with_files(vec![
+                FileSpec::new("a.bin", 700_000),
+                FileSpec::new("sub/b.bin", 1_300_000),
+                FileSpec::new("c.bin", 500_000),
+            ])
+            .with_piece_length(64 << 10)
+            .with_tracker(&tracker.http_url(0)),
+    ))
+}
+
+/// A silent tap peer that advertises BEP 21 `upload_only` (libtorrent sends
+/// the message only to peers that list it in their `m` map).
+fn upload_only_tap(fx: &Fixture) -> Result<TapPeer> {
+    let mut m = crate::bencode::Value::dict();
+    m.insert("ut_pex", crate::bencode::Value::Int(1));
+    m.insert("ut_metadata", crate::bencode::Value::Int(2));
+    m.insert("upload_only", crate::bencode::Value::Int(3));
+    let mut ext = crate::bencode::Value::dict();
+    ext.insert("m", m);
+    ext.insert("v", crate::bencode::Value::str("tap-peer 0.1"));
+    ext.insert("reqq", crate::bencode::Value::Int(250));
+    TapPeer::start(
+        TapPeerConfig::new(fx.info_hash, Role::Silent)
+            .ext_handshake(Some(ext))
+            .encryption(TapEncryption::Disabled)
+            .linger(Duration::from_secs(30)),
+    )
+}
+
+fn connect_retry(tap: &TapPeer, target: SocketAddr, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        tap.connect_async(target);
+        if tap.wait_for(Duration::from_secs(3), |c| {
+            c.iter().any(|c| c.handshake.is_some())
+        }) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
+/// A received message as the shape comparison sees it: its kind, the
+/// extension id for extension messages, and the payload of a non-bencoded
+/// one (BEP 21 `upload_only` is one raw byte).
+fn shape_of(e: &PeerEvent) -> serde_json::Value {
+    if e.kind == "extended" {
+        let raw = if e.detail["decoded"].is_null() {
+            e.detail["raw_hex"].clone()
+        } else {
+            serde_json::Value::Null
+        };
+        json!({ "kind": "extended", "ext_id": e.detail["ext_id"], "raw": raw })
+    } else {
+        json!({ "kind": e.kind })
+    }
+}
+
+/// What a partial seed shows a peer that connects to it, then what it sends
+/// when its selection widens: the bitfield, the extension handshake's
+/// `upload_only`, and the messages after the change.
+fn observe_partial_seed(
+    tap: &TapPeer,
+    target: SocketAddr,
+    widen: &dyn Fn() -> Result<()>,
+) -> Result<serde_json::Value> {
+    ensure!(connect_retry(tap, target, 10), "the tap could not connect");
+    ensure!(
+        tap.wait_for(Duration::from_secs(10), |c| c
+            .iter()
+            .any(|c| c.ext_handshake().is_some())),
+        "no extension handshake"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let before = tap.captures();
+    let conn = before
+        .iter()
+        .find(|c| c.ext_handshake().is_some())
+        .ok_or_else(|| anyhow::anyhow!("no connection"))?;
+    let recv: Vec<&PeerEvent> = conn.events.iter().filter(|e| e.dir == "recv").collect();
+    let bitfield = recv
+        .iter()
+        .find(|e| e.kind == "bitfield")
+        .map(|e| e.detail.clone());
+    let ext = conn.ext_handshake().cloned().unwrap_or_default();
+    let seen = recv.len();
+    widen()?;
+    std::thread::sleep(Duration::from_secs(4));
+    let after_caps = tap.captures();
+    let after: Vec<serde_json::Value> = after_caps
+        .iter()
+        .find(|c| c.id == conn.id)
+        .map(|c| {
+            c.events
+                .iter()
+                .filter(|e| e.dir == "recv")
+                .skip(seen)
+                .filter(|e| e.kind != "keep_alive")
+                .map(shape_of)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(json!({
+        "first": recv.iter().map(|e| shape_of(e)).collect::<Vec<_>>(),
+        "bitfield": bitfield,
+        "ext_keys": ext.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()),
+        "upload_only": ext.get("upload_only").cloned(),
+        "after_widen": after,
+    }))
+}
+
+/// The oracle as a partial seed: it downloaded a selection (the middle file
+/// skipped) and its seeder is gone. A tap peer records what it advertises,
+/// and what it sends when the middle file is selected after all.
+fn capture_partial_seed(ctx: &mut Ctx) -> Result<()> {
+    let tracker = tap_tracker(ctx)?;
+    let fx = partial_fixture(&tracker);
+    let h = fx.info_hash_hex();
+    let mut seeder = ctx.oracle(
+        "seeder",
+        OracleConfig::primary().encryption(Encryption::Disable),
+    )?;
+    fx.write_data(&seeder.save_path)?;
+    seeder.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&seeder.save_path.to_string_lossy()),
+        &h,
+    )?;
+    seeder
+        .api
+        .wait_for(&h, Duration::from_secs(60), "seeder", |t| t.is_seeding())?;
+    let partial = ctx.oracle(
+        "partial",
+        OracleConfig::primary().encryption(Encryption::Disable),
+    )?;
+    partial.api.add_torrent(
+        &AddTorrent::file(&fx.torrent)
+            .save_path(&partial.save_path.to_string_lossy())
+            .stopped(true),
+        &h,
+    )?;
+    partial.api.set_file_priority(&h, &[1], 0)?;
+    partial.api.start(&h)?;
+    let t = partial
+        .api
+        .wait_for(&h, Duration::from_secs(120), "the selection", |t| {
+            t.is_complete()
+        })?;
+    ctx.note(format!(
+        "oracle partial: state={} progress={}",
+        t.state, t.progress
+    ));
+    seeder.shutdown()?;
+    let tap = upload_only_tap(&fx)?;
+    let target = SocketAddr::new(partial.actor.addr(), partial.listen_port());
+    let api = partial.api.clone();
+    let hh = h.clone();
+    let summary = observe_partial_seed(&tap, target, &move || api.set_file_priority(&hh, &[1], 1))?;
+    ctx.note(format!("oracle partial seed: {summary}"));
+    let p = ctx.file("partial-seed.json");
+    std::fs::write(&p, serde_json::to_string_pretty(&summary)?)?;
+    ctx.artifact("partial-seed.json", &p);
+    let tp = ctx.file("tap-peer-partial.jsonl");
+    tap.save_jsonl(&tp)?;
+    ctx.artifact("tap-peer-partial.jsonl", &tp);
+    Ok(())
+}
+
+/// Our client (qbt profile) as a partial seed, against the oracle's
+/// (`capture_partial_seed`): the same bitfield, the same `upload_only` in
+/// the extension handshake and the same messages when the selection widens.
+/// Then an oracle that wants the same selection downloads it from us, its
+/// only source.
+fn partial_seed_shape(ctx: &mut Ctx) -> Result<()> {
+    let golden =
+        crate::scenario::golden_file("capture_partial_seed", Shape::V4, "partial-seed.json")
+            .ok_or_else(|| {
+                anyhow::anyhow!("no golden; run `cargo xtask capture capture_partial_seed`")
+            })?;
+    let golden: serde_json::Value = serde_json::from_slice(&std::fs::read(golden)?)?;
+    let tracker = tap_tracker(ctx)?;
+    let fx = partial_fixture(&tracker);
+    let h = fx.info_hash_hex();
+    let mut seeder = ctx.oracle(
+        "seeder",
+        OracleConfig::primary().encryption(Encryption::Disable),
+    )?;
+    fx.write_data(&seeder.save_path)?;
+    seeder.api.add_torrent(
+        &AddTorrent::file(&fx.torrent).save_path(&seeder.save_path.to_string_lossy()),
+        &h,
+    )?;
+    seeder
+        .api
+        .wait_for(&h, Duration::from_secs(60), "seeder", |t| t.is_seeding())?;
+    let torrent_path = ctx.file("sel.torrent");
+    std::fs::write(&torrent_path, &fx.torrent)?;
+    let mut client = ctx.client(
+        "urt",
+        ClientConfig::default()
+            .profile("qbt")
+            .encryption("disabled")
+            .lsd(false)
+            .file_priorities(vec![4, 0, 4]),
+        &torrent_path,
+    )?;
+    client.wait_for(Duration::from_secs(120), "the selection", |s| s.complete)?;
+    seeder.shutdown()?;
+    let tap = upload_only_tap(&fx)?;
+    let target = SocketAddr::new(client.actor.addr(), client.listen_port());
+    let ours = {
+        let c = &client;
+        observe_partial_seed(&tap, target, &|| c.command("prio 4,4,4"))?
+    };
+    ctx.note(format!("ours: {ours}"));
+    ctx.note(format!("oracle: {golden}"));
+    for key in ["bitfield", "upload_only", "after_widen"] {
+        ensure!(
+            ours[key] == golden[key],
+            "{key} differs: ours {}, oracle {}",
+            ours[key],
+            golden[key]
+        );
+    }
+    // Back to the selection, and an oracle downloads it from us alone.
+    client.command("prio 4,0,4")?;
+    let leecher = ctx.oracle(
+        "leecher",
+        OracleConfig::primary().encryption(Encryption::Disable),
+    )?;
+    leecher.api.add_torrent(
+        &AddTorrent::file(&fx.torrent)
+            .save_path(&leecher.save_path.to_string_lossy())
+            .stopped(true),
+        &h,
+    )?;
+    leecher.api.set_file_priority(&h, &[1], 0)?;
+    leecher.api.start(&h)?;
+    leecher.api.add_peers(&h, &[target])?;
+    leecher.api.wait_for(
+        &h,
+        Duration::from_secs(120),
+        "the oracle's selection",
+        |t| t.is_complete(),
+    )?;
+    let a = std::fs::read(leecher.save_path.join("sel/a.bin"))?;
+    ensure!(
+        a == fx.data_range(0, 700_000),
+        "a.bin from our partial seed"
+    );
+    let c = std::fs::read(leecher.save_path.join("sel/c.bin"))?;
+    ensure!(
+        c == fx.data_range(2_000_000, 500_000),
+        "c.bin from our partial seed"
     );
     client.shutdown()?;
     Ok(())

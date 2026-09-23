@@ -9,7 +9,7 @@
 | Fuzz | `fuzz/` | `cargo xtask fuzz <target> [secs]` |
 | Replay | crate tests fed from `testkit/golden` | `cargo xtask check` |
 | Integration | `testkit/src/scenario` | `cargo xtask it [--shape v4\|v6\|dual] [scenario]` |
-| Differential | scenarios tagged `Diff` (`diff_identity`, `mse_shape`, `dual_stack_announce`, `pex_discovery`, `web_seed_only`, `dht_shape`, `utp_shape`, `magnet_private_shape`, `magnet_hold`, ...) | `cargo xtask diff` |
+| Differential | scenarios tagged `Diff` (`diff_identity`, `mse_shape`, `dual_stack_announce`, `pex_discovery`, `web_seed_only`, `dht_shape`, `utp_shape`, `magnet_private_shape`, `magnet_hold`, `partial_seed_shape`, ...) | `cargo xtask diff` |
 | Captures | scenarios tagged `Capture` | `cargo xtask capture` |
 | Enforcement | `xtask syscalls` (uring probe + real session under `strace -f -Y`) | `cargo xtask syscalls` |
 | Benchmark | `testkit/src/scenario/bench.rs` (RSS / CPU against the oracle) | `cargo xtask bench [bench_leech\|bench_seed\|bench_many]` (see `docs/perf.md`) |

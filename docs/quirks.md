@@ -615,3 +615,20 @@ us by `magnet_hold` (`xtask diff`).
   files checked" for a magnet is hold then release.
 - **The hold is not persisted.** A held torrent's resume data describes the
   torrent without the hold; a caller that restarts re-adds it held.
+
+## Q30. A partial seed is upload-only
+
+Source: capture `capture_partial_seed` (golden
+`testkit/golden/capture_partial_seed/v4/partial-seed.json`), checked against
+us by `partial_seed_shape` (`xtask diff`); libtorrent 2.0.14
+`torrent::is_upload_only` (= `is_finished`: every wanted piece done).
+
+- **The LTEP handshake says `upload_only: 1` once the selection is done**,
+  not only when every piece is there: the oracle, having downloaded two of
+  three files, sent `upload_only: 1` with a bitfield of its 20 pieces. Before
+  0.13.3 we left the key out until the whole torrent was complete (an L2
+  difference a peer could see).
+- **Selecting more sends `upload_only` 0** (BEP 21's one-byte extension
+  message) to peers that advertise the extension, as the oracle does.
+- The bitfield carries exactly the pieces held, the straddling ones included
+  (their skipped-file bytes read back from the parts file when served).
