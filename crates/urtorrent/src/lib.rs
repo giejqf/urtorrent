@@ -43,6 +43,9 @@ pub use session::{
     TrackerStatus, TransportPolicy,
 };
 
+/// This library's version (`CARGO_PKG_VERSION`), for a frontend's "about".
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Stream conveniences for [`EventStream`] (`tokio` feature).
 #[cfg(feature = "tokio")]
 pub use tokio_stream::StreamExt;

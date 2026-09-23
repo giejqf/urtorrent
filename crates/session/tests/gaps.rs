@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{block_on, event_param, make_multi_torrent, make_torrent, spawn_tracker};
+use common::{
+    block_on, event_param, make_multi_torrent, make_torrent, spawn_seeder, spawn_tracker,
+};
 use session::{AddTorrent, Session, SessionBuilder, TorrentId, TorrentState, TransportPolicy};
 
 fn init_log() {
@@ -407,6 +409,117 @@ fn a_held_torrent_file_is_held_at_once_and_removed_without_trace() {
         0,
         "no resume file left behind"
     );
+    block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn statuses_carry_what_a_list_view_shows() {
+    // One call per refresh, no per-torrent follow-ups: the tracker summary,
+    // the sequential flag, distributed copies and the activity times.
+    let dir = tmp("list");
+    let (bytes, data) = make_torrent("l.bin", 2 << 20, 64 * 1024, "http://127.0.0.1:1/x");
+    let a_dir = dir.join("a");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("l.bin"), &data).unwrap();
+    let a = block_on(builder(1).upload_limit(1 << 20).build()).unwrap();
+    let a_id = block_on(a.add_torrent(AddTorrent::metainfo(bytes.clone(), &a_dir))).unwrap();
+    wait_state(&a, a_id, TorrentState::Seeding, 10);
+    let a_st = status(&a, a_id);
+    assert_eq!(
+        a_st.distributed_copies(),
+        None,
+        "a seed reports none (libtorrent's -1)"
+    );
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_tracker(addr_of(1, &a), log);
+    let (bytes_b, _) = make_torrent("l.bin", 2 << 20, 64 * 1024, &url);
+    assert_eq!(
+        metainfo::Torrent::parse(&bytes_b).unwrap().info.info_hash,
+        metainfo::Torrent::parse(&bytes).unwrap().info.info_hash
+    );
+    let b_dir = dir.join("b");
+    let b = block_on(builder(2).build()).unwrap();
+    // Same content, announced to the test tracker (the info dict is the
+    // same, so is the info-hash).
+    let id =
+        block_on(b.add_torrent(AddTorrent::metainfo(bytes_b, &b_dir).sequential(true))).unwrap();
+    let find = || {
+        block_on(b.statuses())
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap()
+    };
+    wait_for("the tracker summary", 10, || {
+        find().working_tracker.as_deref() == Some(url.as_str())
+    });
+    let st = find();
+    assert!(st.trackers.is_empty(), "statuses() stays cheap");
+    assert_eq!(st.trackers_count, 1);
+    assert_eq!((st.swarm_seeders, st.swarm_leechers), (Some(1), Some(0)));
+    assert!(st.sequential);
+    // While downloading from the seed: at least one full copy (the seed's).
+    wait_for("distributed copies", 10, || {
+        find().distributed_copies().is_some_and(|c| c >= 1.0)
+    });
+    wait_state(&b, id, TorrentState::Seeding, 30);
+    wait_for("the activity times", 5, || {
+        let st = find();
+        st.last_download.is_some() && st.last_seen_complete.is_some()
+    });
+    assert_eq!(find().distributed_copies(), None);
+    wait_for("the seed's upload time", 5, || {
+        status(&a, a_id).last_upload.is_some()
+    });
+    // They survive in resume data.
+    let r = storage::ResumeData::decode(&block_on(b.resume_data(id)).unwrap()).unwrap();
+    assert!(
+        r.last_download.is_some() && r.last_seen_complete.is_some(),
+        "{r:?}"
+    );
+    block_on(b.shutdown()).unwrap();
+    block_on(a.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_peer_the_engine_bans_is_reported() {
+    // The only supplier of pieces that fail their hash is banned at once
+    // (libtorrent trust points), and the caller hears of it.
+    let (bytes, data) = make_torrent("ban.bin", 256 * 1024, 64 * 1024, "http://127.0.0.1:1/x");
+    let hash = metainfo::Torrent::parse(&bytes).unwrap().info.info_hash;
+    let mut bad = data.clone();
+    for b in bad.iter_mut().step_by(1000) {
+        *b ^= 0xff;
+    }
+    let seeder = spawn_seeder(hash, Arc::new(bad), 64 * 1024);
+    let dir = tmp("ban");
+    let s = block_on(builder(1).build()).unwrap();
+    let mut events = s.events();
+    let id = block_on(s.add_torrent(AddTorrent::metainfo(bytes, &dir))).unwrap();
+    block_on(s.add_peer(id, seeder)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match events.try_recv() {
+            Some(session::Event::PeerBanned {
+                id: bid,
+                ip,
+                reason,
+            }) => {
+                assert_eq!(bid, id);
+                assert_eq!(ip, seeder.ip());
+                assert!(reason.contains("hash"), "{reason}");
+                break;
+            }
+            Some(_) => {}
+            None => {
+                assert!(Instant::now() < deadline, "no PeerBanned event");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
     block_on(s.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

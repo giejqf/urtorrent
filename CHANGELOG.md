@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.0] - 2026-09-23
 
 What a daemon in front of the library needs (`../urtorrentd/docs/gaps.md`).
 Breaking: `Event` and `TorrentState` are `#[non_exhaustive]` now, and
@@ -35,6 +35,20 @@ Breaking: `Event` and `TorrentState` are `#[non_exhaustive]` now, and
   the lab scenario `magnet_hold`. `urt-client --hold`, control `release`.
 - `AddTorrent` is `#[non_exhaustive]` (build it with its constructors and
   builder methods).
+- What a list view shows, in `Session::statuses` without per-torrent
+  follow-ups: `TorrentStatus::{trackers_count, working_tracker,
+  swarm_seeders, swarm_leechers}` (the tracker list itself stays in
+  `status` / `trackers`), `sequential`, libtorrent's distributed copies
+  (`distributed_full_copies`, `distributed_fraction`,
+  `TorrentStatus::distributed_copies()`; `None` for a seed, libtorrent's
+  -1) from a per-availability piece count the picker keeps in step, and
+  `last_seen_complete`, `last_download`, `last_upload` (unix seconds,
+  libtorrent's).
+- `Event::PeerBanned { id, ip, reason }` when the engine bans a peer for
+  hash failures.
+- `urtorrent::VERSION`.
+- Resume data format 7: the three activity times (formats 1-6 still
+  load).
 
 ### Changed
 
@@ -48,6 +62,8 @@ Breaking: `Event` and `TorrentState` are `#[non_exhaustive]` now, and
   so a seed whose drive vanished failed silently.
 - `remove_torrent` deletes the torrent's resume file (the final save while
   stopping is skipped); `remove_torrent_with_files` already did.
+- The `native` profile's identity strings are `-UR0C00-` / `urtorrent/0.12.0`
+  / DHT `UR\x00\x0c`.
 
 ### Fixed
 

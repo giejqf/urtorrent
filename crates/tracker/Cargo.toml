@@ -12,9 +12,9 @@ description = "Sans-IO HTTP/UDP tracker announce and scrape builders, parsers an
 workspace = true
 
 [dependencies]
-bencode = { path = "../bencode", version = "0.11.4" }
-metainfo = { path = "../metainfo", version = "0.11.4" }
-profile = { path = "../profile", version = "0.11.4" }
+bencode = { path = "../bencode", version = "0.12.0" }
+metainfo = { path = "../metainfo", version = "0.12.0" }
+profile = { path = "../profile", version = "0.12.0" }
 # Pure-Rust inflate for gzip-compressed tracker responses (we advertise
 # `Accept-Encoding: gzip` because the oracle does).
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

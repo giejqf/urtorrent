@@ -242,7 +242,7 @@ pub fn spawn_tracker(peer: SocketAddr, log: Arc<Mutex<Vec<String>>>) -> String {
             let SocketAddr::V4(p) = peer else {
                 unreachable!()
             };
-            let mut body = b"d8:intervali1800e5:peers6:".to_vec();
+            let mut body = b"d8:completei1e10:incompletei0e8:intervali1800e5:peers6:".to_vec();
             body.extend_from_slice(&p.ip().octets());
             body.extend_from_slice(&p.port().to_be_bytes());
             body.push(b'e');

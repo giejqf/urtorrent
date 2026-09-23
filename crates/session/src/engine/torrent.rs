@@ -85,6 +85,15 @@ pub struct Stats {
     last_uploaded: u64,
 }
 
+/// [`Torrent::tracker_summary`].
+#[derive(Default)]
+struct TrackerSummary {
+    count: usize,
+    working: Option<String>,
+    seeders: Option<u32>,
+    leechers: Option<u32>,
+}
+
 /// One torrent.
 pub struct Torrent {
     pub id: TorrentId,
@@ -111,6 +120,15 @@ pub struct Torrent {
     /// carries one) and when the download completed.
     pub added_time: u64,
     pub completed_time: Option<u64>,
+    /// Unix seconds: a complete copy last seen (a connected seed, or ours),
+    /// payload last received, payload last sent (libtorrent's
+    /// `last_seen_complete`, `last_download`, `last_upload`).
+    pub last_seen_complete: Option<u64>,
+    pub last_download: Option<u64>,
+    pub last_upload: Option<u64>,
+    /// Addresses this torrent banned since the last look (for
+    /// `Event::PeerBanned`).
+    new_bans: Vec<IpAddr>,
     /// A resume blob given at add time (`AddTorrent::resume_data`), taking
     /// precedence over the resume directory's file.
     pub resume_blob: Option<Vec<u8>>,
@@ -437,6 +455,21 @@ impl Torrent {
             .collect()
     }
 
+    /// What the list view shows of the trackers: how many, the first that
+    /// works, and the most seeds / leechers any of them reported.
+    fn tracker_summary(&self) -> TrackerSummary {
+        let mut sum = TrackerSummary::default();
+        for t in self.announcer.snapshot() {
+            sum.count += 1;
+            if t.working && sum.working.is_none() {
+                sum.working = Some(t.url);
+            }
+            sum.seeders = sum.seeders.max(t.complete);
+            sum.leechers = sum.leechers.max(t.incomplete);
+        }
+        sum
+    }
+
     /// The per-file status list.
     pub fn files(&self) -> Vec<crate::api::FileStatus> {
         self.file_statuses()
@@ -540,6 +573,13 @@ impl Torrent {
     ) -> TorrentStatus {
         let n = self.piece_count();
         let seeds = self.peers.values().filter(|p| p.is_seed(n)).count();
+        let tracker_summary = self.tracker_summary();
+        // libtorrent frees a seed's picker and reports -1.
+        let copies = if n == 0 || self.picker.have_count() == n {
+            None
+        } else {
+            self.picker.distributed_copies()
+        };
         TorrentStatus {
             id: self.id,
             info_hash: self.info_hash,
@@ -547,6 +587,16 @@ impl Torrent {
             state: self.state(),
             error: self.error.clone(),
             error_kind: self.error.as_ref().and(self.error_kind),
+            sequential: self.sequential,
+            trackers_count: tracker_summary.count,
+            working_tracker: tracker_summary.working,
+            swarm_seeders: tracker_summary.seeders,
+            swarm_leechers: tracker_summary.leechers,
+            distributed_full_copies: copies.map(|c| c.0),
+            distributed_fraction: copies.map(|c| c.1),
+            last_seen_complete: self.last_seen_complete,
+            last_download: self.last_download,
+            last_upload: self.last_upload,
             has_metadata: self.info.is_some(),
             private: self.private,
             pieces_have: self.picker.have_count(),
@@ -801,6 +851,9 @@ impl Torrent {
             return Vec::new();
         }
         let fresh = self.banned.insert(ip);
+        if fresh {
+            self.new_bans.push(ip);
+        }
         for p in self.peers.values() {
             if p.addr.ip() == ip {
                 p.close("banned: repeated hash failures");
@@ -996,6 +1049,10 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         web_seeds,
         added_time: unix_now(),
         completed_time: None,
+        last_seen_complete: None,
+        last_download: None,
+        last_upload: None,
+        new_bans: Vec::new(),
         resume_blob: params.resume_data.clone(),
         comment: extras.0,
         created_by: extras.1,
@@ -1285,6 +1342,10 @@ fn load_resume(ctx: &Ctx, torrent: &Rc<RefCell<Torrent>>) -> Option<ResumeData> 
             t.added_time = r.added_time;
         }
         t.completed_time = r.completed_time;
+        // v7.
+        t.last_seen_complete = r.last_seen_complete;
+        t.last_download = r.last_download;
+        t.last_upload = r.last_upload;
         if !r.peers.is_empty() {
             t.add_candidates(ctx, &r.peers, PeerSource::Resume);
         }
@@ -2178,6 +2239,9 @@ async fn build_resume(
         completed_time: t.completed_time,
         peers,
         unfinished,
+        last_seen_complete: t.last_seen_complete,
+        last_download: t.last_download,
+        last_upload: t.last_upload,
     };
     if let Some(r) = &t.kept_resume {
         // Not applied yet (the content is missing, or the torrent is held):
@@ -2209,6 +2273,17 @@ pub fn tick_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, now: Instant) ->
         t.stats.last_uploaded = t.stats.uploaded;
         t.stats.download_rate = (t.stats.download_rate * 3 + d) / 4;
         t.stats.upload_rate = (t.stats.upload_rate * 3 + u) / 4;
+        let unix = unix_now();
+        if d > 0 {
+            t.last_download = Some(unix);
+        }
+        if u > 0 {
+            t.last_upload = Some(unix);
+        }
+        let n = t.piece_count();
+        if n > 0 && (t.picker.have_count() == n || t.peers.values().any(|p| p.is_seed(n))) {
+            t.last_seen_complete = Some(unix);
+        }
         // The queue's inactivity clock (`ActiveLimits::count_slow`).
         if t.stats.download_rate < super::queue::INACTIVE_RATE
             && t.stats.upload_rate < super::queue::INACTIVE_RATE
@@ -2512,6 +2587,13 @@ async fn verify_piece(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, piece: u32, e
                     }
                 }
                 ctx.emit(Event::HashFailed { id, piece });
+                for ip in std::mem::take(&mut t.new_bans) {
+                    ctx.emit(Event::PeerBanned {
+                        id,
+                        ip,
+                        reason: "repeated hash failures".into(),
+                    });
+                }
                 // Pieces a just-banned peer had blocks in start over on
                 // disk too.
                 if !tainted.is_empty()

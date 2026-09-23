@@ -28,10 +28,10 @@ docs/quirks.md Q28). The data is kept and saved back as it was:
 `Session::resume` tries it again once the files are back, and
 `Session::force_recheck` accepts what the disk holds instead.
 
-## What the blob holds (format 6)
+## What the blob holds (format 7)
 
-Bencoded dictionary, `format` = 6; every version reads every older version
-(format 1 → 6 are all accepted; fields absent in an older file take their
+Bencoded dictionary, `format` = 7; every version reads every older version
+(format 1 → 7 are all accepted; fields absent in an older file take their
 defaults).
 
 | Key | Meaning |
@@ -41,6 +41,7 @@ defaults).
 | `unfinished` | pieces in progress: `[piece, start, end, start, end, ...]` byte ranges written and synced but not yet hashed. Restored as downloaded blocks (whole 16 KiB blocks inside a range), read back from disk by the hash cursor; a piece whose blocks are all there is hashed at once, and a failed hash discards it and blames the disk alongside the peers |
 | `uploaded`, `downloaded`, `active_time`, `seeding_time` | counters (truthful; never edited) |
 | `added_time`, `completed_time` | unix seconds |
+| `last_seen_complete`, `last_download`, `last_upload` | unix seconds (v7): a complete copy last seen (a connected seed, or ours), payload last received and sent, as libtorrent keeps them |
 | `file_priorities`, `mapped_files` | selection and renames (v2, v5) |
 | `sequential`, `upload_limit`, `download_limit`, `max_peers`, `max_uploads` | per-torrent settings (v5); `AddTorrent`'s explicit values win |
 | `auto_managed`, `queue_position` | queue standing (v4) |
@@ -49,7 +50,7 @@ defaults).
 
 Not in the blob, on purpose: the metainfo (`Session::torrent_file`
 returns it; libtorrent optionally embeds it), the save path and whether
-the torrent is paused (the caller decides both on every add), anything
+the torrent is paused or held (the caller decides on every add), anything
 frontend-side (categories, tags).
 
 ## Versus libtorrent
@@ -61,6 +62,7 @@ frontend-side (categories, tags).
 | When to save | poll `need_save_resume_data()` | `TorrentStatus::needs_resume_save`, plus periodic and shutdown saves in `resume_dir` mode |
 | Unfinished pieces | block bitmaps, trusted until the piece's hash | written byte ranges, same trust model (hashed when the piece completes; the prefix is hashed at restore) |
 | Verified pieces | trusted if files' mtimes/sizes match | trusted if the wanted files exist and the metainfo matches; the check is the fallback |
+| Files gone | fast resume rejected, torrent errored ("missing files") | `ErrorKind::ContentMissing`, the data kept; `resume` looks again, `force_recheck` starts over |
 | Trackers | resume trackers replace (or merge with a flag) | replace |
 | Peers | up to `max_resume_peers` | up to 100 |
 | Metainfo inside | optional (`save_info_dict`) | never; `torrent_file(id)` |

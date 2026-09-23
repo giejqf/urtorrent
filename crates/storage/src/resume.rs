@@ -49,8 +49,10 @@ fn compact_peers(peers: &[SocketAddr]) -> (Vec<u8>, Vec<u8>) {
 /// settings (`sequential`, rate limits, `max_peers`, `max_uploads`) and the
 /// renamed file paths (`mapped_files`); version 6 the trackers, web seeds,
 /// timestamps, last peers and the unfinished pieces' written ranges (the
-/// self-contained blob of `Session::resume_data`); all optional on read.
-pub const FORMAT_VERSION: i64 = 6;
+/// self-contained blob of `Session::resume_data`); version 7 the activity
+/// times (`last_seen_complete`, `last_download`, `last_upload`); all
+/// optional on read.
+pub const FORMAT_VERSION: i64 = 7;
 
 /// Decoded resume data for one torrent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +111,14 @@ pub struct ResumeData {
     /// and synced but not yet hashed (v6). Restored as downloaded blocks;
     /// the hash check happens when the piece completes.
     pub unfinished: Vec<(u32, Vec<(u32, u32)>)>,
+    /// When a complete copy was last seen, among the peers or ours, unix
+    /// seconds (v7; libtorrent `last_seen_complete`).
+    pub last_seen_complete: Option<u64>,
+    /// When payload last arrived, unix seconds (v7; libtorrent
+    /// `last_download`).
+    pub last_download: Option<u64>,
+    /// When payload last left, unix seconds (v7; libtorrent `last_upload`).
+    pub last_upload: Option<u64>,
 }
 
 /// Most peers kept in resume data.
@@ -149,6 +159,9 @@ impl ResumeData {
             completed_time: None,
             peers: Vec::new(),
             unfinished: Vec::new(),
+            last_seen_complete: None,
+            last_download: None,
+            last_upload: None,
         }
     }
 
@@ -266,6 +279,17 @@ impl ResumeData {
             ));
             if let Some(c) = self.completed_time {
                 entries.push((b"completed_time", Value::Int(c.min(i64::MAX as u64) as i64)));
+            }
+            if self.format_version >= 7 {
+                for (key, t) in [
+                    (&b"last_seen_complete"[..], self.last_seen_complete),
+                    (&b"last_download"[..], self.last_download),
+                    (&b"last_upload"[..], self.last_upload),
+                ] {
+                    if let Some(t) = t {
+                        entries.push((key, Value::Int(t.min(i64::MAX as u64) as i64)));
+                    }
+                }
             }
             if !peers4.is_empty() {
                 entries.push((b"peers", Value::Bytes(&peers4)));
@@ -449,6 +473,21 @@ impl ResumeData {
                 .and_then(Value::as_int)
                 .filter(|c| *c > 0)
                 .map(|c| c as u64),
+            last_seen_complete: v
+                .get_str("last_seen_complete")
+                .and_then(Value::as_int)
+                .filter(|c| *c > 0)
+                .map(|c| c as u64),
+            last_download: v
+                .get_str("last_download")
+                .and_then(Value::as_int)
+                .filter(|c| *c > 0)
+                .map(|c| c as u64),
+            last_upload: v
+                .get_str("last_upload")
+                .and_then(Value::as_int)
+                .filter(|c| *c > 0)
+                .map(|c| c as u64),
             peers: {
                 let mut peers = Vec::new();
                 if let Some(b) = v.get_str("peers").and_then(Value::as_bytes) {
@@ -599,7 +638,30 @@ mod tests {
                 (3, vec![(0, 32768), (65536, 81920)]),
                 (7, vec![(16384, 32768)]),
             ],
+            last_seen_complete: Some(1_700_000_200),
+            last_download: Some(1_700_000_150),
+            last_upload: None,
         }
+    }
+
+    /// A version-6 file (no activity times) still loads.
+    #[test]
+    fn reads_format_version_6() {
+        let mut v6 = sample();
+        v6.format_version = 6;
+        let bytes = v6.encode();
+        assert!(!bytes.windows(13).any(|w| w == b"last_download"));
+        let back = ResumeData::decode(&bytes).unwrap();
+        assert_eq!(back.format_version, 6);
+        assert_eq!(
+            (
+                back.last_seen_complete,
+                back.last_download,
+                back.last_upload
+            ),
+            (None, None, None)
+        );
+        assert_eq!(back.unfinished, v6.unfinished);
     }
 
     /// A version-5 file (no trackers, timestamps, peers or unfinished

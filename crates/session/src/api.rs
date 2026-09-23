@@ -393,6 +393,15 @@ pub enum ErrorKind {
     Metadata,
 }
 
+impl TorrentStatus {
+    /// libtorrent's `distributed_copies`: full copies plus the fraction,
+    /// e.g. 1.5 when the rarest piece has one copy and half the pieces
+    /// have more. `None` where libtorrent reports -1.
+    pub fn distributed_copies(&self) -> Option<f32> {
+        Some(self.distributed_full_copies? as f32 + self.distributed_fraction? as f32 / 1000.0)
+    }
+}
+
 /// One tracker's state in a status snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -433,6 +442,33 @@ pub struct TorrentStatus {
     pub error: Option<String>,
     /// What kind of error, when `state == Error`.
     pub error_kind: Option<ErrorKind>,
+    /// Pieces are downloaded in order (`Session::set_sequential`).
+    pub sequential: bool,
+    /// Trackers configured, all tiers (filled in [`Session::statuses`]
+    /// too).
+    pub trackers_count: usize,
+    /// The first tracker that works, if any (qBittorrent's "tracker"
+    /// column).
+    pub working_tracker: Option<String>,
+    /// The most seeds any tracker reported (announce or scrape).
+    pub swarm_seeders: Option<u32>,
+    /// The most leechers any tracker reported (announce or scrape).
+    pub swarm_leechers: Option<u32>,
+    /// libtorrent's distributed copies: copies of the rarest piece among
+    /// the connected peers and us. `None` without metadata and for a
+    /// complete seed (libtorrent frees a seed's picker and reports -1).
+    /// See [`TorrentStatus::distributed_copies`].
+    pub distributed_full_copies: Option<u32>,
+    /// With `distributed_full_copies`: the share of pieces with more copies
+    /// than the rarest, in thousandths.
+    pub distributed_fraction: Option<u32>,
+    /// When a complete copy was last seen (a connected seed, or ours), unix
+    /// seconds (persisted in resume data).
+    pub last_seen_complete: Option<u64>,
+    /// When payload last arrived, unix seconds (persisted).
+    pub last_download: Option<u64>,
+    /// When payload last left, unix seconds (persisted).
+    pub last_upload: Option<u64>,
     /// The metadata is known (always true for a `.torrent`; false while a
     /// magnet link is fetching it).
     pub has_metadata: bool,
@@ -879,6 +915,16 @@ pub enum Event {
         error: String,
         /// What kind of error (what brings the torrent back).
         kind: ErrorKind,
+    },
+    /// The engine banned a peer on its own (it supplied pieces that failed
+    /// their hash). Bans made through [`Session::ban_ip`] are not reported.
+    PeerBanned {
+        /// The torrent whose pieces it corrupted.
+        id: TorrentId,
+        /// The banned address.
+        ip: IpAddr,
+        /// Why.
+        reason: String,
     },
     /// A torrent was removed.
     TorrentRemoved {

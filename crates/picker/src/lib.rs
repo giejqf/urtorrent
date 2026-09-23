@@ -85,6 +85,11 @@ struct Piece {
     slot: u32,
 }
 
+/// Copies of a piece among the connected peers and us.
+fn copies_of(p: &Piece) -> usize {
+    p.availability as usize + usize::from(p.have)
+}
+
 impl Piece {
     fn wanted(&self) -> bool {
         !self.have && self.priority > 0
@@ -141,6 +146,10 @@ pub struct Picker {
     /// Whether extent affinity is on (it never applies to pieces of 4 MiB or
     /// more, nor in sequential mode).
     extent_affinity: bool,
+    /// Pieces by copies held among the connected peers and us
+    /// (`availability + have`): `copies[k]` pieces have `k` copies. Kept in
+    /// step so [`Picker::distributed_copies`] costs no walk over the pieces.
+    copies: Vec<u32>,
 }
 
 /// Size of a piece extent for affinity purposes (libtorrent
@@ -196,6 +205,7 @@ impl Picker {
             fresh_seq: std::collections::BTreeSet::new(),
             recent_extents: Vec::new(),
             extent_affinity: true,
+            copies: vec![u32::try_from(piece_count).unwrap_or(u32::MAX)],
         };
         p.rebuild();
         p
@@ -352,9 +362,15 @@ impl Picker {
             b.clear();
         }
         self.fresh_seq.clear();
+        self.copies.clear();
         for i in 0..self.pieces.len() {
             let size = u64::from(self.piece_size(i));
             let p = &self.pieces[i];
+            let k = copies_of(p);
+            if self.copies.len() <= k {
+                self.copies.resize(k + 1, 0);
+            }
+            self.copies[k] += 1;
             if p.have {
                 self.have_count += 1;
                 self.have_bytes += size;
@@ -495,6 +511,10 @@ impl Picker {
             self.free_blocks -= self.free_in(i);
         }
         let size = u64::from(self.piece_size(i));
+        if !self.pieces[i].have {
+            let before = copies_of(&self.pieces[i]);
+            self.recount(before, before + 1);
+        }
         let p = &mut self.pieces[i];
         if !p.have {
             p.have = true;
@@ -640,10 +660,15 @@ impl Picker {
     // --- peer availability ---
 
     fn set_availability(&mut self, i: usize, avail: u32) {
-        let p = &self.pieces[i];
-        if p.availability == avail {
+        let (before, current) = {
+            let p = &self.pieces[i];
+            (copies_of(p), p.availability as usize)
+        };
+        if current == avail as usize {
             return;
         }
+        self.recount(before, before + avail as usize - current);
+        let p = &self.pieces[i];
         let Loc::Fresh { prio, avail: old } = p.loc else {
             self.pieces[i].availability = avail;
             return;
@@ -711,6 +736,37 @@ impl Picker {
     /// How many peers have piece `i`.
     pub fn availability(&self, i: usize) -> u32 {
         self.pieces.get(i).map_or(0, |p| p.availability)
+    }
+
+    /// Move one piece from `from` to `to` copies in the histogram.
+    fn recount(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        if let Some(c) = self.copies.get_mut(from) {
+            *c = c.saturating_sub(1);
+        }
+        if self.copies.len() <= to {
+            self.copies.resize(to + 1, 0);
+        }
+        self.copies[to] += 1;
+    }
+
+    /// libtorrent's distributed copies (`piece_picker::distributed_copies`):
+    /// the copies of the rarest piece among the connected peers and us, and
+    /// the share of pieces with more, in thousandths (`(full, fraction)`).
+    /// `None` without pieces.
+    pub fn distributed_copies(&self) -> Option<(u32, u32)> {
+        let n = self.pieces.len();
+        let (min, at_min) = self
+            .copies
+            .iter()
+            .enumerate()
+            .find(|(_, c)| **c > 0)
+            .map(|(k, c)| (k, *c as usize))?;
+        let above = n.saturating_sub(at_min);
+        let thousandths = (above * 1000 / n.max(1)) as u32;
+        Some((u32::try_from(min).unwrap_or(u32::MAX), thousandths))
     }
 
     // --- requests ---
@@ -1195,6 +1251,24 @@ impl Picker {
         if fresh_seq != self.fresh_seq {
             return Err("fresh_seq out of sync".into());
         }
+        let mut copies: Vec<u32> = Vec::new();
+        for p in &self.pieces {
+            let k = copies_of(p);
+            if copies.len() <= k {
+                copies.resize(k + 1, 0);
+            }
+            copies[k] += 1;
+        }
+        let trim = |v: &[u32]| {
+            let end = v.iter().rposition(|c| *c > 0).map_or(0, |e| e + 1);
+            v[..end].to_vec()
+        };
+        if trim(&copies) != trim(&self.copies) {
+            return Err(format!(
+                "copies histogram {:?}, recount {copies:?}",
+                self.copies
+            ));
+        }
         for (slot, &i) in self.open.iter().enumerate() {
             let p = &self.pieces[i];
             if p.loc != Loc::Open || p.slot as usize != slot || !p.wanted() || p.blocks.is_none() {
@@ -1265,6 +1339,26 @@ impl Picker {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn distributed_copies_counts_the_rarest_piece_and_ourselves() {
+        let mut p = Picker::new(4, 16384, 4 * 16384);
+        assert_eq!(p.distributed_copies(), Some((0, 0)), "nobody has anything");
+        // A seed, a peer with pieces 0 and 1, and us with piece 0: copies
+        // 3, 2, 1, 1. Rarest: 1 copy; half the pieces have more.
+        p.peer_joined(&Bitfield::all_set(4));
+        let mut half = Bitfield::new(4);
+        half.set(0);
+        half.set(1);
+        p.peer_joined(&half);
+        p.piece_verified(0);
+        assert_eq!(p.distributed_copies(), Some((1, 500)));
+        p.peer_left(&Bitfield::all_set(4));
+        // Copies 2, 1, 0, 0.
+        assert_eq!(p.distributed_copies(), Some((0, 500)));
+        assert_eq!(Picker::new(0, 16384, 0).distributed_copies(), None);
+        p.check_invariants().unwrap();
+    }
 
     struct Lcg(u64);
     impl profile::Rng for Lcg {
