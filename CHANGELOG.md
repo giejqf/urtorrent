@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] - 2026-09-23
+
+### Fixed
+
+- **After a hold, `add_peer` waited out the reconnect backoff for the peer
+  the metadata came from** (about 60 s; `../urtorrentd/docs/gaps.md`). The
+  hold's wind-down ran in that peer's own task and waited for the peers to
+  leave, itself included, so it took a second and the torrent showed `Held`
+  meanwhile; a quick `release` / `resume` / `add_peer` cleared the backoff
+  before that peer's disconnect recorded a new one. The hold now stops the
+  torrent at once and winds down in its own task, `release` (and `resume`
+  on a held torrent) waits for the wind-down as a `pause` does before it
+  answers, and an `add_peer` request survives a connection to the same
+  address that is still closing: the address is dialled once regardless of
+  the backoff.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0D10-` / `urtorrent/0.13.1`
+  / DHT `UR\x00\x0d`.
+
 ## [0.13.0] - 2026-09-23
 
 The optional items of the daemon's gap list (`../urtorrentd/docs/gaps.md`).

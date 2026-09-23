@@ -336,8 +336,8 @@ mod tests {
         );
         // libtorrent's letter digits for components of ten or more.
         assert_eq!(
-            client_name(&id(b"-UR0D00-")).as_deref(),
-            Some("urtorrent 0.13.0")
+            client_name(&id(b"-UR0D10-")).as_deref(),
+            Some("urtorrent 0.13.1")
         );
         assert_eq!(
             client_name(&id(b"-TR4010-")).as_deref(),

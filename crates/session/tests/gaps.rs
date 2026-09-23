@@ -671,3 +671,53 @@ fn a_banned_range_keeps_peers_out_until_lifted() {
     block_on(a.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn add_peer_redials_the_metadata_peer_after_a_hold() {
+    // ../urtorrentd/docs/gaps.md: after a hold, `add_peer` for the peer the
+    // metadata came from waited out the 60 s reconnect backoff (the hold's
+    // wind-down ran in that peer's own task and its disconnect landed after
+    // `release` / `resume` / `add_peer`). It dials at once, as after an
+    // ordinary pause / resume, whether released first or resumed straight
+    // from the hold.
+    for release_first in [true, false] {
+        let dir = tmp(&format!("hold-redial-{release_first}"));
+        let (bytes, data) = make_torrent("hr.bin", 512 * 1024, 64 * 1024, "http://127.0.0.1:1/x");
+        let a_dir = dir.join("a");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        std::fs::write(a_dir.join("hr.bin"), &data).unwrap();
+        let a = block_on(builder(1).build()).unwrap();
+        let a_id = block_on(a.add_torrent(AddTorrent::metainfo(bytes.clone(), &a_dir))).unwrap();
+        wait_state(&a, a_id, TorrentState::Seeding, 10);
+
+        let b = block_on(builder(2).build()).unwrap();
+        let hash = metainfo::Torrent::parse(&bytes).unwrap().info.info_hash;
+        let hex: String = hash.iter().map(|x| format!("{x:02x}")).collect();
+        let id = block_on(
+            b.add_torrent(
+                AddTorrent::magnet(format!("magnet:?xt=urn:btih:{hex}"), dir.join("b"))
+                    .hold_after_metadata(true),
+            ),
+        )
+        .unwrap();
+        block_on(b.add_peer(id, addr_of(1, &a))).unwrap();
+        wait_state(&b, id, TorrentState::Held, 20);
+        if release_first {
+            block_on(b.release(id)).unwrap();
+            wait_state(&b, id, TorrentState::Paused, 10);
+        }
+        block_on(b.resume(id)).unwrap();
+        block_on(b.add_peer(id, addr_of(1, &a))).unwrap();
+        let started = Instant::now();
+        wait_state(&b, id, TorrentState::Seeding, 10);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "redialled after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read(dir.join("b/hr.bin")).unwrap(), data);
+        block_on(b.shutdown()).unwrap();
+        block_on(a.shutdown()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

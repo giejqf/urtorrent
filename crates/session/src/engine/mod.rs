@@ -1661,8 +1661,9 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
                     let mut tb = t.borrow_mut();
                     tb.add_candidates(ctx, &[addr], crate::api::PeerSource::Manual);
                     // An explicit request: dial now, whatever the backoff
-                    // from an earlier attempt (libtorrent `connect_peer`).
-                    tb.allow_reconnect_now(torrent::canonical_addr(addr));
+                    // from an earlier (or still closing) connection
+                    // (libtorrent `connect_peer`).
+                    tb.request_dial(torrent::canonical_addr(addr));
                 }
                 torrent::on_new_candidates(ctx, &t);
                 let _ = reply.send(Ok(()));

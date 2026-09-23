@@ -264,6 +264,10 @@ pub struct Torrent {
     /// Addresses that already used their one immediate retry
     /// (`take_fast_retry`).
     fast_retried: HashSet<SocketAddr>,
+    /// Addresses `add_peer` asked to dial now: the reconnect backoff does
+    /// not apply until they have been dialled, even when a connection to
+    /// them that was still closing records one afterwards.
+    dial_now: HashSet<SocketAddr>,
     pub half_open: usize,
     /// Set when the torrent is stopping; every task of the torrent exits.
     pub closing: Rc<Flag>,
@@ -847,6 +851,7 @@ impl Torrent {
             self.sources.remove(&a);
             self.failed.remove(&a);
             self.fast_retried.remove(&a);
+            self.dial_now.remove(&a);
         }
         true
     }
@@ -899,6 +904,16 @@ impl Torrent {
     /// `fast_reconnect` after a plaintext attempt that needs MSE).
     pub fn allow_reconnect_now(&mut self, addr: SocketAddr) {
         self.failed.remove(&addr);
+    }
+
+    /// `Session::add_peer`: dial `addr` as soon as a connection slot and the
+    /// one-connection-per-IP rule allow, whatever backoff an earlier or
+    /// still-closing connection records (libtorrent `connect_peer`).
+    pub fn request_dial(&mut self, addr: SocketAddr) {
+        self.failed.remove(&addr);
+        if self.known.contains(&addr) {
+            self.dial_now.insert(addr);
+        }
     }
 
     /// One immediate retry per address whose first connection died before
@@ -970,6 +985,7 @@ impl Torrent {
     /// ours; `Ctx::note_own_ip` keeps it out of every torrent from now on).
     pub fn forget_candidate(&mut self, addr: SocketAddr) {
         self.known.remove(&addr);
+        self.dial_now.remove(&addr);
         self.candidates.retain(|a| *a != addr);
     }
 
@@ -1207,6 +1223,7 @@ pub async fn add(ctx: Rc<Ctx>, id: TorrentId, params: AddTorrent) -> Result<Torr
         outgoing_pids: HashSet::new(),
         mse_retry: HashSet::new(),
         fast_retried: HashSet::new(),
+        dial_now: HashSet::new(),
         half_open: 0,
         closing: Flag::new(),
         tracker_kick: Notify::new(),
@@ -1585,7 +1602,7 @@ pub async fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec
         return;
     }
     if torrent.borrow().hold {
-        hold_torrent(ctx, torrent, resume).await;
+        hold_torrent(ctx, torrent, resume);
         return;
     }
     let files_present = wanted_files_present(torrent);
@@ -1633,7 +1650,7 @@ pub async fn on_metadata(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, raw: Vec
 /// `resume`). It stops the way the oracle's "stop condition: metadata
 /// received" does (capture `capture_magnet_hold`): `stopped` to the
 /// trackers, peers dropped, out of the queue's hands.
-async fn hold_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, resume: Option<ResumeData>) {
+fn hold_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, resume: Option<ResumeData>) {
     let (id, private) = {
         let mut t = torrent.borrow_mut();
         t.hold = false;
@@ -1643,6 +1660,10 @@ async fn hold_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, resume: Opt
         t.check_queued = false;
         t.auto_managed = false;
         t.auto_paused = false;
+        // Stopped from this moment (no dial, no request); the wind-down
+        // below finishes the job and clears `stopping`.
+        t.paused = true;
+        t.stopping = true;
         if t.private {
             // Rule 2, as when the metadata arrives unheld.
             t.pex = super::pex::State::default();
@@ -1651,7 +1672,18 @@ async fn hold_torrent(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, resume: Opt
     };
     tracing::info!(torrent = id.0, private, "metadata received; held");
     ctx.emit(Event::MetadataReceived { id });
-    pause(ctx, torrent).await;
+    // The wind-down (stopped announces, peers dropped, resume data saved)
+    // runs in its own task. This one belongs to the peer that delivered the
+    // last metadata piece, and the wind-down waits for the peers to leave:
+    // awaited here, it would wait for itself, and that peer's disconnect
+    // (with its reconnect backoff) would land after a quick `release` and
+    // `add_peer`.
+    let ctx2 = ctx.clone();
+    let t2 = torrent.clone();
+    uring::spawn(async move {
+        stop(&ctx2, &t2, true).await;
+        t2.borrow_mut().stopping = false;
+    });
 }
 
 /// `Session::release` (`start` false) and `resume` / `force_resume` on a
@@ -1664,13 +1696,28 @@ pub async fn release(
     torrent: &Rc<RefCell<Torrent>>,
     start: bool,
 ) -> Result<(), Error> {
-    let resume = {
+    {
         let mut t = torrent.borrow_mut();
         if !t.held {
             if t.hold {
                 t.hold = false;
                 return Ok(());
             }
+            return Err(Error::Busy("the torrent is not held"));
+        }
+    }
+    // The hold's wind-down (stopped announces, peers leaving) must be over
+    // before anything starts again, as a `pause` is before it answers.
+    for _ in 0..600 {
+        if !torrent.borrow().stopping {
+            break;
+        }
+        uring::sleep(Duration::from_millis(50)).await;
+    }
+    let resume = {
+        let mut t = torrent.borrow_mut();
+        if !t.held {
+            // Released meanwhile by a concurrent call.
             return Err(Error::Busy("the torrent is not held"));
         }
         t.held = false;
@@ -2476,12 +2523,14 @@ fn connect_more(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, t: &mut Torrent, 
             || !ctx.families().allows(addr.ip()) // a family switched off since
             || t.has_peer_ip(addr.ip()) // one connection per IP, as the oracle
             || t.connecting.contains(&addr)
-            || t.failed
-                .get(&addr)
-                .is_some_and(|f| now.duration_since(*f) < RECONNECT_BACKOFF)
+            || (!t.dial_now.contains(&addr)
+                && t.failed
+                    .get(&addr)
+                    .is_some_and(|f| now.duration_since(*f) < RECONNECT_BACKOFF))
         {
             continue;
         }
+        t.dial_now.remove(&addr);
         t.half_open += 1;
         ctx.connection_opened();
         t.connecting.insert(addr);
