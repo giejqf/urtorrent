@@ -543,6 +543,23 @@ impl Actor {
             .collect()
     }
 
+    /// Add (`present`) or remove an extra address on the actor's interface,
+    /// in the lab's /16 (it becomes a secondary address: the primary stays
+    /// the kernel's default source).
+    pub fn set_extra_v4(&self, addr: Ipv4Addr, present: bool) -> Result<()> {
+        let op = if present { "add" } else { "del" };
+        ip(&[
+            "-n",
+            &self.ns,
+            "addr",
+            op,
+            &format!("{addr}/16"),
+            "dev",
+            "eth0",
+        ])?;
+        Ok(())
+    }
+
     /// A command that runs `program` inside this namespace as the current user.
     pub fn command(&self, program: &Path) -> Command {
         self.command_with_env(program, &[])

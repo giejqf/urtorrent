@@ -1026,7 +1026,11 @@ impl SessionBuilder {
 
     /// IPv4 listen address (`None` disables IPv4: no listen socket, no
     /// announce for the family, and IPv4 peers learned from any source are
-    /// not dialled).
+    /// not dialled). A specific address is also the source of everything
+    /// outgoing in the family: peer connections, UDP and HTTP(S) tracker
+    /// announces, web-seed downloads, the DHT. When it goes away (a VPN
+    /// interface going down) those fail; nothing falls back to the default
+    /// route. [`Session::set_listen`] moves all of it.
     pub fn listen_v4(mut self, addr: Option<Ipv4Addr>) -> Self {
         self.cfg.listen_v4 = addr;
         self
@@ -1034,7 +1038,8 @@ impl SessionBuilder {
 
     /// IPv6 listen address (`None` disables IPv6: no listen socket, no
     /// announce for the family, and IPv6 peers learned from any source are
-    /// not dialled).
+    /// not dialled). A specific address is the source of everything
+    /// outgoing in the family, as for [`SessionBuilder::listen_v4`].
     pub fn listen_v6(mut self, addr: Option<Ipv6Addr>) -> Self {
         self.cfg.listen_v6 = addr;
         self

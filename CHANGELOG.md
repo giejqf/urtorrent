@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.4] - 2026-09-24
+
+### Fixed
+
+- **HTTP(S) tracker announces and web-seed downloads were not bound to the
+  listen address** (`../urtorrentd/docs/gaps.md`). Peers, UDP trackers and
+  the DHT left from it, but HTTP connections took the default route: with
+  the listen address on a VPN interface, an HTTP tracker saw the address
+  meant to be hidden, and the traffic went on while the VPN was down. They
+  now bind to the listen address of their family when a specific one is
+  set (libtorrent announces from the listen socket's address), and fail
+  when it is gone instead of falling back.
+- **Peer connections kept the listen address the session was built with**
+  after `Session::set_listen` moved it: dials were bound to the old
+  address. Everything outgoing now takes the address in use
+  (`Ctx::outgoing`).
+
+### Added
+
+- Gates: `gaps.rs` (announces and web-seed requests from the listen
+  address, and announces and peer dials following `set_listen`), and the
+  lab scenario `http_bound_to_listen_address` (the client listens on a
+  secondary address; every announce and web-seed request comes from it,
+  and once it is removed they fail with nothing from the primary one).
+  `testkit`: `ClientConfig::listen_v4`, `Actor::set_extra_v4`.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0D40-` / `urtorrent/0.13.4`
+  / DHT `UR\x00\x0d`.
+
 ## [0.13.3] - 2026-09-23
 
 Gates for seeding from a partial selection, and the difference they found.

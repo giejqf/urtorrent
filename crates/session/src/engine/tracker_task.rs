@@ -141,7 +141,7 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
             .disable_endpoint(job.tier, job.index, job.endpoint);
         return;
     }
-    let family = http::Families::only(v6);
+    let family = ctx.outgoing().only(v6);
     // Bounded concurrency across the session (an announce storm at start-up
     // with thousands of torrents would otherwise open thousands of sockets).
     let permit = ctx.announce_gate.acquire().await;
@@ -295,7 +295,7 @@ pub async fn scrape_all(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
             }
             let profile_v = ctx.profile();
             let profile = &profile_v;
-            let resp = http::get(&ctx.dns, &ctx.tls, ctx.families(), &url, &|u| {
+            let resp = http::get(&ctx.dns, &ctx.tls, ctx.outgoing(), &url, &|u| {
                 tracker::scrape::http_request(u, &[hash], profile)
             })
             .await?;

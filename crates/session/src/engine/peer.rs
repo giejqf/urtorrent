@@ -571,20 +571,10 @@ async fn mse_initiate(
 
 /// Connect out to `addr` for `torrent` and run the connection.
 pub async fn run_outgoing(ctx: Rc<Ctx>, torrent: Rc<RefCell<Torrent>>, addr: SocketAddr) {
-    // Outgoing connections originate from the listen address when one is
-    // configured (libtorrent binds them to the listen interface).
-    let local = match addr {
-        SocketAddr::V4(_) => ctx
-            .cfg
-            .listen_v4
-            .filter(|a| !a.is_unspecified())
-            .map(std::net::IpAddr::V4),
-        SocketAddr::V6(_) => ctx
-            .cfg
-            .listen_v6
-            .filter(|a| !a.is_unspecified())
-            .map(std::net::IpAddr::V6),
-    };
+    // Outgoing connections originate from the listen address in use when a
+    // specific one is (libtorrent binds them to the listen interface); the
+    // one in use now, not the one the session was built with.
+    let local = ctx.bind_addr_for(addr.ip());
     // The transport: TCP first by default, uTP for addresses whose TCP dial
     // failed (`PreferTcp`); libtorrent's order under `PreferUtp` (uTP unless
     // a uTP dial to the address failed, or it was reached over uTP before);

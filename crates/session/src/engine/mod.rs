@@ -481,6 +481,22 @@ impl Ctx {
         self.listen_v6.get()
     }
 
+    /// Where outgoing HTTP(S) connections may go and come from: the listen
+    /// families and addresses in use now (they change with `set_listen`).
+    pub fn outgoing(&self) -> http::Outgoing {
+        http::Outgoing {
+            families: self.families(),
+            bind_v4: self.listen_v4().filter(|a| !a.is_unspecified()),
+            bind_v6: self.listen_v6().filter(|a| !a.is_unspecified()),
+        }
+    }
+
+    /// The source address for an outgoing connection to `ip`: the listen
+    /// address of its family, when a specific one is in use.
+    pub fn bind_addr_for(&self, ip: IpAddr) -> Option<IpAddr> {
+        self.outgoing().bind_for(ip)
+    }
+
     /// The listen address of each tracker endpoint, in the announcer's
     /// endpoint order (`Families::endpoints`).
     pub fn endpoint_addrs(&self) -> Vec<SocketAddr> {

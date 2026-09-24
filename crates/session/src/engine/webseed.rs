@@ -359,7 +359,7 @@ async fn fetch(
     for attempt in 0..2 {
         let reuse = matches!(conn, Some((t, c)) if t == target && c.reusable());
         if !reuse {
-            let c = super::http::HttpConn::open(&ctx.dns, &ctx.tls, ctx.families(), url).await?;
+            let c = super::http::HttpConn::open(&ctx.dns, &ctx.tls, ctx.outgoing(), url).await?;
             *conn = Some((target.to_string(), c));
         }
         let Some((_, c)) = conn.as_mut() else {

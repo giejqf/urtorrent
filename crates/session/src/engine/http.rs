@@ -5,7 +5,7 @@
 //! connect (with timeout), optional TLS (rustls, ADR 0003), send the pre-built
 //! request, frame the response with `tracker::http`, follow a few redirects.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use tracker::Url;
@@ -58,12 +58,43 @@ impl Families {
     }
 }
 
+/// Where outgoing HTTP(S) connections (trackers, web seeds) may go and come
+/// from: the listen families, and the listen address of each, bound when it
+/// is a specific one (libtorrent announces from the listen socket's address
+/// and binds outgoing connections to the listen interface). A bound address
+/// that is gone makes the connection fail; there is no unbound retry, so
+/// traffic meant for a VPN interface never takes the default route.
+#[derive(Debug, Clone, Copy)]
+pub struct Outgoing {
+    pub families: Families,
+    pub bind_v4: Option<Ipv4Addr>,
+    pub bind_v6: Option<Ipv6Addr>,
+}
+
+impl Outgoing {
+    /// The source address for a connection to `ip`, if one is set.
+    pub fn bind_for(&self, ip: IpAddr) -> Option<IpAddr> {
+        match ip {
+            IpAddr::V4(_) => self.bind_v4.map(IpAddr::V4),
+            IpAddr::V6(_) => self.bind_v6.map(IpAddr::V6),
+        }
+    }
+
+    /// Restrict to one family (one listen endpoint's announce).
+    pub fn only(self, v6: bool) -> Outgoing {
+        Outgoing {
+            families: Families::only(v6),
+            ..self
+        }
+    }
+}
+
 /// Perform a GET for `url`, building the request bytes with `build` (so
 /// redirects re-render the request against the new URL).
 pub async fn get(
     dns: &Dns,
     tls: &TlsClient,
-    families: Families,
+    families: Outgoing,
     url: &Url,
     build: &dyn Fn(&Url) -> Vec<u8>,
 ) -> Result<Response, String> {
@@ -77,7 +108,7 @@ pub async fn get(
 pub async fn get_with_endpoints(
     dns: &Dns,
     tls: &TlsClient,
-    families: Families,
+    families: Outgoing,
     url: &Url,
     build: &dyn Fn(&Url) -> Vec<u8>,
 ) -> Result<(Response, (SocketAddr, SocketAddr)), String> {
@@ -119,7 +150,7 @@ pub async fn get_with_endpoints(
 async fn fetch_once(
     dns: &Dns,
     tls: &TlsClient,
-    families: Families,
+    families: Outgoing,
     url: &Url,
     request: Vec<u8>,
 ) -> Result<(Response, (SocketAddr, SocketAddr)), String> {
@@ -153,13 +184,15 @@ pub struct HttpConn {
 
 impl HttpConn {
     /// Resolve and connect (with TLS for `https`), trying each address of
-    /// the allowed families in turn.
+    /// the allowed families in turn, from the listen address of its family
+    /// when one is set ([`Outgoing`]).
     pub async fn open(
         dns: &Dns,
         tls: &TlsClient,
-        families: Families,
+        out: Outgoing,
         url: &Url,
     ) -> Result<HttpConn, String> {
+        let families = out.families;
         let addrs = dns
             .resolve(&url.host, url.effective_port())
             .await
@@ -181,7 +214,13 @@ impl HttpConn {
         }
         let mut last_err = String::new();
         for addr in candidates {
-            match uring::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            let connect = async {
+                match out.bind_for(addr.ip()) {
+                    Some(local) => TcpStream::connect_from(local, addr).await,
+                    None => TcpStream::connect(addr).await,
+                }
+            };
+            match uring::timeout(CONNECT_TIMEOUT, connect).await {
                 Ok(Ok(stream)) => {
                     let local = stream
                         .local_addr()

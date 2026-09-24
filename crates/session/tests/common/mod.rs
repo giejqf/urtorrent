@@ -277,13 +277,32 @@ pub fn spawn_range_server(
     data: Arc<Vec<u8>>,
     path: &'static str,
 ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let (url, hits, _) = spawn_range_server_recording(data, path);
+    (url, hits)
+}
+
+/// [`spawn_range_server`], also recording where each connection came from.
+#[allow(dead_code, clippy::type_complexity)]
+pub fn spawn_range_server_recording(
+    data: Arc<Vec<u8>>,
+    path: &'static str,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<Mutex<Vec<SocketAddr>>>,
+) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hits2 = hits.clone();
+    let sources = Arc::new(Mutex::new(Vec::new()));
+    let sources2 = sources.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
+            if let Ok(from) = s.peer_addr() {
+                sources2.lock().unwrap().push(from);
+            }
             let data = data.clone();
             let hits = hits2.clone();
             std::thread::spawn(move || {
@@ -323,7 +342,49 @@ pub fn spawn_range_server(
             });
         }
     });
-    (format!("http://127.0.0.1:{port}{path}"), hits)
+    (format!("http://127.0.0.1:{port}{path}"), hits, sources)
+}
+
+/// A tiny HTTP tracker recording, for each announce, where it came from and
+/// its request line; it answers with no peers.
+#[allow(dead_code, clippy::type_complexity)]
+pub fn spawn_recording_tracker() -> (String, Arc<Mutex<Vec<(SocketAddr, String)>>>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = log.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let from = stream.peer_addr().unwrap_or(addr);
+            let mut buf = vec![0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let n = match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let line = String::from_utf8_lossy(&got)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            log2.lock().unwrap().push((from, line));
+            let body = b"d8:intervali1800e5:peers0:e";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    (format!("http://{addr}/announce"), log)
 }
 
 /// Poll session stats until the disk and hash queues are idle, and return

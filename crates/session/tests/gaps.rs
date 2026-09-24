@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{
-    block_on, event_param, make_multi_torrent, make_torrent, spawn_seeder, spawn_tracker,
+    block_on, event_param, make_multi_torrent, make_torrent, spawn_range_server_recording,
+    spawn_recording_tracker, spawn_seeder, spawn_tracker,
 };
 use session::{AddTorrent, Session, SessionBuilder, TorrentId, TorrentState, TransportPolicy};
 
@@ -812,5 +813,106 @@ fn every_change_the_resume_data_records_marks_it() {
         assert!(!dirty(id), "{id:?} marked though its position stayed");
     }
     block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn http_trackers_web_seeds_and_peers_leave_from_the_listen_address() {
+    // ../urtorrentd/docs/gaps.md: with the listen address on a VPN
+    // interface, HTTP(S) announces and web-seed downloads took the default
+    // route. Everything outgoing binds to the listen address in use, and
+    // follows it when `set_listen` moves it. Loopback shows it: B listens on
+    // 127.0.0.2 and 127.0.0.3, the servers are on 127.0.0.1, which an
+    // unbound connection would come from.
+    let dir = tmp("bind");
+    let (tracker, log) = spawn_recording_tracker();
+    let (bytes, data) = make_torrent("w.bin", 256 * 1024, 64 * 1024, &tracker);
+    let data = Arc::new(data);
+    let (seed_url, _hits, seed_from) = spawn_range_server_recording(data.clone(), "/w.bin");
+    let b = block_on(builder(2).build()).unwrap();
+    let id = block_on(b.add_torrent(AddTorrent::metainfo(bytes.clone(), dir.join("b")))).unwrap();
+    block_on(b.add_web_seed(id, seed_url)).unwrap();
+    wait_state(&b, id, TorrentState::Seeding, 30);
+    wait_for("an announce", 10, || !log.lock().unwrap().is_empty());
+    let two: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+    assert!(
+        log.lock().unwrap().iter().all(|(from, _)| from.ip() == two),
+        "{:?}",
+        log.lock().unwrap()
+    );
+    assert!(!seed_from.lock().unwrap().is_empty());
+    assert!(
+        seed_from.lock().unwrap().iter().all(|a| a.ip() == two),
+        "{:?}",
+        seed_from.lock().unwrap()
+    );
+
+    // Move the listen address: announces and peer dials follow it. (The
+    // new `started` can land before `set_listen` returns: count from here.)
+    let three = Ipv4Addr::new(127, 0, 0, 3);
+    let seen = log.lock().unwrap().len();
+    let port = block_on(b.set_listen(0, Some(three), None)).unwrap();
+    wait_for("the started announce from the new address", 10, || {
+        log.lock().unwrap()[seen..].iter().any(|(from, line)| {
+            from.ip() == std::net::IpAddr::V4(three)
+                && event_param(line).as_deref() == Some("started")
+        })
+    });
+    // From the new `started` on, everything comes from the new address
+    // (an announce already in flight under the old one, the `stopped` owed
+    // to it included, may land before).
+    {
+        let log = log.lock().unwrap();
+        let restart = seen
+            + log[seen..]
+                .iter()
+                .position(|(from, line)| {
+                    from.ip() == std::net::IpAddr::V4(three)
+                        && event_param(line).as_deref() == Some("started")
+                })
+                .unwrap();
+        assert!(
+            log[restart..]
+                .iter()
+                .all(|(from, _)| from.ip() == std::net::IpAddr::V4(three)),
+            "{:?}",
+            &log[seen..]
+        );
+    }
+    let a_dir = dir.join("a");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    let (a_bytes, a_data) = make_torrent("p.bin", 128 * 1024, 64 * 1024, "http://127.0.0.1:1/x");
+    std::fs::write(a_dir.join("p.bin"), &a_data).unwrap();
+    let a = block_on(builder(1).build()).unwrap();
+    let mut a_events = a.events();
+    let a_id = block_on(a.add_torrent(AddTorrent::metainfo(a_bytes.clone(), &a_dir))).unwrap();
+    wait_state(&a, a_id, TorrentState::Seeding, 10);
+    let p_id = block_on(b.add_torrent(AddTorrent::metainfo(a_bytes, dir.join("b2")))).unwrap();
+    block_on(b.add_peer(p_id, addr_of(1, &a))).unwrap();
+    // The transfer is over in milliseconds and the two seeds part: A's
+    // events, not its live peer list, say where B came from.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let from = loop {
+        match a_events.try_recv() {
+            Some(session::Event::PeerConnected {
+                addr,
+                incoming: true,
+                ..
+            }) => break addr,
+            Some(_) => {}
+            None => {
+                assert!(Instant::now() < deadline, "B never reached A");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    assert_eq!(
+        from.ip(),
+        std::net::IpAddr::V4(three),
+        "peer dialled from {from}"
+    );
+    assert_eq!(b.listen_port(), port);
+    block_on(a.shutdown()).unwrap();
+    block_on(b.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

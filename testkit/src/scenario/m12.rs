@@ -53,6 +53,12 @@ pub fn scenarios() -> Vec<ScenarioDef> {
             tags: &[Tag::It, Tag::Diff],
             run: partial_seed_shape,
         },
+        ScenarioDef {
+            name: "http_bound_to_listen_address",
+            shapes: &[Shape::V4],
+            tags: &[Tag::It],
+            run: http_bound_to_listen_address,
+        },
     ]
 }
 
@@ -694,5 +700,117 @@ fn partial_seed_shape(ctx: &mut Ctx) -> Result<()> {
         "c.bin from our partial seed"
     );
     client.shutdown()?;
+    Ok(())
+}
+
+/// The client listens on a secondary address of its interface (a VPN
+/// address, say); the primary one is the kernel's default source. Announces
+/// to an HTTP tracker and web-seed downloads come from the listen address,
+/// and once that address is gone they fail: nothing ever arrives from the
+/// primary one (../urtorrentd/docs/gaps.md).
+fn http_bound_to_listen_address(ctx: &mut Ctx) -> Result<()> {
+    let tracker = tap_tracker(ctx)?;
+    let seed_addrs: Vec<SocketAddr> = ctx
+        .host_addrs()
+        .into_iter()
+        .map(|a| SocketAddr::new(a, 7090))
+        .collect();
+    let spec = || {
+        FixtureSpec::small("bound.bin")
+            .with_size(4 << 20)
+            .with_piece_length(64 << 10)
+            .with_tracker(&tracker.http_url(0))
+    };
+    let server = crate::tap::webseed::TapWebSeed::start(
+        seed_addrs,
+        Arc::new(Fixture::generate(spec())),
+        "/seed/",
+    )?;
+    let fx = Arc::new(Fixture::generate(spec().with_url_list(vec![server.url(0)])));
+    let torrent_path = ctx.file("bound.torrent");
+    std::fs::write(&torrent_path, &fx.torrent)?;
+    let actor = ctx.actor("urt")?;
+    let primary = match actor.addr() {
+        std::net::IpAddr::V4(a) => a,
+        std::net::IpAddr::V6(_) => anyhow::bail!("an IPv4 actor"),
+    };
+    let o = primary.octets();
+    let vpn = std::net::Ipv4Addr::new(o[0], o[1], o[2], 9);
+    actor.set_extra_v4(vpn, true)?;
+    let mut client = crate::client::UrtClient::launch(
+        &actor,
+        ClientConfig::default()
+            .profile("qbt")
+            .lsd(false)
+            .listen_v4(vpn)
+            .download_limit(256 * 1024),
+        &torrent_path,
+    )?;
+    client.wait_for(Duration::from_secs(60), "web-seed progress", |s| {
+        s.pieces_have >= 8
+    })?;
+    let vpn_ip = std::net::IpAddr::V4(vpn);
+    let from_tracker = || -> Vec<std::net::IpAddr> {
+        tracker
+            .events()
+            .iter()
+            .filter(|e| e.kind == "announce")
+            .map(|e| e.from.ip())
+            .collect()
+    };
+    let from_seed =
+        || -> Vec<std::net::IpAddr> { server.requests().iter().map(|r| r.from.ip()).collect() };
+    let (t, w) = (from_tracker(), from_seed());
+    ctx.note(format!(
+        "while bound: tracker from {t:?}, web seed from {w:?}"
+    ));
+    ensure!(
+        !t.is_empty() && t.iter().all(|a| *a == vpn_ip),
+        "announces from {t:?}"
+    );
+    ensure!(
+        !w.is_empty() && w.iter().all(|a| *a == vpn_ip),
+        "web seed from {w:?}"
+    );
+
+    // The address goes away (the VPN drops): announces and web-seed requests
+    // fail rather than leave from the primary address. Wait until both have
+    // been tried and failed, so the check below is about real attempts.
+    let count = |s: &crate::client::ClientStatus, kind: &str| {
+        s.events.iter().filter(|e| e.starts_with(kind)).count()
+    };
+    let before = client.status().unwrap_or_default();
+    let (tracker_errors, seed_errors) = (
+        count(&before, "TrackerError"),
+        count(&before, "WebSeedError"),
+    );
+    actor.set_extra_v4(vpn, false)?;
+    // Past the tap tracker's `min interval` (10 s), so the reannounce runs.
+    std::thread::sleep(Duration::from_secs(11));
+    client.command("reannounce")?;
+    let st = client.wait_for(Duration::from_secs(40), "the bound requests to fail", |s| {
+        count(s, "TrackerError") > tracker_errors && count(s, "WebSeedError") > seed_errors
+    })?;
+    for e in st
+        .events
+        .iter()
+        .filter(|e| e.starts_with("TrackerError") || e.starts_with("WebSeedError"))
+        .rev()
+        .take(2)
+    {
+        ctx.note(format!("failed as it should: {e}"));
+    }
+    let (t, w) = (from_tracker(), from_seed());
+    ctx.note(format!(
+        "after the address went: tracker from {t:?}, web seed from {w:?}"
+    ));
+    let primary_ip = std::net::IpAddr::V4(primary);
+    ensure!(
+        !t.contains(&primary_ip) && !w.contains(&primary_ip),
+        "traffic fell back to the primary address: tracker {t:?}, web seed {w:?}"
+    );
+    let st = client.status().unwrap_or_default();
+    ensure!(!st.complete, "the download went on without its address");
+    client.kill9()?;
     Ok(())
 }

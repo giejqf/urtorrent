@@ -43,6 +43,9 @@ pub struct ClientConfig {
     pub file_priorities: Option<Vec<u8>>,
     /// `AddTorrent::hold_after_metadata` (`release` / `resume` controls).
     pub hold: bool,
+    /// Listen (and so originate everything) on this IPv4 address instead
+    /// of every address.
+    pub listen_v4: Option<std::net::Ipv4Addr>,
     /// Every `.torrent` in this directory is added as well.
     pub add_dir: Option<PathBuf>,
     /// Extra environment (e.g. `RUST_LOG`).
@@ -67,6 +70,7 @@ impl Default for ClientConfig {
             add_peers: Vec::new(),
             file_priorities: None,
             hold: false,
+            listen_v4: None,
             add_dir: None,
             env: vec![("RUST_LOG".into(), "debug".into())],
         }
@@ -103,6 +107,10 @@ impl ClientConfig {
 
     pub fn add_peer(mut self, a: std::net::SocketAddr) -> Self {
         self.add_peers.push(a);
+        self
+    }
+    pub fn listen_v4(mut self, a: std::net::Ipv4Addr) -> Self {
+        self.listen_v4 = Some(a);
         self
     }
     pub fn hold(mut self, on: bool) -> Self {
@@ -376,6 +384,8 @@ impl UrtClient {
         // IPv4 address to announce anyway).
         if actor.v4.is_none() {
             cmd.arg("--no-v4");
+        } else if let Some(a) = config.listen_v4 {
+            cmd.arg("--v4").arg(a.to_string());
         }
         if actor.v6.is_none() {
             cmd.arg("--no-v6");
