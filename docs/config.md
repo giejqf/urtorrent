@@ -17,7 +17,7 @@ snapshots and the public operations is the frontend's, and stays out.
 | Connections | `max_connections` (+ `set_max_connections`), `max_peers_per_torrent` (+ `set_max_peers_per_torrent`) | `max_peers` (+ `set_max_peers`) |
 | Upload slots | `unchoke_slots` (+ `set_unchoke_slots`) | `max_uploads` (+ `set_max_uploads`) |
 | Rates | `upload_limit`, `download_limit` (+ `set_rate_limits`) | `upload_limit`, `download_limit` (+ `set_torrent_rate_limits`) |
-| Queue | `active_limits` (`downloads` / `seeds` / `total` / `count_slow`, + `set_active_limits`) | `auto_managed` (+ `set_auto_managed`, `force_resume`, `move_in_queue`); `pause` leaves the queue, `resume` rejoins it |
+| Queue | `active_limits` (`downloads` / `seeds` / `total` / `count_slow`, + `set_active_limits`) | `auto_managed` (+ `set_auto_managed`, `force_resume`, `move_in_queue`, `set_queue_position`); `pause` leaves the queue, `resume` rejoins it; `TorrentStatus::slow` for a running torrent the queue no longer counts |
 | Transports | `transports` (`TcpOnly` / `PreferTcp` / `PreferUtp` / `UtpOnly`, + `set_transports`), `encryption` (`Disabled` / `Enabled` / `Forced`, + `set_encryption`) | |
 | Discovery | `pex` (+ `set_pex`), `lsd` (+ `set_lsd`), `dht` (+ `set_dht`), `dht_bootstrap_nodes`, `dht_read_only`, `dht_state` | `add_peer`, `add_tracker` / `remove_tracker`, `add_web_seed` / `remove_web_seed`, `force_reannounce`, `scrape` |
 | Peers | `ban_ip` / `unban_ip` / `banned_ips`, `ban_ip_range` / `unban_ip_range` / `banned_ip_ranges` (session-wide) | |

@@ -32,7 +32,11 @@ review of missing configuration (docs/config.md) put it on the library side.
 - Semantics of the public operations follow qBittorrent's use of libtorrent:
   `pause` takes the torrent out of the queue (else the queue would restart
   it), `resume` hands it back (it may end up `Queued`), `force_resume`
-  bypasses the queue, `move_in_queue` reorders.
+  bypasses the queue, `move_in_queue` reorders by one step or to either
+  end, `set_queue_position` (0.13.5, libtorrent `queue_position_set`) puts
+  a torrent at a given place in one re-plan.
+- `TorrentStatus::slow` (0.13.5) reports the planner's inactive state for
+  a running torrent, so a frontend can show which ones hold no slot.
 - A resume during a pause's wind-down is safe: `Torrent::stopping` makes the
   pause restart the tasks when its `stopped` announces are done, instead of
   two lifecycles overlapping.

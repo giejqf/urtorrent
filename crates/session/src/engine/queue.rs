@@ -222,18 +222,33 @@ pub fn positions(ctx: &Ctx) -> Vec<(TorrentId, usize)> {
 
 /// `Session::move_in_queue`.
 pub fn move_in_queue(ctx: &Rc<Ctx>, id: TorrentId, to: QueueMove) -> Result<(), Error> {
+    place(ctx, id, |idx, rest| match to {
+        QueueMove::Top => 0,
+        QueueMove::Up => idx.saturating_sub(1),
+        QueueMove::Down => (idx + 1).min(rest),
+        QueueMove::Bottom => rest,
+    })
+}
+
+/// `Session::set_queue_position`: past the end is last.
+pub fn set_queue_position(ctx: &Rc<Ctx>, id: TorrentId, position: usize) -> Result<(), Error> {
+    place(ctx, id, |_, rest| position.min(rest))
+}
+
+/// Take `id` out of the queue order and insert it where `at(current index,
+/// number of the others)` says, then renumber and re-plan once.
+fn place(
+    ctx: &Rc<Ctx>,
+    id: TorrentId,
+    at: impl FnOnce(usize, usize) -> usize,
+) -> Result<(), Error> {
     let order = positions(ctx);
     let Some(idx) = order.iter().position(|(i, _)| *i == id) else {
         return Err(Error::NoSuchTorrent);
     };
     let mut ids: Vec<TorrentId> = order.into_iter().map(|(i, _)| i).collect();
     let moved = ids.remove(idx);
-    let at = match to {
-        QueueMove::Top => 0,
-        QueueMove::Up => idx.saturating_sub(1),
-        QueueMove::Down => (idx + 1).min(ids.len()),
-        QueueMove::Bottom => ids.len(),
-    };
+    let at = at(idx, ids.len());
     ids.insert(at, moved);
     // Renumber densely, keeping the allocator ahead of every position;
     // each torrent whose key changes has its resume data marked.

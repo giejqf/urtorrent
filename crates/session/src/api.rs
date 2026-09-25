@@ -601,6 +601,13 @@ pub struct TorrentStatus {
     /// `seeds`. libtorrent ranks seeds by its `seed_rank` instead; here the
     /// caller's order applies to both.
     pub queue_position: usize,
+    /// Running for at least 60 s with `download_rate` and `upload_rate`
+    /// both below 2 KiB/s for the last 60 s (libtorrent's inactive
+    /// torrent). An auto-managed torrent in this state holds no
+    /// `ActiveLimits` slot unless `count_slow` is set, so the next queued
+    /// one may start; it counts again, and the flag clears, once data
+    /// flows. Always `false` while paused, queued or checking.
+    pub slow: bool,
     /// Time until the earliest scheduled tracker announce, if any.
     pub next_announce_in: Option<Duration>,
 }
@@ -1578,6 +1585,16 @@ impl Session {
     /// Move a torrent in the queue (`TorrentStatus::queue_position`).
     pub async fn move_in_queue(&self, id: TorrentId, to: QueueMove) -> Result<(), Error> {
         self.send(|tx| Command::MoveInQueue(id, to, tx)).await?
+    }
+
+    /// Put a torrent at `position` in the queue
+    /// (`TorrentStatus::queue_position`): 0 is first, a position past the
+    /// end is last, and the torrents in between shift by one. The queue is
+    /// re-planned once, and every torrent whose position changed has
+    /// `needs_resume_save` set.
+    pub async fn set_queue_position(&self, id: TorrentId, position: usize) -> Result<(), Error> {
+        self.send(|tx| Command::SetQueuePosition(id, position, tx))
+            .await?
     }
 
     /// The DHT's persistable state (node ids and routing-table nodes) for

@@ -670,6 +670,7 @@ impl Torrent {
             completed_on: self.completed_time,
             auto_managed: self.auto_managed,
             queue_position,
+            slow: self.is_running() && self.is_inactive(now),
             next_announce_in: self
                 .announcer
                 .snapshot()

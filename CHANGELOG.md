@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.5] - 2026-09-25
+
+### Added
+
+- **`TorrentStatus::slow`** (`../urtorrentd/docs/gaps.md`): a running
+  torrent that has run for 60 s with both rates below 2 KiB/s for the last
+  60 s, the state in which an auto-managed torrent holds no `ActiveLimits`
+  slot unless `count_slow`. A frontend can now show which running torrents
+  the queue does not count instead of guessing from the rates.
+- **`Session::set_queue_position(id, position)`**
+  (`../urtorrentd/docs/gaps.md`, libtorrent `queue_position_set`): puts a
+  torrent at a place in the queue in one call (0 first, past the end last,
+  the others shift), re-plans once, and marks `needs_resume_save` on every
+  torrent whose position changed. For drag-and-drop queue lists, which
+  would otherwise take one `move_in_queue` per step.
+- Gates: `gaps.rs` (positions set into the middle, to the front with the
+  seed slot following, past the end, no-op moves marking nothing, dense
+  positions after a removal; the slow flag not before a minute, the second
+  download starting without `count_slow` and waiting with it, the flag
+  clearing and the slot taken back once data flows).
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0D50-` / `urtorrent/0.13.5`
+  / DHT `UR\x00\x0d`.
+
 ## [0.13.4] - 2026-09-24
 
 ### Fixed

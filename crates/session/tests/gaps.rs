@@ -6,7 +6,8 @@
 //! missing says so instead of starting over, removal leaves no resume file
 //! behind, torrents hold at their metadata, list views get what they show.
 //! 0.13.0: tracker rows per listen endpoint, file completion, piece
-//! priorities, banned address ranges.
+//! priorities, banned address ranges. 0.13.5: the queue's slow flag, a
+//! queue position set in one call.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -100,6 +101,10 @@ fn addr_of(n: u8, s: &Session) -> SocketAddr {
 
 fn status(s: &Session, id: TorrentId) -> session::TorrentStatus {
     block_on(s.status(id)).unwrap()
+}
+
+fn state(s: &Session, id: TorrentId) -> TorrentState {
+    status(s, id).state
 }
 
 #[test]
@@ -914,5 +919,179 @@ fn http_trackers_web_seeds_and_peers_leave_from_the_listen_address() {
     assert_eq!(b.listen_port(), port);
     block_on(a.shutdown()).unwrap();
     block_on(b.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_queue_position_is_set_in_one_call() {
+    // ../urtorrentd/docs/gaps.md: dragging a row in a queue list puts a
+    // torrent at a place in one call. 0 is first, past the end is last, the
+    // others shift; the queue is re-planned at once, and only the torrents
+    // whose position changed have their resume data marked.
+    let dir = tmp("position");
+    let s = block_on(
+        builder(1)
+            .active_limits(session::ActiveLimits {
+                downloads: None,
+                seeds: Some(1),
+                total: None,
+                count_slow: false,
+            })
+            .build(),
+    )
+    .unwrap();
+    let mut ids = Vec::new();
+    for name in ["p0.bin", "p1.bin", "p2.bin", "p3.bin"] {
+        let (bytes, data) = make_torrent(name, 128 * 1024, 64 * 1024, "http://127.0.0.1:1/x");
+        std::fs::write(dir.join(name), &data).unwrap();
+        ids.push(block_on(s.add_torrent(AddTorrent::metainfo(bytes, &dir))).unwrap());
+    }
+    wait_state(&s, ids[0], TorrentState::Seeding, 10);
+    for &id in &ids[1..] {
+        wait_state(&s, id, TorrentState::Queued, 10);
+    }
+    let order = || {
+        let mut v: Vec<(usize, TorrentId)> = block_on(s.statuses())
+            .unwrap()
+            .into_iter()
+            .map(|st| (st.queue_position, st.id))
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+    };
+    let save_all = || {
+        for &id in &ids {
+            let _ = block_on(s.resume_data(id)).unwrap();
+            assert!(!status(&s, id).needs_resume_save);
+        }
+    };
+    let dirty = || {
+        ids.iter()
+            .map(|&id| status(&s, id).needs_resume_save)
+            .collect::<Vec<_>>()
+    };
+    let [t0, t1, t2, t3] = [ids[0], ids[1], ids[2], ids[3]];
+
+    // Into the middle: the ones it passes shift down, the first stays put.
+    save_all();
+    block_on(s.set_queue_position(t3, 1)).unwrap();
+    assert_eq!(order(), vec![t0, t3, t1, t2]);
+    assert_eq!(dirty(), vec![false, true, true, true]);
+    assert_eq!(state(&s, t0), TorrentState::Seeding);
+
+    // To the front: it takes the only seed slot and the old first queues.
+    save_all();
+    block_on(s.set_queue_position(t2, 0)).unwrap();
+    assert_eq!(order(), vec![t2, t0, t3, t1]);
+    assert_eq!(dirty(), vec![true, true, true, true]);
+    wait_state(&s, t2, TorrentState::Seeding, 10);
+    wait_state(&s, t0, TorrentState::Queued, 10);
+
+    // Past the end is last; the first is untouched.
+    save_all();
+    block_on(s.set_queue_position(t0, 1000)).unwrap();
+    assert_eq!(order(), vec![t2, t3, t1, t0]);
+    assert_eq!(dirty(), vec![true, true, false, true]);
+
+    // Where it already is: nothing moves, nothing is marked.
+    save_all();
+    block_on(s.set_queue_position(t3, 1)).unwrap();
+    block_on(s.set_queue_position(t0, 3)).unwrap();
+    assert_eq!(order(), vec![t2, t3, t1, t0]);
+    assert_eq!(dirty(), vec![false; 4]);
+
+    // Positions stay dense after a removal; an unknown torrent is refused.
+    block_on(s.remove_torrent(t3)).unwrap();
+    assert_eq!(
+        block_on(s.set_queue_position(t3, 0)),
+        Err(session::Error::NoSuchTorrent)
+    );
+    block_on(s.set_queue_position(t1, 0)).unwrap();
+    assert_eq!(order(), vec![t1, t2, t0]);
+    let positions: Vec<usize> = [t1, t2, t0]
+        .iter()
+        .map(|&id| status(&s, id).queue_position)
+        .collect();
+    assert_eq!(positions, vec![0, 1, 2]);
+    wait_state(&s, t1, TorrentState::Seeding, 10);
+    wait_state(&s, t2, TorrentState::Queued, 10);
+    block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_running_torrent_moving_no_data_is_reported_slow() {
+    // ../urtorrentd/docs/gaps.md: the queue lets a torrent that has run for
+    // 60 s below 2 KiB/s both ways go without a slot (unless `count_slow`),
+    // and `TorrentStatus::slow` says which torrents are in that state. Two
+    // sessions wait out the same minute: without `count_slow` the stalled
+    // first download is slow and the second starts; with it the flag is the
+    // same but the second keeps waiting. Once data flows the flag clears and
+    // the first counts again, so the second queues again.
+    let dir = tmp("slow");
+    let (bytes, data) = make_torrent("s0.bin", 2 << 20, 64 * 1024, "http://127.0.0.1:1/x");
+    let (bytes1, _) = make_torrent("s1.bin", 2 << 20, 64 * 1024, "http://127.0.0.1:1/x");
+    let seed_dir = dir.join("seed");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    std::fs::write(seed_dir.join("s0.bin"), &data).unwrap();
+    let a = block_on(builder(1).build()).unwrap();
+    let a_id = block_on(a.add_torrent(AddTorrent::metainfo(bytes.clone(), &seed_dir))).unwrap();
+    wait_state(&a, a_id, TorrentState::Seeding, 10);
+    let limits = |count_slow| session::ActiveLimits {
+        downloads: Some(1),
+        seeds: None,
+        total: None,
+        count_slow,
+    };
+    let b = block_on(
+        builder(2)
+            .active_limits(limits(false))
+            .download_limit(64 * 1024)
+            .build(),
+    )
+    .unwrap();
+    let c = block_on(builder(3).active_limits(limits(true)).build()).unwrap();
+    let started = Instant::now();
+    let mut two = Vec::new();
+    for (s, who) in [(&b, "b"), (&c, "c")] {
+        let d = dir.join(who);
+        std::fs::create_dir_all(&d).unwrap();
+        let t0 = block_on(s.add_torrent(AddTorrent::metainfo(bytes.clone(), &d))).unwrap();
+        let t1 = block_on(s.add_torrent(AddTorrent::metainfo(bytes1.clone(), &d))).unwrap();
+        wait_state(s, t0, TorrentState::Downloading, 10);
+        wait_state(s, t1, TorrentState::Queued, 10);
+        two.push((t0, t1));
+    }
+    let [(b0, b1), (c0, c1)] = [two[0], two[1]];
+    for (s, id) in [(&b, b0), (&b, b1), (&c, c0), (&c, c1)] {
+        assert!(!status(s, id).slow, "{id:?} slow at once");
+    }
+
+    // Not before a minute of running: the rates are zero from the start,
+    // but a torrent that has just started is not slow yet.
+    std::thread::sleep(Duration::from_secs(50).saturating_sub(started.elapsed()));
+    assert!(!status(&b, b0).slow && !status(&c, c0).slow, "slow early");
+    wait_for("b0 slow", 30, || status(&b, b0).slow);
+    wait_for("c0 slow", 10, || status(&c, c0).slow);
+    assert!(started.elapsed() >= Duration::from_secs(60));
+    // Without count_slow the slot is free and the second download runs
+    // (not slow itself: it has just started); with it, it waits.
+    wait_state(&b, b1, TorrentState::Downloading, 10);
+    assert!(!status(&b, b1).slow);
+    assert_eq!(state(&c, c1), TorrentState::Queued);
+    assert!(!status(&c, c1).slow, "a queued torrent is never slow");
+    let listed = block_on(b.statuses()).unwrap();
+    assert!(listed.iter().any(|st| st.id == b0 && st.slow));
+    assert!(listed.iter().any(|st| st.id == b1 && !st.slow));
+
+    // Data flows: the flag clears, the first holds its slot again and the
+    // second goes back to the queue.
+    block_on(b.add_peer(b0, addr_of(1, &a))).unwrap();
+    wait_for("b0 moving", 30, || !status(&b, b0).slow);
+    wait_state(&b, b1, TorrentState::Queued, 10);
+    assert_eq!(state(&b, b0), TorrentState::Downloading);
+    block_on(b.shutdown()).unwrap();
+    block_on(c.shutdown()).unwrap();
+    block_on(a.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

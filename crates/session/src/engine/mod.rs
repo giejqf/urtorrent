@@ -228,6 +228,7 @@ pub enum Command {
     SetAutoManaged(TorrentId, bool, oneshot::Sender<Result<(), Error>>),
     ForceResume(TorrentId, oneshot::Sender<Result<(), Error>>),
     MoveInQueue(TorrentId, QueueMove, oneshot::Sender<Result<(), Error>>),
+    SetQueuePosition(TorrentId, usize, oneshot::Sender<Result<(), Error>>),
     DhtState(oneshot::Sender<Option<Vec<u8>>>),
     AddDhtNode(SocketAddr, oneshot::Sender<()>),
     Status(TorrentId, oneshot::Sender<Result<TorrentStatus, Error>>),
@@ -1443,6 +1444,10 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
         },
         Command::MoveInQueue(id, to, reply) => {
             let r = queue::move_in_queue(ctx, id, to);
+            let _ = reply.send(r);
+        }
+        Command::SetQueuePosition(id, position, reply) => {
+            let r = queue::set_queue_position(ctx, id, position);
             let _ = reply.send(r);
         }
         Command::SetMaxPeers(id, max, reply) => match ctx.torrent(id) {
