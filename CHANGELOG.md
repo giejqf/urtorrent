@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.6] - 2026-09-26
+
+### Fixed
+
+- **Web seeds ignored the download limits.** Web-seed traffic was never
+  charged to the session's `download_limit` or the torrent's
+  (`set_torrent_rate_limits`): 1 MiB came in at loopback speed under a
+  256 KiB/s limit. It now draws from both, as peer connections do
+  (libtorrent's web peers share the peers' bandwidth channels). Under a
+  limit, a round asks for about 5 s of it rather than 4 MiB, and a
+  throttled response times out only when the server stays silent for 30 s
+  (time spent waiting for quota does not count). CI found it: the lab's
+  `http_bound_to_listen_address` could fetch the whole torrent before it
+  removed the listen address.
+- **A piece verified during a connection's handshake could be lost to the
+  peer.** Its `have` went out at once, ahead of the first messages, and the
+  bitfield that followed did not contain the piece: the peer took the
+  bitfield as our whole have-state, so we advertised less than we had, and
+  the bitfield was not the first message. The piece now joins the
+  have-state the first messages carry (libtorrent's `announce_piece` skips
+  connections still in their handshake). Seen in `dualstack.rs`, where the
+  seed never saw the leecher complete.
+
+### Added
+
+- Gates: `extensions.rs` (web seeds under the session and the torrent
+  download limit), `wire` (a piece gained during the handshake is in the
+  bitfield, for both roles). `dualstack.rs`: a peer dialled over both
+  families is checked with the IPv4 connection up before the IPv6 dial (the
+  duplicate closes are then deterministic) and with both dials at once
+  (whatever order the handshakes complete in, both ends keep the IPv6
+  connection); the dialling side may see the other end's duplicate close
+  as a reset when its requests were still unread there.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0D60-` / `urtorrent/0.13.6`
+  / DHT `UR\x00\x0d`.
+
 ## [0.13.5] - 2026-09-25
 
 ### Added

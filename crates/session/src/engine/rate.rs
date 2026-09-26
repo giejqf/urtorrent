@@ -123,6 +123,17 @@ impl Limiter {
     }
 }
 
+/// Take a grant from the session limiter, then narrow it through the
+/// torrent's; unused session tokens go back.
+pub async fn acquire_pair(session: &Limiter, torrent: &Limiter, want: u64) -> u64 {
+    let g1 = session.acquire(want).await;
+    let g2 = torrent.acquire(g1).await;
+    if g2 < g1 {
+        session.refund(g1 - g2);
+    }
+    g2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

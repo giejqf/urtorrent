@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 urtorrent contributors
 
-//! A minimal HTTP/1.1 client over io_uring TCP for tracker announces: resolve,
+//! A minimal HTTP/1.1 client over io_uring TCP for tracker announces and web
+//! seeds: resolve,
 //! connect (with timeout), optional TLS (rustls, ADR 0003), send the pre-built
 //! request, frame the response with `tracker::http`, follow a few redirects.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::rc::Rc;
 use std::time::Duration;
 
 use tracker::Url;
@@ -13,14 +15,50 @@ use tracker::http::{Response, ResponseParser};
 use uring::{Buffer, TcpStream};
 
 use super::dns::Dns;
+use super::local::{Either, Flag, select2};
+use super::rate::{Limiter, acquire_pair};
 use super::tls::{TlsClient, TlsStream};
 
 /// Maximum redirects followed (libtorrent follows 5).
 const MAX_REDIRECTS: usize = 5;
 /// Connect timeout.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Whole-exchange timeout after connecting.
+/// Whole-exchange timeout after connecting (per read for a throttled
+/// request, [`HttpConn::request`]).
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The download limits a response body is charged to: web seeds share the
+/// peers' limits, session and torrent (libtorrent's web peers are peer
+/// connections in the same bandwidth channels); tracker traffic is not
+/// limited.
+pub struct Throttle {
+    pub session: Rc<Limiter>,
+    pub torrent: Rc<Limiter>,
+    /// Ends a wait for quota (the torrent stopping).
+    pub stop: Rc<Flag>,
+}
+
+impl Throttle {
+    /// Charge `n` received bytes, waiting for the quota as peers do (the
+    /// bytes are here; the next read waits). `Err` once stopped.
+    async fn charge(&self, mut n: u64) -> Result<(), String> {
+        if self.session.is_unlimited() && self.torrent.is_unlimited() {
+            return Ok(());
+        }
+        while n > 0 {
+            match select2(
+                acquire_pair(&self.session, &self.torrent, n),
+                self.stop.wait(),
+            )
+            .await
+            {
+                Either::Left(g) => n -= g.min(n),
+                Either::Right(()) => return Err("stopped".into()),
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Which address families we can use for outgoing connections.
 #[derive(Debug, Clone, Copy)]
@@ -157,7 +195,7 @@ async fn fetch_once(
     let mut conn = HttpConn::open(dns, tls, families, url).await?;
     let resp = uring::timeout(
         RESPONSE_TIMEOUT,
-        conn.request(request, tracker::http::MAX_BODY),
+        conn.request(request, tracker::http::MAX_BODY, None),
     )
     .await
     .map_err(|_| "tracker response timed out".to_string())??;
@@ -256,8 +294,16 @@ impl HttpConn {
         !self.closed
     }
 
-    /// Send `request` and read one response (body up to `max_body`).
-    pub async fn request(&mut self, request: Vec<u8>, max_body: usize) -> Result<Response, String> {
+    /// Send `request` and read one response (body up to `max_body`). With
+    /// a `throttle` the body is charged to its limits as it arrives, and
+    /// the server has [`RESPONSE_TIMEOUT`] for each read rather than for
+    /// the whole response (time spent waiting for quota is ours).
+    pub async fn request(
+        &mut self,
+        request: Vec<u8>,
+        max_body: usize,
+        throttle: Option<&Throttle>,
+    ) -> Result<Response, String> {
         if self.closed {
             return Err("connection closed by the server".into());
         }
@@ -277,16 +323,28 @@ impl HttpConn {
             }
         }
         loop {
-            let chunk: Vec<u8> = match &mut self.stream {
-                Stream::Plain(s) => {
-                    let (r, buf) = s.recv(Buffer::from_vec(vec![0u8; 16 * 1024])).await;
-                    match r {
-                        Ok(0) => Vec::new(),
-                        Ok(n) => buf.as_slice()[..n as usize].to_vec(),
-                        Err(e) => return Err(format!("recv: {e}")),
+            let read = async {
+                match &mut self.stream {
+                    Stream::Plain(s) => {
+                        let (r, buf) = s.recv(Buffer::from_vec(vec![0u8; 16 * 1024])).await;
+                        match r {
+                            Ok(0) => Ok(Vec::new()),
+                            Ok(n) => Ok(buf.as_slice()[..n as usize].to_vec()),
+                            Err(e) => Err(format!("recv: {e}")),
+                        }
                     }
+                    Stream::Tls(s) => s.recv(16 * 1024).await,
                 }
-                Stream::Tls(s) => s.recv(16 * 1024).await?,
+            };
+            let chunk: Vec<u8> = match throttle {
+                None => read.await?,
+                Some(th) => {
+                    let chunk = uring::timeout(RESPONSE_TIMEOUT, read)
+                        .await
+                        .map_err(|_| "response timed out".to_string())??;
+                    th.charge(chunk.len() as u64).await?;
+                    chunk
+                }
             };
             if chunk.is_empty() {
                 self.closed = true;

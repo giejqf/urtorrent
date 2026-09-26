@@ -325,6 +325,50 @@ fn web_seed_only() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn web_seeds_honour_the_download_limits() {
+    // libtorrent's web seeds are peer connections in the same bandwidth
+    // channels: the session's download limit and the torrent's both slow
+    // them down. 1 MiB at 256 KiB/s, less the one second of burst the
+    // limiter starts with, takes about 3 s; unlimited it takes
+    // milliseconds on loopback.
+    init_log();
+    let dir = std::env::temp_dir().join(format!("urt-ext-wslimit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (torrent, data) = make_torrent("lim.bin", 1 << 20, 64 * 1024, "http://127.0.0.1:1/x");
+    let data = Arc::new(data);
+    for (i, per_torrent) in [false, true].into_iter().enumerate() {
+        let (url, _hits) = spawn_range_server(data.clone(), "/lim.bin");
+        let mut builder = Session::builder()
+            .listen_port(0)
+            .listen_v4(Some(Ipv4Addr::new(127, 0, 0, 1)))
+            .listen_v6(None)
+            .lsd(false)
+            .dht(false);
+        if !per_torrent {
+            builder = builder.download_limit(256 * 1024);
+        }
+        let s = block_on(builder.build()).unwrap();
+        let d = dir.join(format!("{i}"));
+        let id = block_on(s.add_torrent(AddTorrent::metainfo(torrent.clone(), &d))).unwrap();
+        if per_torrent {
+            block_on(s.set_torrent_rate_limits(id, 0, 256 * 1024)).unwrap();
+        }
+        let started = Instant::now();
+        block_on(s.add_web_seed(id, url)).unwrap();
+        let st = wait_state(&s, id, TorrentState::Seeding, 30);
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(2500),
+            "per_torrent={per_torrent}: 1 MiB in {took:?} under 256 KiB/s"
+        );
+        assert_eq!(st.downloaded, 1 << 20);
+        assert_eq!(std::fs::read(d.join("lim.bin")).unwrap(), *data);
+        block_on(s.shutdown()).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// BEP 9 `x.pe` and BEP 53 `so=` in a magnet link: the peer named in the
 /// link is dialled without any tracker or manual `add_peer`, the metadata
 /// arrives, and only the selected file is downloaded.

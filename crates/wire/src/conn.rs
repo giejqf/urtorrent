@@ -477,9 +477,16 @@ impl Connection {
         });
     }
 
-    /// Announce that we now have piece `index`.
+    /// Announce that we now have piece `index`. Before the first messages
+    /// (the handshake still in flight) the piece joins the have-state they
+    /// will carry instead: a `have` queued then would precede the bitfield,
+    /// which the peer takes as our whole have-state, so it would lose the
+    /// piece (and the bitfield would not be the first message).
     pub fn have(&mut self, index: u32) {
-        self.push(&Message::Have(index));
+        self.params.our_have.set(index as usize);
+        if self.first_messages_sent {
+            self.push(&Message::Have(index));
+        }
     }
 
     /// Request a block. Returns `false` (and sends nothing) if the request is
@@ -1286,6 +1293,37 @@ mod tests {
         assert_eq!(upload_only_of(true, false), Some(true), "finished partial");
         assert_eq!(upload_only_of(false, false), None, "still downloading");
         assert_eq!(upload_only_of(false, true), Some(true), "every piece");
+    }
+
+    #[test]
+    fn a_piece_gained_during_the_handshake_is_in_the_bitfield() {
+        // The engine announces a verified piece to every connection,
+        // including one whose handshake is still in flight: the piece must
+        // reach the peer in the have-state the first messages carry, not
+        // as a `have` ahead of a bitfield that lacks it.
+        for role in [Role::Initiator, Role::Responder] {
+            let mut p = params(role, 12, false);
+            p.our_have.set(3);
+            let mut c = Connection::new(p);
+            c.have(5);
+            if role == Role::Initiator {
+                let hs = c.take_outbound();
+                assert_eq!(hs.len(), 68, "only the handshake before the peer's");
+            }
+            c.receive(&peer_hs(PLAIN)).unwrap();
+            let mut out = c.take_outbound();
+            if role == Role::Responder {
+                out.drain(..68);
+            }
+            let msgs = decode_all(&out, false);
+            assert_eq!(msgs, vec![Message::Bitfield(vec![0x14, 0])], "{role:?}");
+            // Once the first messages are out, a piece is a `have`.
+            c.have(7);
+            assert_eq!(
+                decode_all(&c.take_outbound(), false),
+                vec![Message::Have(7)]
+            );
+        }
     }
 
     #[test]

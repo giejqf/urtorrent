@@ -23,7 +23,7 @@ use wire::{Connection, ConnectionParams, Event as WireEvent, Handshake, PeerHave
 
 use super::Ctx;
 use super::local::{Either, Flag, Notify, select2};
-use super::rate::Limiter;
+use super::rate::acquire_pair;
 use super::torrent::{self, INACTIVITY_TIMEOUT, KEEPALIVE_AFTER, REQUEST_TIMEOUT, Torrent};
 use crate::api::{EncryptionMode, Event, PeerInfo, PeerSource};
 
@@ -1552,17 +1552,6 @@ async fn handle_event(
         WireEvent::NotInterested | WireEvent::KeepAlive => {}
     }
     Ok(())
-}
-
-/// Take a grant from the session limiter, then narrow it through the
-/// torrent's; unused session tokens go back.
-async fn acquire_pair(session: &Limiter, torrent: &Limiter, want: u64) -> u64 {
-    let g1 = session.acquire(want).await;
-    let g2 = torrent.acquire(g1).await;
-    if g2 < g1 {
-        session.refund(g1 - g2);
-    }
-    g2
 }
 
 /// Flush the connection's outbound bytes as they appear, within the upload

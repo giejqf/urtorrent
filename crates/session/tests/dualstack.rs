@@ -169,8 +169,16 @@ fn spawn_tracker(peers: Vec<SocketAddr>, peers6: Vec<SocketAddr>) -> String {
 /// Replay `ev` up to `TorrentFinished` for `id`: the connections live at
 /// that moment and every disconnect reason seen before it.
 fn live_at_finish(ev: &mut session::EventStream, id: TorrentId) -> (Vec<SocketAddr>, Vec<String>) {
+    live_at_finish_from(ev, id, Vec::new())
+}
+
+/// [`live_at_finish`] with `live` already connected.
+fn live_at_finish_from(
+    ev: &mut session::EventStream,
+    id: TorrentId,
+    mut live: Vec<SocketAddr>,
+) -> (Vec<SocketAddr>, Vec<String>) {
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut live: Vec<SocketAddr> = Vec::new();
     let mut reasons = Vec::new();
     loop {
         match ev.try_recv() {
@@ -194,32 +202,65 @@ fn live_at_finish(ev: &mut session::EventStream, id: TorrentId) -> (Vec<SocketAd
     }
 }
 
+/// Whether a disconnect reason is the dialling side's view of a duplicate
+/// being dropped: its own verdict, or the other end's close arriving first,
+/// as a FIN or, when that end closed with our requests still unread in its
+/// receive buffer, as a reset.
+fn dropped_as_duplicate(reason: &str) -> bool {
+    reason.ends_with("duplicate peer id")
+        || reason.ends_with("peer closed the connection")
+        || reason.ends_with("Connection reset by peer (os error 104)")
+}
+
+/// Wait for `id`'s `PeerConnected` from `ip`, dropping the events before
+/// it; the connection's address.
+fn wait_connected(ev: &mut session::EventStream, id: TorrentId, ip: IpAddr) -> SocketAddr {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match ev.try_recv() {
+            Some(Event::PeerConnected { id: i, addr, .. }) if i == id && addr.ip() == ip => {
+                return addr;
+            }
+            Some(_) => {}
+            None => {
+                assert!(Instant::now() < deadline, "no connection from {ip}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 #[test]
 fn peer_dialled_over_both_families_keeps_one_connection() {
     // A: 127.0.0.1 + ::1, B: 127.0.0.2 + ::1 (same listen port on both of
-    // each engine's addresses). B learns both of A's addresses.
+    // each engine's addresses). B learns both of A's addresses: the IPv4
+    // connection is up on both ends before B dials IPv6, so both ends see
+    // the IPv6 handshake as the newcomer and close the IPv4 connection
+    // (`..._at_once` below leaves the order to the scheduler). B's download
+    // is rate limited so the IPv6 connection comes before the end.
     let a = block_on(builder(Some(1), true).build()).unwrap();
-    let b = block_on(builder(Some(2), true).build()).unwrap();
+    let b = block_on(builder(Some(2), true).download_limit(2 << 20).build()).unwrap();
     let fx = Fixture::new("both", 4 << 20);
     let a_id = fx.seed(&a);
     let mut a_events = a.events();
     let mut b_events = b.events();
     let b_id = fx.leech(&b);
     block_on(b.add_peer(b_id, v4(1, &a))).unwrap();
+    let b_v4 = wait_connected(&mut b_events, b_id, v4(1, &a).ip());
+    wait_connected(&mut a_events, a_id, Ipv4Addr::new(127, 0, 0, 2).into());
     block_on(b.add_peer(b_id, v6(&a))).unwrap();
     wait_state(&b, b_id, TorrentState::Seeding, 60);
     fx.check_leeched();
 
     // Both ends keep the IPv6 connection (same peer id over both families,
     // both dialled by B), and the other one went as a duplicate, not as an
-    // error. B may see A's close first ("peer closed the connection").
-    let (b_live, b_reasons) = live_at_finish(&mut b_events, b_id);
+    // error (B may see A's close first).
+    let (b_live, b_reasons) = live_at_finish_from(&mut b_events, b_id, vec![b_v4]);
     assert_eq!(b_live, vec![v6(&a)], "B live at finish; {b_reasons:?}");
     assert_eq!(b_reasons.len(), 1, "{b_reasons:?}");
     assert!(
         b_reasons[0].starts_with(&format!("{}: ", v4(1, &a)))
-            && (b_reasons[0].ends_with("duplicate peer id")
-                || b_reasons[0].ends_with("peer closed the connection")),
+            && dropped_as_duplicate(&b_reasons[0]),
         "{b_reasons:?}"
     );
     // A's side: the incoming v6 connection from B survives.
@@ -256,6 +297,66 @@ fn peer_dialled_over_both_families_keeps_one_connection() {
             .iter()
             .any(|r| r.starts_with("[::1]:") && r.ends_with("both seeds")),
         "A's v6 connection lived until B finished; {a_reasons:?}"
+    );
+    block_on(b.shutdown()).unwrap();
+    block_on(a.shutdown()).unwrap();
+}
+
+#[test]
+fn peer_dialled_over_both_families_at_once_keeps_one_connection() {
+    // As above with both dials at once: each end may see either handshake
+    // first, and the two ends may disagree on the order (docs/quirks.md
+    // Q25). A connection refused at its handshake was never reported
+    // connected, so it reports no disconnect either. Whatever the order,
+    // both ends keep the IPv6 connection and drop the IPv4 one only as a
+    // duplicate.
+    let a = block_on(builder(Some(1), true).build()).unwrap();
+    let b = block_on(builder(Some(2), true).build()).unwrap();
+    let fx = Fixture::new("both-at-once", 4 << 20);
+    let a_id = fx.seed(&a);
+    let mut a_events = a.events();
+    let mut b_events = b.events();
+    let b_id = fx.leech(&b);
+    block_on(b.add_peer(b_id, v4(1, &a))).unwrap();
+    block_on(b.add_peer(b_id, v6(&a))).unwrap();
+    wait_state(&b, b_id, TorrentState::Seeding, 60);
+    fx.check_leeched();
+
+    let (b_live, b_reasons) = live_at_finish(&mut b_events, b_id);
+    assert_eq!(b_live, vec![v6(&a)], "B live at finish; {b_reasons:?}");
+    assert!(
+        b_reasons.len() <= 1
+            && b_reasons
+                .iter()
+                .all(|r| r.starts_with(&format!("{}: ", v4(1, &a))) && dropped_as_duplicate(r)),
+        "{b_reasons:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut a_reasons = Vec::new();
+    while !a_reasons.iter().any(|r: &String| r.ends_with("both seeds")) {
+        match a_events.try_recv() {
+            Some(Event::PeerDisconnected {
+                id, addr, reason, ..
+            }) if id == a_id => a_reasons.push(format!("{addr}: {reason}")),
+            Some(_) => {}
+            None => {
+                assert!(Instant::now() < deadline, "A: {a_reasons:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    // A's IPv6 connection lived until B finished; its IPv4 one, if it was
+    // ever reported, went as the duplicate.
+    assert!(
+        a_reasons.iter().all(|r| {
+            (r.starts_with("[::1]:") && r.ends_with("both seeds"))
+                || (r.starts_with("127.0.0.2:") && r.ends_with("duplicate peer id"))
+        }) && a_reasons
+            .iter()
+            .filter(|r| r.ends_with("both seeds"))
+            .count()
+            == 1,
+        "{a_reasons:?}"
     );
     block_on(b.shutdown()).unwrap();
     block_on(a.shutdown()).unwrap();
@@ -343,11 +444,7 @@ fn incoming_and_outgoing_over_different_families_keep_one_connection() {
         "B live at finish: {b_live:?}; {b_reasons:?}"
     );
     assert!(
-        b_reasons.len() <= 1
-            && b_reasons
-                .iter()
-                .all(|r| r.ends_with("duplicate peer id")
-                    || r.ends_with("peer closed the connection")),
+        b_reasons.len() <= 1 && b_reasons.iter().all(|r| dropped_as_duplicate(r)),
         "{b_reasons:?}"
     );
     block_on(b.shutdown()).unwrap();
@@ -382,9 +479,7 @@ fn tracker_peers_and_peers6_naming_one_seeder_yield_one_connection() {
         reasons.len() <= 1
             && reasons
                 .iter()
-                .all(|r| r.starts_with(&format!("{}: ", v4(1, &a)))
-                    && (r.ends_with("duplicate peer id")
-                        || r.ends_with("peer closed the connection"))),
+                .all(|r| r.starts_with(&format!("{}: ", v4(1, &a))) && dropped_as_duplicate(r)),
         "{reasons:?}"
     );
     block_on(b.shutdown()).unwrap();

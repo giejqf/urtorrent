@@ -38,6 +38,20 @@ pub const MAX_REQUEST: u64 = 4 * 1024 * 1024;
 pub const MAX_FAILURES: u32 = 5;
 /// Blocks picked per round (one `MAX_REQUEST` worth at 16 KiB).
 const BLOCKS_PER_ROUND: usize = (MAX_REQUEST / 16384) as usize;
+/// Under a download limit a round holds about this long of it, so its
+/// blocks are not tied up (and its progress unseen) for long.
+const ROUND_SECS: u64 = 5;
+
+/// Blocks for the next round under the session and torrent download limits
+/// (0 = unlimited): the tighter one decides.
+fn round_blocks(session: u64, torrent: u64) -> usize {
+    match [session, torrent].into_iter().filter(|r| *r > 0).min() {
+        None => BLOCKS_PER_ROUND,
+        Some(rate) => {
+            ((rate.saturating_mul(ROUND_SECS) / 16384) as usize).clamp(1, BLOCKS_PER_ROUND)
+        }
+    }
+}
 
 /// Per-torrent web seed bookkeeping.
 #[derive(Default)]
@@ -187,8 +201,15 @@ async fn run_inner(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, url: &str, key
             let Some(info) = t.info.clone() else {
                 return "no metadata".into();
             };
-            let blocks = torrent::pick_contiguous(ctx, &mut t.picker, key, BLOCKS_PER_ROUND);
+            let want = round_blocks(ctx.down_limit.rate(), t.down_limit.rate());
+            let blocks = torrent::pick_contiguous(ctx, &mut t.picker, key, want);
             (info, blocks, t.closing.clone())
+        };
+        // Web seeds draw from the download limits as peers do.
+        let throttle = super::http::Throttle {
+            session: ctx.down_limit.clone(),
+            torrent: torrent.borrow().down_limit.clone(),
+            stop: closing.clone(),
         };
         if blocks.is_empty() {
             match super::local::select2(uring::sleep(Duration::from_secs(1)), closing.wait()).await
@@ -247,7 +268,10 @@ async fn run_inner(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, url: &str, key
                 }
             };
             let request = build_request(&target_url, user_agent, seg.start, seg.end - 1);
-            let resp = fetch(ctx, &mut conn, &target, &target_url, request).await;
+            let resp = fetch(ctx, &mut conn, &target, &target_url, request, &throttle).await;
+            if torrent.borrow().closing.is_set() {
+                return "stopped".into();
+            }
             match resp {
                 Ok(Response {
                     status: 206, body, ..
@@ -347,16 +371,21 @@ async fn run_inner(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, url: &str, key
 
 /// One request over the kept-alive connection to `target`, reconnecting
 /// when the URL changed, the server closed, or the first attempt failed on
-/// a stale connection.
+/// a stale connection. The body is charged to the download limits as it
+/// arrives; the server has `RESPONSE_TIMEOUT` for each read.
 async fn fetch(
     ctx: &Rc<Ctx>,
     conn: &mut Option<(String, super::http::HttpConn)>,
     target: &str,
     url: &Url,
     request: Vec<u8>,
+    throttle: &super::http::Throttle,
 ) -> Result<Response, String> {
     let max_body = MAX_REQUEST as usize + 1024;
     for attempt in 0..2 {
+        if throttle.stop.is_set() {
+            return Err("stopped".into());
+        }
         let reuse = matches!(conn, Some((t, c)) if t == target && c.reusable());
         if !reuse {
             let c = super::http::HttpConn::open(&ctx.dns, &ctx.tls, ctx.outgoing(), url).await?;
@@ -365,23 +394,14 @@ async fn fetch(
         let Some((_, c)) = conn.as_mut() else {
             return Err("no connection".into());
         };
-        match uring::timeout(
-            super::http::RESPONSE_TIMEOUT,
-            c.request(request.clone(), max_body),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => return Ok(resp),
-            Ok(Err(e)) => {
+        match c.request(request.clone(), max_body, Some(throttle)).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
                 *conn = None;
                 if attempt == 1 || !reuse {
                     return Err(e);
                 }
                 // A stale kept-alive connection: retry once on a fresh one.
-            }
-            Err(_) => {
-                *conn = None;
-                return Err("web seed response timed out".into());
             }
         }
     }
@@ -428,6 +448,18 @@ mod tests {
             "d5:filesld6:lengthi10e4:pathl3:dir5:x y.ceed6:lengthi5e4:pathl1:zeee4:name3:top12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae"
         };
         metainfo::Info::from_info_dict(spec.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn rounds_follow_the_tightest_download_limit() {
+        assert_eq!(round_blocks(0, 0), BLOCKS_PER_ROUND);
+        // 256 KiB/s for 5 s = 80 blocks, whichever limit sets it.
+        assert_eq!(round_blocks(256 * 1024, 0), 80);
+        assert_eq!(round_blocks(0, 256 * 1024), 80);
+        assert_eq!(round_blocks(1 << 20, 256 * 1024), 80);
+        // At least one block; never more than an unlimited round.
+        assert_eq!(round_blocks(100, 0), 1);
+        assert_eq!(round_blocks(u64::MAX, 0), BLOCKS_PER_ROUND);
     }
 
     #[test]
