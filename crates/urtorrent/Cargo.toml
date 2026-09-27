@@ -22,7 +22,7 @@ default = ["tokio"]
 tokio = ["dep:tokio-stream"]
 
 [dependencies]
-session = { package = "urtorrent-session", path = "../session", version = "0.14.1" }
-metainfo = { package = "urtorrent-metainfo", path = "../metainfo", version = "0.14.1" }
-profile = { package = "urtorrent-profile", path = "../profile", version = "0.14.1" }
+session = { package = "urtorrent-session", path = "../session", version = "0.14.2" }
+metainfo = { package = "urtorrent-metainfo", path = "../metainfo", version = "0.14.2" }
+profile = { package = "urtorrent-profile", path = "../profile", version = "0.14.2" }
 tokio-stream = { version = "0.1", default-features = false, optional = true }

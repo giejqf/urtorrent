@@ -1482,7 +1482,12 @@ async fn handle_event(
             // Payload we received and cannot use: counted as downloaded
             // (it came off the wire) and as redundant (libtorrent's
             // `incoming_piece`: `received_bytes` plus
-            // `add_redundant_bytes`), so the two always cancel out.
+            // `add_redundant_bytes`), so the two always cancel out. The
+            // connection's own counter has it too, as libtorrent's peer
+            // statistics do: per-peer figures add up to the torrent's.
+            handle
+                .downloaded
+                .set(handle.downloaded.get() + u64::from(length));
             let mut t = torrent.borrow_mut();
             t.stats.downloaded += u64::from(length);
             t.stats.redundant += u64::from(length);

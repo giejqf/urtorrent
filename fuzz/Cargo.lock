@@ -351,14 +351,14 @@ checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
 name = "urtorrent-bencode"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "urtorrent-dht"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "sha1",
  "thiserror",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "urtorrent-metainfo"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "sha1",
  "thiserror",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "urtorrent-mse"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -408,11 +408,11 @@ dependencies = [
 
 [[package]]
 name = "urtorrent-profile"
-version = "0.14.1"
+version = "0.14.2"
 
 [[package]]
 name = "urtorrent-storage"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "sha1",
  "thiserror",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "urtorrent-tracker"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "miniz_oxide",
  "thiserror",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "urtorrent-uring"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "io-uring",
  "libc",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "urtorrent-utp"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "thiserror",
  "tracing",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "urtorrent-wire"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "sha1",
  "thiserror",

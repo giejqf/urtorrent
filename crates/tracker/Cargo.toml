@@ -12,9 +12,9 @@ description = "Sans-IO HTTP/UDP tracker announce and scrape builders, parsers an
 workspace = true
 
 [dependencies]
-bencode = { package = "urtorrent-bencode", path = "../bencode", version = "0.14.1" }
-metainfo = { package = "urtorrent-metainfo", path = "../metainfo", version = "0.14.1" }
-profile = { package = "urtorrent-profile", path = "../profile", version = "0.14.1" }
+bencode = { package = "urtorrent-bencode", path = "../bencode", version = "0.14.2" }
+metainfo = { package = "urtorrent-metainfo", path = "../metainfo", version = "0.14.2" }
+profile = { package = "urtorrent-profile", path = "../profile", version = "0.14.2" }
 # Pure-Rust inflate for gzip-compressed tracker responses (we advertise
 # `Accept-Encoding: gzip` because the oracle does).
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

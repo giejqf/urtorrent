@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.2] - 2026-09-27
+
+### Fixed
+
+- **A connection's `downloaded` missed the blocks it sent unrequested.** A
+  block we never asked for (or no longer tracked) was counted in the
+  torrent's `downloaded` and `redundant`, as libtorrent's `incoming_piece`
+  does, but not in the sending connection's `PeerInfo::downloaded`, so the
+  per-peer figures fell short of the torrent's (AGENTS.md rule 1). They now
+  include it, as libtorrent's peer statistics do. CI's lab caught it on
+  0.14.1: in `leech_from_oracle [dual]` the two connections to the oracle
+  added up to one block less than the total. `hostile.rs` checks it.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0E20-` /
+  `urtorrent/0.14.2`.
+
 ## [0.14.1] - 2026-09-27
 
 Published on crates.io. The facade's API is unchanged.

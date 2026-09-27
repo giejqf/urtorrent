@@ -471,6 +471,12 @@ fn unrequested_pieces_are_dropped_and_counted_not_written() {
     assert_eq!(st.downloaded, st.redundant, "{st:?}");
     assert!(st.redundant >= 4 * 16 * 1024, "{st:?}");
     assert_eq!(st.total_wanted_done, 0, "{st:?}");
+    // The connection's own counter has them too (libtorrent's peer
+    // statistics count every payload byte received): per-peer figures add
+    // up to the torrent's.
+    let peers = block_on(b.peers(b_id)).unwrap();
+    assert_eq!(peers.len(), 1, "{peers:?}");
+    assert_eq!(peers[0].downloaded, st.downloaded, "{peers:?}");
     // The connection survives (libtorrent keeps it, Q23) and a real
     // download can still proceed through it.
     assert_eq!(st.peers, 1, "{st:?}");

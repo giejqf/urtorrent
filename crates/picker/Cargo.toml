@@ -12,8 +12,8 @@ description = "Piece picker and block request scheduling (rarest-first, prioriti
 workspace = true
 
 [dependencies]
-metainfo = { package = "urtorrent-metainfo", path = "../metainfo", version = "0.14.1" }
-profile = { package = "urtorrent-profile", path = "../profile", version = "0.14.1" }
+metainfo = { package = "urtorrent-metainfo", path = "../metainfo", version = "0.14.2" }
+profile = { package = "urtorrent-profile", path = "../profile", version = "0.14.2" }
 
 [dev-dependencies]
 proptest.workspace = true
