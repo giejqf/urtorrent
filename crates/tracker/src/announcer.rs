@@ -22,7 +22,9 @@
 //! skipped; a tracker that is due is announced to and satisfies the tier; a
 //! failed tracker in backoff is skipped so the next one in the tier gets its
 //! turn. Endpoints the caller disabled (a listen socket that cannot reach the
-//! tracker's address family) are skipped silently.
+//! tracker's address family) are skipped silently. A tracker reannounced by
+//! hand ([`Announcer::force_reannounce_tracker`]) is the one exception: it
+//! goes out once even when an earlier tracker satisfies its tier.
 
 use std::time::{Duration, Instant};
 
@@ -64,6 +66,8 @@ struct Endpoint {
     /// Earliest time a forced re-announce may happen.
     min_announce: Option<Instant>,
     updating: bool,
+    /// Reannounced by hand: announce once even if the tier is satisfied.
+    forced: bool,
     start_sent: bool,
     complete_sent: bool,
     complete_pending: bool,
@@ -82,6 +86,7 @@ impl Endpoint {
             next_announce: None,
             min_announce: None,
             updating: false,
+            forced: false,
             start_sent: false,
             complete_sent: false,
             complete_pending: false,
@@ -242,6 +247,7 @@ impl Announcer {
             for e in &mut t.endpoints {
                 e.next_announce = None;
                 e.updating = false;
+                e.forced = false;
             }
         }
     }
@@ -255,6 +261,7 @@ impl Announcer {
             for (i, t) in tier.iter_mut().enumerate() {
                 for (ei, e) in t.endpoints.iter_mut().enumerate() {
                     e.updating = false;
+                    e.forced = false;
                     if e.start_sent {
                         jobs.push(AnnounceJob {
                             tier: ti,
@@ -296,6 +303,22 @@ impl Announcer {
         }
     }
 
+    /// Force a re-announce to the tracker with `url` alone, as soon as each
+    /// of its endpoints' `min interval` allows, even when another tracker
+    /// satisfies its tier (libtorrent's `force_reannounce` with a tracker
+    /// index leaves it to the tier rules, which skip it then;
+    /// docs/quirks.md Q31). Returns whether the tracker is present.
+    pub fn force_reannounce_tracker(&mut self, url: &str, now: Instant) -> bool {
+        let Some(t) = self.tiers.iter_mut().flatten().find(|t| t.url == url) else {
+            return false;
+        };
+        for e in &mut t.endpoints {
+            e.next_announce = Some(e.min_announce.unwrap_or(now).max(now));
+            e.forced = true;
+        }
+        true
+    }
+
     /// Disable one endpoint of one tracker (its listen socket cannot reach
     /// the tracker, e.g. an IPv4 literal from the IPv6 socket). Disabled
     /// endpoints produce no jobs and no errors.
@@ -320,15 +343,19 @@ impl Announcer {
         let mut jobs = Vec::new();
         for ei in 0..self.endpoints {
             for (ti, tier) in self.tiers.iter_mut().enumerate() {
+                // Once a tracker satisfies the tier on this endpoint, only
+                // trackers reannounced by hand are looked at.
+                let mut satisfied = false;
                 for (i, t) in tier.iter_mut().enumerate() {
                     let Some(e) = t.endpoints.get_mut(ei) else {
                         continue;
                     };
-                    if !e.enabled {
+                    if !e.enabled || (satisfied && !e.forced) {
                         continue;
                     }
                     if e.updating {
-                        break; // this tier is being handled on this endpoint
+                        satisfied = true; // this tier is being handled on this endpoint
+                        continue;
                     }
                     if e.is_due(now) {
                         let event = if e.complete_pending && e.start_sent {
@@ -339,6 +366,7 @@ impl Announcer {
                             AnnounceEvent::None
                         };
                         e.updating = true;
+                        e.forced = false;
                         jobs.push(AnnounceJob {
                             tier: ti,
                             index: i,
@@ -347,10 +375,11 @@ impl Announcer {
                             event,
                             tracker_id: t.tracker_id.clone(),
                         });
-                        break;
+                        satisfied = true;
+                        continue;
                     }
                     if e.is_working() {
-                        break; // a working tracker satisfies the tier until it is due
+                        satisfied = true; // a working tracker satisfies the tier until it is due
                     }
                     // failed and in backoff: let the next tracker in the tier try
                 }
@@ -367,20 +396,22 @@ impl Announcer {
         let mut best: Option<Instant> = None;
         for ei in 0..self.endpoints {
             for tier in &self.tiers {
+                let mut satisfied = false;
                 for t in tier {
                     let Some(e) = t.endpoints.get(ei) else {
                         continue;
                     };
-                    if !e.enabled {
+                    if !e.enabled || (satisfied && !e.forced) {
                         continue;
                     }
                     if e.updating {
-                        break;
+                        satisfied = true;
+                        continue;
                     }
                     let due = e.next_announce.unwrap_or(now).max(now);
                     best = Some(best.map_or(due, |b| b.min(due)));
                     if e.is_working() || e.is_due(now) {
-                        break;
+                        satisfied = true;
                     }
                 }
             }
@@ -479,6 +510,9 @@ impl Announcer {
         }
         let e = &mut t.endpoints[ei];
         e.updating = false;
+        // A reannounce asked for while this one was in flight: its reply
+        // is as fresh.
+        e.forced = false;
         e.fails = 0;
         e.ever_succeeded = true;
         e.last_error = None;
@@ -512,6 +546,7 @@ impl Announcer {
         };
         let e = &mut t.endpoints[ei];
         e.updating = false;
+        e.forced = false;
         e.fails = e.fails.saturating_add(1);
         e.last_error = Some(error);
         let fails = u64::from(e.fails.min(1000));
@@ -840,6 +875,112 @@ mod tests {
             Some(t0 + Duration::from_secs(60))
         );
         assert_eq!(a.poll(t0 + Duration::from_secs(60)).len(), 1);
+    }
+
+    #[test]
+    fn force_reannounce_tracker_announces_to_it_alone() {
+        let t0 = Instant::now();
+        let mut a = Announcer::new(urls(&[&["http://a/"], &["http://b/"]]), 2);
+        a.start();
+        for job in a.poll(t0) {
+            a.on_success(&job, &resp(1800), t0);
+        }
+        assert!(!a.force_reannounce_tracker("http://c/", t0), "unknown URL");
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(a.force_reannounce_tracker("http://b/", t1));
+        let jobs = a.poll(t1);
+        assert_eq!(
+            jobs.iter()
+                .map(|j| (j.url.as_str(), j.endpoint, j.event))
+                .collect::<Vec<_>>(),
+            vec![
+                ("http://b/", 0, AnnounceEvent::None),
+                ("http://b/", 1, AnnounceEvent::None),
+            ],
+            "one per endpoint, the other tracker left alone"
+        );
+        for job in &jobs {
+            a.on_success(job, &resp(1800), t1);
+        }
+        assert_eq!(a.next_due(t1), Some(t0 + Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn a_tracker_reannounced_by_hand_goes_out_past_a_satisfied_tier() {
+        // libtorrent would skip it (the tier's working tracker satisfies
+        // the tier); the caller asked for this tracker, so it goes, once.
+        let t0 = Instant::now();
+        let with_min = AnnounceResponse {
+            interval: 1800,
+            min_interval: Some(60),
+            ..Default::default()
+        };
+        let mut a = Announcer::new(urls(&[&["http://a/", "http://b/"]]), 1);
+        a.start();
+        let job = a.poll(t0).remove(0);
+        assert_eq!(job.url, "http://a/");
+        a.on_success(&job, &with_min, t0);
+        // Tier satisfied by a: b is never looked at.
+        assert!(a.poll(t0 + Duration::from_secs(1)).is_empty());
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(a.force_reannounce_tracker("http://b/", t1));
+        assert_eq!(a.next_due(t1), Some(t1));
+        let jobs = a.poll(t1);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            (jobs[0].url.as_str(), jobs[0].event),
+            ("http://b/", AnnounceEvent::Started)
+        );
+        a.on_success(&jobs[0], &resp(1800), t1);
+        // Once: afterwards the tier rules apply again (a is announced when
+        // due, b is not), and both got `started`, so both get `stopped`.
+        let due = t0 + Duration::from_secs(1800);
+        assert_eq!(a.next_due(t1), Some(due));
+        let jobs = a.poll(t1 + Duration::from_secs(1800));
+        assert_eq!(
+            jobs.iter().map(|j| j.url.as_str()).collect::<Vec<_>>(),
+            vec!["http://a/"]
+        );
+        a.on_success(&jobs[0], &with_min, due);
+        // a's `min interval` holds a forced reannounce back.
+        let t2 = due + Duration::from_secs(5);
+        assert!(a.force_reannounce_tracker("http://a/", t2));
+        assert!(a.poll(t2).is_empty());
+        assert_eq!(a.next_due(t2), Some(due + Duration::from_secs(60)));
+        assert_eq!(a.poll(due + Duration::from_secs(60)).len(), 1);
+        assert_eq!(a.stop().len(), 2);
+    }
+
+    #[test]
+    fn a_reannounce_by_hand_does_not_outlive_its_run() {
+        let t0 = Instant::now();
+        let mut a = Announcer::new(urls(&[&["http://a/", "http://b/"]]), 1);
+        a.start();
+        assert_eq!(a.poll(t0)[0].url, "http://a/");
+        // Asked for before a stop: the restart announces by the tier rules
+        // only.
+        assert!(a.force_reannounce_tracker("http://b/", t0));
+        assert!(a.stop().is_empty(), "nothing was started");
+        a.start();
+        let jobs = a.poll(t0);
+        assert_eq!(
+            jobs.iter().map(|j| j.url.as_str()).collect::<Vec<_>>(),
+            vec!["http://a/"]
+        );
+        // a fails, b takes over; a reannounce of b asked for while b's
+        // announce is in flight is answered by that reply.
+        a.on_failure(&jobs[0], "down".into(), t0);
+        let jobs = a.poll(t0);
+        assert_eq!(jobs[0].url, "http://b/");
+        assert!(a.force_reannounce_tracker("http://b/", t0));
+        a.on_success(&jobs[0], &resp(1800), t0);
+        let t1 = t0 + Duration::from_secs(17);
+        let jobs = a.poll(t1);
+        assert_eq!(
+            jobs.iter().map(|j| j.url.as_str()).collect::<Vec<_>>(),
+            vec!["http://a/"],
+            "a's retry; b is not announced again"
+        );
     }
 
     #[test]

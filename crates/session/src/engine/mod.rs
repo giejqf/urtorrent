@@ -237,6 +237,7 @@ pub enum Command {
     Stats(oneshot::Sender<SessionStats>),
     SaveResume(TorrentId, oneshot::Sender<Result<(), Error>>),
     ForceReannounce(TorrentId, oneshot::Sender<Result<(), Error>>),
+    ForceReannounceTracker(TorrentId, String, oneshot::Sender<Result<(), Error>>),
     AddPeer(TorrentId, SocketAddr, oneshot::Sender<Result<(), Error>>),
     SetFilePriorities(TorrentId, Vec<u8>, oneshot::Sender<Result<(), Error>>),
     SetSequential(TorrentId, bool, oneshot::Sender<Result<(), Error>>),
@@ -1741,6 +1742,21 @@ fn handle_command(ctx: &Rc<Ctx>, cmd: Command) {
             Some(t) => {
                 t.borrow_mut().force_reannounce(Instant::now());
                 let _ = reply.send(Ok(()));
+            }
+            None => {
+                let _ = reply.send(Err(Error::NoSuchTorrent));
+            }
+        },
+        Command::ForceReannounceTracker(id, url, reply) => match ctx.torrent(id) {
+            Some(t) => {
+                let found = t
+                    .borrow_mut()
+                    .force_reannounce_tracker(&url, Instant::now());
+                let _ = reply.send(if found {
+                    Ok(())
+                } else {
+                    Err(Error::InvalidArgument(format!("no such tracker: {url}")))
+                });
             }
             None => {
                 let _ = reply.send(Err(Error::NoSuchTorrent));

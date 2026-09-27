@@ -145,6 +145,9 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
     // Bounded concurrency across the session (an announce storm at start-up
     // with thousands of torrents would otherwise open thousands of sockets).
     let permit = ctx.announce_gate.acquire().await;
+    // The response time starts here: waiting for a slot is ours, not the
+    // tracker's.
+    let sent = Instant::now();
     let result: Result<(AnnounceResponse, Option<(SocketAddr, SocketAddr)>), String> = async {
         let url = Url::parse(&job.url).map_err(|e| e.to_string())?;
         let profile_v = ctx.profile();
@@ -196,12 +199,16 @@ pub async fn announce_once(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, job: A
                 peers = resp.peers.len(),
                 new = added,
                 interval = resp.interval,
+                took = ?now.saturating_duration_since(sent),
                 "announce ok"
             );
             ctx.emit(Event::TrackerReply {
                 id,
                 url: job.url.clone(),
                 peers: resp.peers.len(),
+                interval: Duration::from_secs(u64::from(resp.interval)),
+                min_interval: resp.min_interval.map(|s| Duration::from_secs(u64::from(s))),
+                response_time: now.saturating_duration_since(sent),
             });
             if added > 0 {
                 torrent::on_new_candidates(ctx, torrent);

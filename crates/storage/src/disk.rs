@@ -19,6 +19,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -77,6 +78,8 @@ enum Job {
     },
     CheckAll {
         id: u64,
+        /// Pieces looked at so far, for the engine's progress reports.
+        checked: Arc<AtomicUsize>,
         done: Done,
     },
     SetHave {
@@ -425,6 +428,7 @@ impl DiskRing {
             have: RefCell::new(Bitfield::new(info.piece_count())),
             priorities: RefCell::new(priorities),
             mapped: RefCell::new(mapped),
+            checked: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -455,6 +459,8 @@ pub struct DiskStore {
     priorities: RefCell<Vec<u8>>,
     /// Mirror of the renamed paths (per `info.files` entry).
     mapped: RefCell<Vec<Option<SafePath>>>,
+    /// Pieces the running `check_all` has looked at (0 when none runs).
+    checked: Arc<AtomicUsize>,
 }
 
 impl DiskStore {
@@ -665,17 +671,30 @@ impl DiskStore {
     }
 
     /// Re-hash everything on disk; the have mirror is replaced by the result.
+    /// [`DiskStore::checked_pieces`] follows its progress meanwhile.
     pub async fn check_all(&self) -> Result<Bitfield, Error> {
         let (t, done) = self.ticket();
-        self.ring.submit(Job::CheckAll { id: self.id, done });
+        self.checked.store(0, Ordering::Relaxed);
+        self.ring.submit(Job::CheckAll {
+            id: self.id,
+            checked: self.checked.clone(),
+            done,
+        });
         let r = match t.await {
             Reply::Bits(r) => r,
             other => Err(unexpected(other)),
         };
+        self.checked.store(0, Ordering::Relaxed);
         if let Ok(h) = &r {
             *self.have.borrow_mut() = h.clone();
         }
         r
+    }
+
+    /// Pieces the running [`DiskStore::check_all`] has hashed (or found
+    /// incomplete) so far; 0 when no check runs.
+    pub fn checked_pieces(&self) -> usize {
+        self.checked.load(Ordering::Relaxed)
     }
 
     /// Change file priorities (see [`Storage::set_file_priorities`]).
@@ -1110,8 +1129,8 @@ async fn run_job(entry: Rc<RefCell<Entry>>, job: Job) {
         Job::VerifyPiece { piece, done, .. } => {
             done.complete(Reply::Bool(storage.verify_piece(piece).await));
         }
-        Job::CheckAll { done, .. } => {
-            done.complete(Reply::Bits(storage.check_all().await));
+        Job::CheckAll { checked, done, .. } => {
+            done.complete(Reply::Bits(storage.check_all_counting(&checked).await));
         }
         Job::SetHave { have, .. } => storage.set_have(have),
         Job::SetPriorities { prios, done, .. } => {

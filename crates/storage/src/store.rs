@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Waker;
 
 use metainfo::{FileSlice, Info, SafePath};
@@ -1241,10 +1242,17 @@ impl Storage {
     /// Recheck every piece against the data on disk, rebuilding the have set
     /// (force recheck / crash recovery).
     pub async fn check_all(&self) -> Result<Bitfield, Error> {
+        self.check_all_counting(&AtomicUsize::new(0)).await
+    }
+
+    /// [`Storage::check_all`], keeping `checked` at the number of pieces
+    /// looked at so far (for progress reports from another thread).
+    pub async fn check_all_counting(&self, checked: &AtomicUsize) -> Result<Bitfield, Error> {
         let pieces = self.info.piece_count();
         let mut have = Bitfield::new(pieces);
         self.progress.borrow_mut().clear();
         for p in 0..pieces {
+            checked.store(p, Ordering::Relaxed);
             let expected = match self.info.piece_hash(p) {
                 Some(h) => *h,
                 None => continue,
@@ -1260,6 +1268,7 @@ impl Storage {
                 self.res.put_buf(self.piece_buf_size(), data);
             }
         }
+        checked.store(pieces, Ordering::Relaxed);
         *self.have.borrow_mut() = have.clone();
         Ok(have)
     }

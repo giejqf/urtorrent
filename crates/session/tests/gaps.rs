@@ -7,13 +7,16 @@
 //! behind, torrents hold at their metadata, list views get what they show.
 //! 0.13.0: tracker rows per listen endpoint, file completion, piece
 //! priorities, banned address ranges. 0.13.5: the queue's slow flag, a
-//! queue position set in one call.
+//! queue position set in one call. 0.14.0: tracker replies with their
+//! intervals and response time, one tracker reannounced alone, how far a
+//! check has got.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1093,5 +1096,238 @@ fn a_running_torrent_moving_no_data_is_reported_slow() {
     block_on(b.shutdown()).unwrap();
     block_on(c.shutdown()).unwrap();
     block_on(a.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An HTTP tracker answering every announce with `body` after `delay`; it
+/// records the request lines.
+fn spawn_answering_tracker(
+    body: &'static [u8],
+    delay: Duration,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = log.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = vec![0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let n = match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let line = String::from_utf8_lossy(&got)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            log2.lock().unwrap().push(line);
+            std::thread::sleep(delay);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    (format!("http://{addr}/announce"), log)
+}
+
+#[test]
+fn a_tracker_reply_says_what_the_tracker_asked_for_and_how_long_it_took() {
+    let dir = tmp("reply");
+    let (url, _log) = spawn_answering_tracker(
+        b"d8:intervali1234e12:min intervali77e5:peers0:e",
+        Duration::from_millis(300),
+    );
+    let (bytes, _) = make_torrent("r.bin", 64 * 1024, 16 * 1024, &url);
+    let s = block_on(builder(1).build()).unwrap();
+    let mut events = s.events();
+    let id = block_on(s.add_torrent(AddTorrent::metainfo(bytes, &dir))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match events.try_recv() {
+            Some(session::Event::TrackerReply {
+                id: rid,
+                url: rurl,
+                peers,
+                interval,
+                min_interval,
+                response_time,
+                ..
+            }) => {
+                assert_eq!((rid, rurl.as_str(), peers), (id, url.as_str(), 0));
+                assert_eq!(interval, Duration::from_secs(1234));
+                assert_eq!(min_interval, Some(Duration::from_secs(77)));
+                assert!(
+                    response_time >= Duration::from_millis(300)
+                        && response_time < Duration::from_secs(10),
+                    "{response_time:?}"
+                );
+                break;
+            }
+            Some(_) => {}
+            None => {
+                assert!(Instant::now() < deadline, "no TrackerReply event");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn one_tracker_is_reannounced_alone() {
+    // Tier 0 holds a then b, tier 1 holds c. a satisfies tier 0, so b is
+    // idle until it is reannounced by hand; then it alone is announced to.
+    let dir = tmp("reannounce-one");
+    let body: &[u8] = b"d8:intervali1800e5:peers0:e";
+    let (a, a_log) = spawn_answering_tracker(body, Duration::ZERO);
+    let (b, b_log) = spawn_answering_tracker(body, Duration::ZERO);
+    let (c, c_log) = spawn_answering_tracker(body, Duration::ZERO);
+    let (bytes, _) = make_torrent("o.bin", 64 * 1024, 16 * 1024, &a);
+    let s = block_on(builder(1).build()).unwrap();
+    let id = block_on(s.add_torrent(AddTorrent::metainfo(bytes, &dir).paused(true))).unwrap();
+    block_on(s.add_tracker(id, b.clone(), 0)).unwrap();
+    block_on(s.add_tracker(id, c.clone(), 1)).unwrap();
+    block_on(s.resume(id)).unwrap();
+    let working = |url: &str| {
+        block_on(s.trackers(id))
+            .unwrap()
+            .iter()
+            .any(|t| t.url == url && t.working)
+    };
+    wait_for("a and c to answer", 10, || working(&a) && working(&c));
+    let count = |log: &Arc<Mutex<Vec<String>>>| log.lock().unwrap().len();
+    assert_eq!((count(&a_log), count(&b_log), count(&c_log)), (1, 0, 1));
+
+    block_on(s.force_reannounce_tracker(id, b.clone())).unwrap();
+    wait_for("b's announce", 10, || working(&b));
+    assert_eq!(events_of(&b_log), ["started"]);
+    block_on(s.force_reannounce_tracker(id, c.clone())).unwrap();
+    wait_for("c's second announce", 10, || count(&c_log) == 2);
+    assert_eq!(
+        event_param(&c_log.lock().unwrap()[1]),
+        None,
+        "a regular one"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        (count(&a_log), count(&b_log), count(&c_log)),
+        (1, 1, 2),
+        "no tracker but the one asked for"
+    );
+
+    assert!(matches!(
+        block_on(s.force_reannounce_tracker(id, "http://127.0.0.1:1/nope".into())),
+        Err(session::Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        block_on(s.force_reannounce_tracker(TorrentId(u64::MAX), a.clone())),
+        Err(session::Error::NoSuchTorrent)
+    ));
+    block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A single-file torrent of `pieces` pieces whose hashes match nothing:
+/// every piece a check looks at is hashed and fails.
+fn hashless_torrent(name: &str, pieces: usize, piece_len: usize) -> Vec<u8> {
+    let bstr = |out: &mut Vec<u8>, s: &[u8]| {
+        out.extend_from_slice(format!("{}:", s.len()).as_bytes());
+        out.extend_from_slice(s);
+    };
+    let mut t = b"d8:announce19:http://127.0.0.1:1/4:infod".to_vec();
+    bstr(&mut t, b"length");
+    t.extend_from_slice(format!("i{}e", pieces * piece_len).as_bytes());
+    bstr(&mut t, b"name");
+    bstr(&mut t, name.as_bytes());
+    bstr(&mut t, b"piece length");
+    t.extend_from_slice(format!("i{piece_len}e").as_bytes());
+    bstr(&mut t, b"pieces");
+    bstr(&mut t, &vec![0xab; pieces * 20]);
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// `pieces_checked` while the torrent checks, until it leaves the check.
+fn sample_check(s: &Session, id: TorrentId, pieces: usize) -> Vec<usize> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut seen = Vec::new();
+    loop {
+        let st = status(s, id);
+        match st.state {
+            TorrentState::Checking => seen.push(st.pieces_checked),
+            TorrentState::QueuedForChecking => assert_eq!(st.pieces_checked, 0),
+            _ => {
+                assert_eq!(st.pieces_checked, 0, "0 outside a check: {st:?}");
+                return seen;
+            }
+        }
+        assert!(st.pieces_checked <= pieces);
+        assert!(Instant::now() < deadline, "the check never ended");
+    }
+}
+
+fn assert_progressed(seen: &[usize], pieces: usize) {
+    assert!(
+        seen.windows(2).all(|w| w[0] <= w[1]),
+        "never backwards: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|&c| c > 0 && c < pieces),
+        "a value between the ends: {:?}..{:?} ({} samples)",
+        seen.first(),
+        seen.last(),
+        seen.len()
+    );
+}
+
+#[test]
+fn a_check_reports_how_far_it_has_got() {
+    // A sparse file under 4096 small pieces: the check reads and hashes
+    // every piece (none verifies) without the test writing the data.
+    let dir = tmp("check-progress");
+    let (pieces, piece_len) = (4096, 16 * 1024);
+    let bytes = hashless_torrent("c.bin", pieces, piece_len);
+    std::fs::File::create(dir.join("c.bin"))
+        .unwrap()
+        .set_len((pieces * piece_len) as u64)
+        .unwrap();
+    let s = block_on(builder(1).build()).unwrap();
+    let started = Instant::now();
+    let id = block_on(s.add_torrent(AddTorrent::metainfo(bytes, &dir))).unwrap();
+    let seen = sample_check(&s, id, pieces);
+    eprintln!(
+        "initial check: {:?}, {} samples",
+        started.elapsed(),
+        seen.len()
+    );
+    assert_progressed(&seen, pieces);
+    let st = status(&s, id);
+    assert_eq!((st.state, st.pieces_have), (TorrentState::Downloading, 0));
+
+    // A recheck counts from 0 again.
+    let s2 = s.clone();
+    let recheck = std::thread::spawn(move || block_on(s2.force_recheck(id)));
+    // Polled without a pause: the recheck must not end unseen.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state(&s, id) != TorrentState::Checking {
+        assert!(Instant::now() < deadline, "the recheck never started");
+    }
+    let seen = sample_check(&s, id, pieces);
+    recheck.join().unwrap().unwrap();
+    assert_progressed(&seen, pieces);
+    block_on(s.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

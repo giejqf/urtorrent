@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-09-27
+
+The open items of the daemon's gap list (`../urtorrentd/docs/gaps.md`).
+Breaking: `Event::TrackerReply` gains fields and is now
+`#[non_exhaustive]` (match it with `..`; fields added to it later will not
+break callers), and `TorrentStatus` gains `pieces_checked` (it is
+`#[non_exhaustive]`, so only struct literals outside the crate break).
+
+### Added
+
+- **`Event::TrackerReply` says what the tracker asked for and how long it
+  took**: `interval` (as sent; the next regular announce still waits at
+  least 5 minutes, Q4), `min_interval` (HTTP trackers that send one) and
+  `response_time`, from the start of the announce (name resolution,
+  connect, TLS) to its reply, not counting the wait for one of the
+  session's concurrent announce slots. For a frontend's tracker report: the
+  intervals trackers ask for, and the trackers that answer slowly.
+- **`Session::force_reannounce_tracker(id, url)`**: reannounce to one
+  tracker alone (libtorrent's `force_reannounce` with a tracker index), on
+  every listen endpoint, once its `min interval` allows.
+  `Error::InvalidArgument` when the torrent has no such tracker. Unlike
+  libtorrent, it goes out even when another tracker of its tier is working
+  (the tier rules would skip it; Q31).
+- **`TorrentStatus::pieces_checked`**: while a torrent is `Checking`, the
+  pieces the check has gone through so far out of `pieces_total` (libtorrent's
+  checking progress; `pieces_have` only moves when the check ends). 0 in
+  every other state. The disk thread counts them as it goes
+  (`storage::DiskStore::checked_pieces`, `Storage::check_all_counting`).
+- Gates: `gaps.rs` (a tracker reply's intervals and response time; one
+  tracker of three reannounced alone, past its satisfied tier; a 4096-piece
+  check and a recheck report progress that never goes backwards and ends
+  at 0), `tracker::announcer` unit tests for the forced tracker.
+
+### Changed
+
+- The `native` profile's identity strings are `-UR0E00-` / `urtorrent/0.14.0`
+  / DHT `UR\x00\x0e`.
+
 ## [0.13.6] - 2026-09-26
 
 ### Fixed

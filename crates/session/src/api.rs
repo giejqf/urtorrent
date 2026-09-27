@@ -507,6 +507,11 @@ pub struct TorrentStatus {
     pub private: bool,
     /// Verified pieces.
     pub pieces_have: usize,
+    /// While [`TorrentState::Checking`]: pieces the check has gone through
+    /// so far, out of [`pieces_total`](Self::pieces_total) (libtorrent's
+    /// checking progress). `pieces_have` only moves when the check ends.
+    /// 0 in every other state.
+    pub pieces_checked: usize,
     /// Total pieces.
     pub pieces_total: usize,
     /// Total content size in bytes.
@@ -891,6 +896,7 @@ pub enum Event {
         error: String,
     },
     /// A tracker answered an announce.
+    #[non_exhaustive]
     TrackerReply {
         /// The torrent.
         id: TorrentId,
@@ -898,6 +904,19 @@ pub enum Event {
         url: String,
         /// Peers in the reply.
         peers: usize,
+        /// The `interval` the tracker asked for. The next regular announce
+        /// waits at least 5 minutes whatever it says (libtorrent's
+        /// `min_announce_interval`, docs/quirks.md Q4).
+        interval: Duration,
+        /// The tracker's `min interval`, if it gave one (HTTP trackers
+        /// only): how soon a forced reannounce may follow.
+        min_interval: Option<Duration>,
+        /// From the start of the announce to its reply: name resolution,
+        /// connecting (TLS included) and the tracker's answer, or for UDP
+        /// the connect and announce exchanges with their retransmits. The
+        /// wait for one of the session's concurrent announce slots is not
+        /// counted.
+        response_time: Duration,
     },
     /// A scrape answered (BEP 48).
     ScrapeReply {
@@ -1688,6 +1707,17 @@ impl Session {
     /// Re-announce as soon as each tracker's `min interval` allows.
     pub async fn force_reannounce(&self, id: TorrentId) -> Result<(), Error> {
         self.send(|tx| Command::ForceReannounce(id, tx)).await?
+    }
+
+    /// Re-announce to the tracker with `url` alone (on every listen
+    /// endpoint), as soon as its `min interval` allows. It goes out even
+    /// when another tracker of its tier is working, which would otherwise
+    /// keep it idle (docs/quirks.md Q31); later announces follow the tier
+    /// rules again. [`Error::InvalidArgument`] when the torrent has no such
+    /// tracker; a paused torrent announces to every tracker when resumed.
+    pub async fn force_reannounce_tracker(&self, id: TorrentId, url: String) -> Result<(), Error> {
+        self.send(|tx| Command::ForceReannounceTracker(id, url, tx))
+            .await?
     }
 
     /// Scrape every tracker of a torrent (BEP 48, HTTP and UDP). Resolves with

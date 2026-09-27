@@ -632,3 +632,31 @@ us by `partial_seed_shape` (`xtask diff`); libtorrent 2.0.14
   message) to peers that advertise the extension, as the oracle does.
 - The bitfield carries exactly the pieces held, the straddling ones included
   (their skipped-file bytes read back from the parts file when served).
+
+## Q31. Reannouncing to one tracker
+
+Source: libtorrent 2.0 `torrent::force_tracker_request` (a tracker index
+moves only that tracker's `next_announce`) and
+`torrent::announce_with_tracker` (with qBittorrent's
+`announce_to_all_tiers = true`, `announce_to_all_trackers = false`, a tier
+whose working tracker has been announced to, or is not due, skips the rest
+of the tier). Accepted L3 difference: API-triggered, nothing on the wire
+differs in shape.
+
+- **`Session::force_reannounce_tracker` announces to the tracker it names,
+  even when another tracker of its tier is working.** libtorrent's
+  `force_reannounce(0, index)` on the second tracker of such a tier does
+  nothing: the tier rules skip it on every pass, so a "Reannounce" button
+  on a backup tracker would be dead. Ours goes out once (on every listen
+  endpoint, after its `min interval`); from then on the tier rules apply
+  again, so it gets no regular announces while the first tracker works.
+  With one tracker per tier, which is how qBittorrent adds trackers and
+  how private trackers ship them, the two behave the same.
+- A tracker that heard `started` this way gets `stopped` when the torrent
+  stops, like any started tracker. It does not get `completed` unless it is
+  announced to again before the download finishes (the same holds for a
+  backup tracker after a failover, in libtorrent too).
+- A reannounce asked for while that tracker's announce is in flight is
+  answered by that announce, as in libtorrent (whose reply overwrites the
+  forced `next_announce`). One asked for while the torrent is paused is
+  dropped: starting announces to every tracker anyway.

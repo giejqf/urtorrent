@@ -615,11 +615,16 @@ impl Torrent {
         } else {
             self.picker.distributed_copies()
         };
+        let state = self.state();
+        let pieces_checked = match (&self.storage, state) {
+            (Some(s), TorrentState::Checking) => s.checked_pieces().min(n),
+            _ => 0,
+        };
         TorrentStatus {
             id: self.id,
             info_hash: self.info_hash,
             name: self.name.clone(),
-            state: self.state(),
+            state,
             error: self.error.clone(),
             error_kind: self.error.as_ref().and(self.error_kind),
             sequential: self.sequential,
@@ -635,6 +640,7 @@ impl Torrent {
             has_metadata: self.info.is_some(),
             private: self.private,
             pieces_have: self.picker.have_count(),
+            pieces_checked,
             pieces_total: n,
             total_size: self.info.as_ref().map_or(0, |i| i.total_length),
             downloaded: self.stats.downloaded,
@@ -800,6 +806,15 @@ impl Torrent {
     pub fn force_reannounce(&mut self, now: Instant) {
         self.announcer.force_reannounce(now);
         self.tracker_kick.notify();
+    }
+
+    /// `Session::force_reannounce_tracker`; false when no tracker has `url`.
+    pub fn force_reannounce_tracker(&mut self, url: &str, now: Instant) -> bool {
+        let found = self.announcer.force_reannounce_tracker(url, now);
+        if found {
+            self.tracker_kick.notify();
+        }
+        found
     }
 
     /// Add peers learned from `source`, filtering what AGENTS.md 5.5 says to

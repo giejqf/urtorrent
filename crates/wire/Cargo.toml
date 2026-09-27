@@ -12,9 +12,9 @@ description = "Sans-IO BitTorrent peer-wire codec and per-connection state machi
 workspace = true
 
 [dependencies]
-bencode = { path = "../bencode", version = "0.13.6" }
-metainfo = { path = "../metainfo", version = "0.13.6" }
-profile = { path = "../profile", version = "0.13.6" }
+bencode = { path = "../bencode", version = "0.14.0" }
+metainfo = { path = "../metainfo", version = "0.14.0" }
+profile = { path = "../profile", version = "0.14.0" }
 sha1.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
