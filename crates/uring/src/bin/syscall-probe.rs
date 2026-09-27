@@ -10,6 +10,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+extern crate urtorrent_uring as uring;
+
 use std::process::ExitCode;
 
 use uring::{Buffer, File, Runtime, TcpListener, TcpStream, spawn};

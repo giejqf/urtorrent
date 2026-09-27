@@ -5,6 +5,8 @@
 //! echo, positional file I/O with fsync/fallocate, and ring timers.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+extern crate urtorrent_uring as uring;
+
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 

@@ -3,6 +3,8 @@
 //! recheck-after-corruption, upload reads, multi-file spans, and resume.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+extern crate urtorrent_storage as storage;
+
 mod fixture;
 
 use std::path::PathBuf;

@@ -8,6 +8,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+extern crate urtorrent_wire as wire;
+
 use std::net::IpAddr;
 use std::path::PathBuf;
 

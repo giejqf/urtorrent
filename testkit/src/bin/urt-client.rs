@@ -238,21 +238,6 @@ async fn main() -> Result<()> {
     let mut finished_at: Option<std::time::Instant> = None;
     let mut last_cmd = String::new();
     loop {
-        // Drain events without blocking.
-        while let Some(ev) = events.try_recv() {
-            let line = format!("{ev:?}");
-            tracing::info!("{line}");
-            if matches!(ev, Event::TorrentFinished { .. }) && finished_at.is_none() {
-                finished_at = Some(std::time::Instant::now());
-            }
-            if let Event::PeerDisconnected { info, .. } = &ev {
-                peers_seen.insert(info.addr.to_string(), peer_json(info));
-            }
-            event_log.push(line);
-            if event_log.len() > 500 {
-                event_log.remove(0);
-            }
-        }
         let st = session.status(id).await?;
         let stats = session.stats().await?;
         // With extra torrents loaded, report how many there are and
@@ -273,6 +258,25 @@ async fn main() -> Result<()> {
         for p in &peers {
             if p.peer_id.is_some() {
                 peers_seen.insert(p.addr.to_string(), peer_json(p));
+            }
+        }
+        // Drain events without blocking, after the snapshots: a peer that
+        // left before them (a seed dropped the moment we complete) is in
+        // neither the live list nor an earlier drain, but its
+        // `PeerDisconnected` was emitted before the status reply, so it is
+        // here, and a status that says `complete` always lists it.
+        while let Some(ev) = events.try_recv() {
+            let line = format!("{ev:?}");
+            tracing::info!("{line}");
+            if matches!(ev, Event::TorrentFinished { .. }) && finished_at.is_none() {
+                finished_at = Some(std::time::Instant::now());
+            }
+            if let Event::PeerDisconnected { info, .. } = &ev {
+                peers_seen.insert(info.addr.to_string(), peer_json(info));
+            }
+            event_log.push(line);
+            if event_log.len() > 500 {
+                event_log.remove(0);
             }
         }
         if let Some(p) = &args.status {

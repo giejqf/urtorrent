@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "A BitTorrent library for Linux on io_uring: downloading and seeding with IPv4/IPv6 and qBittorrent-compatible wire behaviour"
+readme = "../../README.md"
+keywords = ["bittorrent", "torrent", "io-uring", "p2p", "linux"]
+categories = ["network-programming"]
 
 [lints]
 workspace = true
@@ -19,7 +22,7 @@ default = ["tokio"]
 tokio = ["dep:tokio-stream"]
 
 [dependencies]
-session = { path = "../session", version = "0.14.0" }
-metainfo = { path = "../metainfo", version = "0.14.0" }
-profile = { path = "../profile", version = "0.14.0" }
+session = { package = "urtorrent-session", path = "../session", version = "0.14.1" }
+metainfo = { package = "urtorrent-metainfo", path = "../metainfo", version = "0.14.1" }
+profile = { package = "urtorrent-profile", path = "../profile", version = "0.14.1" }
 tokio-stream = { version = "0.1", default-features = false, optional = true }

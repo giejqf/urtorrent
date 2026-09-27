@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-09-27
+
+Published on crates.io. The facade's API is unchanged.
+
+### Changed
+
+- **The internal crates are published as `urtorrent-<name>`**
+  (`urtorrent-bencode`, `urtorrent-session`, …): eleven of the twelve short
+  names belong to other projects on crates.io. Inside the workspace,
+  dependents rename them back (`package = "urtorrent-session"`), so the code
+  still says `session::`; each crate's own tests alias themselves with
+  `extern crate urtorrent_<name> as <name>`. `urtorrent` keeps its name.
+  Log targets follow the library names: a filter such as
+  `RUST_LOG=session=debug` is now `RUST_LOG=urtorrent_session=debug`.
+- The manifests' `repository` points at https://github.com/giejqf/urtorrent;
+  the facade carries the README, keywords and a category for crates.io.
+- Every published crate ships `LICENSE` and `NOTICE`, and `NOTICE` now
+  carries libtorrent-rasterbar's BSD-3-Clause licence text, which the ported
+  portions it lists are under (before, it named them and their copyright
+  only).
+- The `native` profile's identity strings are `-UR0E10-` /
+  `urtorrent/0.14.1` (DHT `UR\x00\x0e` unchanged).
+
+### Fixed
+
+- testkit: `urt-client` drained engine events before it took the status and
+  peer snapshots, so a peer dropped between the two (a seed, the moment we
+  complete) was in neither: a status saying `complete` could lack the
+  peer, and `encryption_matrix` failed in CI on the 0.14.0 commit
+  ("encrypted flag None"). Events are drained after the snapshots now.
+
 ## [0.14.0] - 2026-09-27
 
 The open items of the daemon's gap list (`../urtorrentd/docs/gaps.md`).

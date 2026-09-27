@@ -10,6 +10,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+extern crate urtorrent_session as session;
+
 mod common;
 
 use std::io::Write;
@@ -65,7 +67,7 @@ fn wait_for(secs: u64, mut pred: impl FnMut() -> bool) -> bool {
 fn own_address_from_a_peer_source_is_recognised_and_dropped() {
     let log = Capture::default();
     tracing_subscriber::fmt()
-        .with_env_filter("session=debug")
+        .with_env_filter("urtorrent_session=debug")
         .with_writer(log.clone())
         .with_ansi(false)
         .init();

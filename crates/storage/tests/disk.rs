@@ -4,6 +4,8 @@
 //! notifier + bridge.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+extern crate urtorrent_storage as storage;
+
 mod fixture;
 
 use std::future::Future;

@@ -7,6 +7,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+extern crate urtorrent_session as session;
+
 mod common;
 
 use std::net::{Ipv4Addr, SocketAddr};

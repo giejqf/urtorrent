@@ -1,5 +1,5 @@
 [package]
-name = "metainfo"
+name = "urtorrent-metainfo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,7 @@ description = "Torrent metainfo and magnet parsing, file tree and piece/file spa
 workspace = true
 
 [dependencies]
-bencode = { path = "../bencode", version = "0.14.0" }
+bencode = { package = "urtorrent-bencode", path = "../bencode", version = "0.14.1" }
 thiserror.workspace = true
 sha1.workspace = true
 

@@ -1,5 +1,5 @@
 [package]
-name = "picker"
+name = "urtorrent-picker"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,8 +12,8 @@ description = "Piece picker and block request scheduling (rarest-first, prioriti
 workspace = true
 
 [dependencies]
-metainfo = { path = "../metainfo", version = "0.14.0" }
-profile = { path = "../profile", version = "0.14.0" }
+metainfo = { package = "urtorrent-metainfo", path = "../metainfo", version = "0.14.1" }
+profile = { package = "urtorrent-profile", path = "../profile", version = "0.14.1" }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -4,6 +4,8 @@
 //! Prints the running kernel's io_uring feature support and exits non-zero if
 //! the required baseline is missing. `xtask doctor` runs this.
 
+extern crate urtorrent_uring as uring;
+
 fn main() -> std::process::ExitCode {
     match uring::probe() {
         Ok(f) => {

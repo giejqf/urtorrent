@@ -9,15 +9,15 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bencode = { path = "../crates/bencode" }
-metainfo = { path = "../crates/metainfo" }
-storage = { path = "../crates/storage" }
-wire = { path = "../crates/wire" }
-tracker = { path = "../crates/tracker" }
-profile = { path = "../crates/profile" }
-mse = { path = "../crates/mse" }
-dht = { path = "../crates/dht" }
-utp = { path = "../crates/utp" }
+bencode = { package = "urtorrent-bencode", path = "../crates/bencode" }
+metainfo = { package = "urtorrent-metainfo", path = "../crates/metainfo" }
+storage = { package = "urtorrent-storage", path = "../crates/storage" }
+wire = { package = "urtorrent-wire", path = "../crates/wire" }
+tracker = { package = "urtorrent-tracker", path = "../crates/tracker" }
+profile = { package = "urtorrent-profile", path = "../crates/profile" }
+mse = { package = "urtorrent-mse", path = "../crates/mse" }
+dht = { package = "urtorrent-dht", path = "../crates/dht" }
+utp = { package = "urtorrent-utp", path = "../crates/utp" }
 
 [[bin]]
 name = "bencode_decode"

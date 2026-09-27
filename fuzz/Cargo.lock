@@ -21,13 +21,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "bencode"
-version = "0.11.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -87,18 +80,6 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
-]
-
-[[package]]
-name = "dht"
-version = "0.11.0"
-dependencies = [
- "bencode",
- "metainfo",
- "profile",
- "sha1",
- "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -185,34 +166,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "metainfo"
-version = "0.11.0"
-dependencies = [
- "bencode",
- "sha1",
- "thiserror",
-]
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
-]
-
-[[package]]
-name = "mse"
-version = "0.11.0"
-dependencies = [
- "metainfo",
- "num-bigint",
- "num-traits",
- "profile",
- "rc4",
- "sha1",
- "thiserror",
 ]
 
 [[package]]
@@ -265,10 +224,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "profile"
-version = "0.11.0"
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -308,18 +263,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "storage"
-version = "0.11.0"
-dependencies = [
- "bencode",
- "metainfo",
- "sha1",
- "thiserror",
- "tracing",
- "uring",
-]
 
 [[package]]
 name = "syn"
@@ -395,18 +338,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracker"
-version = "0.11.0"
-dependencies = [
- "bencode",
- "metainfo",
- "miniz_oxide",
- "profile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -419,8 +350,93 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
-name = "uring"
-version = "0.11.0"
+name = "urtorrent-bencode"
+version = "0.14.1"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "urtorrent-dht"
+version = "0.14.1"
+dependencies = [
+ "sha1",
+ "thiserror",
+ "tracing",
+ "urtorrent-bencode",
+ "urtorrent-metainfo",
+ "urtorrent-profile",
+]
+
+[[package]]
+name = "urtorrent-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "urtorrent-bencode",
+ "urtorrent-dht",
+ "urtorrent-metainfo",
+ "urtorrent-mse",
+ "urtorrent-profile",
+ "urtorrent-storage",
+ "urtorrent-tracker",
+ "urtorrent-utp",
+ "urtorrent-wire",
+]
+
+[[package]]
+name = "urtorrent-metainfo"
+version = "0.14.1"
+dependencies = [
+ "sha1",
+ "thiserror",
+ "urtorrent-bencode",
+]
+
+[[package]]
+name = "urtorrent-mse"
+version = "0.14.1"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "rc4",
+ "sha1",
+ "thiserror",
+ "urtorrent-metainfo",
+ "urtorrent-profile",
+]
+
+[[package]]
+name = "urtorrent-profile"
+version = "0.14.1"
+
+[[package]]
+name = "urtorrent-storage"
+version = "0.14.1"
+dependencies = [
+ "sha1",
+ "thiserror",
+ "tracing",
+ "urtorrent-bencode",
+ "urtorrent-metainfo",
+ "urtorrent-uring",
+]
+
+[[package]]
+name = "urtorrent-tracker"
+version = "0.14.1"
+dependencies = [
+ "miniz_oxide",
+ "thiserror",
+ "tracing",
+ "urtorrent-bencode",
+ "urtorrent-metainfo",
+ "urtorrent-profile",
+]
+
+[[package]]
+name = "urtorrent-uring"
+version = "0.14.1"
 dependencies = [
  "io-uring",
  "libc",
@@ -429,28 +445,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "urtorrent-fuzz"
-version = "0.0.0"
+name = "urtorrent-utp"
+version = "0.14.1"
 dependencies = [
- "bencode",
- "dht",
- "libfuzzer-sys",
- "metainfo",
- "mse",
- "profile",
- "storage",
- "tracker",
- "utp",
- "wire",
+ "thiserror",
+ "tracing",
+ "urtorrent-profile",
 ]
 
 [[package]]
-name = "utp"
-version = "0.11.0"
+name = "urtorrent-wire"
+version = "0.14.1"
 dependencies = [
- "profile",
+ "sha1",
  "thiserror",
  "tracing",
+ "urtorrent-bencode",
+ "urtorrent-metainfo",
+ "urtorrent-profile",
 ]
 
 [[package]]
@@ -458,15 +470,3 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "wire"
-version = "0.11.0"
-dependencies = [
- "bencode",
- "metainfo",
- "profile",
- "sha1",
- "thiserror",
- "tracing",
-]

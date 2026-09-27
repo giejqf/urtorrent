@@ -38,7 +38,7 @@ and how a torrent's state survives a restart in [docs/resume.md](docs/resume.md)
 | 0.11.x Races, benchmark | done: overlapping-operation gates (`races.rs`), a recheck no longer strands pieces, the semaphore no longer loses wakeups; `cargo xtask bench` measures RSS and CPU against the oracle (`docs/perf.md`) and found the pipeline ramp and reconnect-backoff bugs; under load the race gates found a block written behind a recheck, in-progress parts left behind when a skipped file became wanted, and a resume restore racing the first peer; the unmaintained `rustls-pemfile` replaced and RustSec advisories enforced; **0.11.4** |
 | 0.12.0 Daemon gaps | done: errored torrents recover (`ErrorKind`; missing content reported as the oracle's "missing files" instead of downloaded again), torrents held at their metadata (`hold_after_metadata` / `release`, checked against the oracle's stop condition in `magnet_hold`), list-view status fields (tracker summary, distributed copies, activity times), `PeerBanned`; a torrent outside the queue now starts; **0.12.0** |
 | 0.13.x Daemon extras | done: tracker rows per listen endpoint, `FileCompleted`, piece priorities (resume format 8), banned address ranges; `add_peer` after a hold dials at once; `needs_resume_save` covers every recorded change; partial seeds gated and `upload_only` as the oracle; HTTP trackers and web seeds bound to the listen address; the queue's slow flag and `set_queue_position`; web seeds under the download limits; **0.13.6** |
-| 0.14.0 Daemon gaps | done: tracker replies carry the tracker's `interval` / `min interval` and the announce's response time, one tracker reannounced alone (`force_reannounce_tracker`, past a satisfied tier: Q31), check progress (`pieces_checked`); **0.14.0** |
+| 0.14.x Daemon gaps | done: tracker replies carry the tracker's `interval` / `min interval` and the announce's response time, one tracker reannounced alone (`force_reannounce_tracker`, past a satisfied tier: Q31), check progress (`pieces_checked`); published on crates.io (internal crates as `urtorrent-*`); **0.14.1** |
 
 ## Developer commands
 
@@ -54,6 +54,14 @@ cargo xtask soak           # perf / leak exercise: many torrents + a big loopbac
 ```
 
 ## Using the library
+
+Linux only (kernel 6.1 or newer, io_uring enabled). From crates.io:
+
+```toml
+[dependencies]
+urtorrent = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
 
 ```rust
 use urtorrent::{AddTorrent, Event, Session};
@@ -92,4 +100,6 @@ oracle binaries (`testkit/oracle.lock`) into `~/.cache/urtorrent/oracle`.
 
 ## Licence
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE); the portions ported
+from libtorrent-rasterbar are BSD-3-Clause, and NOTICE lists them with that
+licence.

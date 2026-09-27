@@ -540,13 +540,13 @@ impl Profile {
                 // Azureus style, one character per component; a component
                 // of ten or more takes a letter as libtorrent's
                 // `fingerprint` does (`A` = 10): 0.10.0 is `0A00`.
-                prefix: "-UR0E00-",
+                prefix: "-UR0E10-",
                 tail_alphabet: NATIVE_TAIL_ALPHABET,
                 lifetime: PeerIdLifetime::PerSession,
                 handshake: HandshakePeerId::SameAsAnnounce,
             },
-            user_agent: "urtorrent/0.14.0",
-            ltep_version: "urtorrent 0.14.0",
+            user_agent: "urtorrent/0.14.1",
+            ltep_version: "urtorrent 0.14.1",
             http: HttpAnnounceShape {
                 params: QBT_ANNOUNCE_PARAMS,
                 headers: QBT_ANNOUNCE_HEADERS,
@@ -720,7 +720,7 @@ mod tests {
         }
         assert_eq!(p.peer_id.lifetime, PeerIdLifetime::PerTorrent);
         let n = Profile::native().peer_id.generate(&mut Counter(2));
-        assert_eq!(&n[..8], b"-UR0E00-");
+        assert_eq!(&n[..8], b"-UR0E10-");
         assert!(n[8..].iter().all(u8::is_ascii_alphanumeric));
     }
 

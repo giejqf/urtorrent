@@ -19,16 +19,16 @@ use anyhow::{Context, Result, bail};
 /// Library crates (the graph that must stay free of epoll/kqueue/IOCP reactors
 /// and of tokio's runtime features). Extended as milestones land.
 const LIB_CRATES: &[&str] = &[
-    "bencode",
-    "metainfo",
-    "wire",
-    "mse",
-    "tracker",
-    "picker",
-    "profile",
-    "uring",
-    "storage",
-    "session",
+    "urtorrent-bencode",
+    "urtorrent-metainfo",
+    "urtorrent-wire",
+    "urtorrent-mse",
+    "urtorrent-tracker",
+    "urtorrent-picker",
+    "urtorrent-profile",
+    "urtorrent-uring",
+    "urtorrent-storage",
+    "urtorrent-session",
     "urtorrent",
 ];
 
@@ -62,7 +62,14 @@ fn syscalls() -> Result<()> {
     }
     // 1. The self-contained uring data-path probe (every syscall counts).
     run(
-        cargo().args(["build", "-q", "-p", "uring", "--bin", "syscall-probe"]),
+        cargo().args([
+            "build",
+            "-q",
+            "-p",
+            "urtorrent-uring",
+            "--bin",
+            "syscall-probe",
+        ]),
         "build syscall-probe",
     )?;
     let probe = root().join("target/debug/syscall-probe");

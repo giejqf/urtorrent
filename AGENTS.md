@@ -460,7 +460,10 @@ Each milestone ends with its integration scenarios green in CI.
   API-compatible (Cargo treats `0.x.y` -> `0.x.z` as compatible; verify with
   `cargo semver-checks` in CI). All workspace crates share one version and are released
   together; internal crates that are not part of the facade's public API are still
-  published under the same version to keep `cargo publish` simple. Keep a `CHANGELOG.md`
+  published under the same version to keep `cargo publish` simple, as `urtorrent-<dir>`
+  (the short names belong to other projects on crates.io; dependents rename them back
+  with `package = "urtorrent-<dir>"`, so code keeps writing `bencode::`). Each published
+  crate ships `LICENSE` and `NOTICE` (symlinks to the root files). Keep a `CHANGELOG.md`
   in Keep-a-Changelog format; every user-visible change gets a line in the same PR.
   Resume-data and profile file formats carry their own format version independent of the
   crate version, and every released version must read every format version it ever wrote.
