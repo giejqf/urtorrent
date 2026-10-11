@@ -1,6 +1,6 @@
 # ADR 0005: Selective download, the parts file, and moving storage
 
-- Status: accepted (2026-09-20)
+- Status: accepted (2026-09-20, 0.1.0)
 - Relates to: AGENTS.md 4 (Tier 1: file priorities, move storage), 5.4; ADR 0004
 
 ## Context
@@ -20,7 +20,11 @@ observable semantics without copying its code.
    scale). The public API numbers content files in torrent order; padding
    files (BEP 47) are internal and always 0. A piece's priority is the highest
    priority of the non-padding files it touches, so a straddling piece stays
-   wanted. `TorrentStatus::total_wanted{,_done}` count wanted *files*.
+   wanted. `TorrentStatus::total_wanted{,_done}` count the bytes of wanted
+   *pieces* (priority > 0), straddling pieces included. *Amended (0.13.0):*
+   `Session::set_piece_priorities` (libtorrent `prioritize_pieces`) sets
+   piece priorities directly; they hold until file priorities are set
+   again.
 2. **The parts file.** A skipped file that does not exist on disk is never
    created; the bytes of straddling pieces that fall into it are written to
    `<save_path>/.<name>.parts`, a sparse file indexed by torrent offset (so the
@@ -36,8 +40,11 @@ observable semantics without copying its code.
    matches libtorrent.
 4. **Priorities persist in resume data** (format version 2; version 1 files
    read as "all default"; version 3, 0.2.0, adds `active_time` /
-   `seeding_time` seconds and reads v1/v2 with zero times). The caller's `AddTorrent::file_priorities` win over
-   the resume data's.
+   `seeding_time` seconds and reads v1/v2 with zero times). The caller's
+   `AddTorrent::file_priorities` win over the resume data's. *Amended
+   (0.13.0):* the format is at version 8 (`storage::resume::FORMAT_VERSION`,
+   whose doc lists each version; version 8, 0.13.0, adds
+   `piece_priorities`); every older version still reads.
 5. **Move storage quiesces, then renames.** `move_storage` raises a gate that
    disk reads/writes of that torrent wait on, waits for in-flight writes and
    hash checks to drain, then renames every file (copy-then-delete across

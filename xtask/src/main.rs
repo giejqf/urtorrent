@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 /// Library crates (the graph that must stay free of epoll/kqueue/IOCP reactors
-/// and of tokio's runtime features). Extended as milestones land.
+/// and of tokio's runtime features), by package name: `urtorrent-<dir>` lives
+/// in `crates/<dir>`, the facade in `crates/urtorrent`.
 const LIB_CRATES: &[&str] = &[
     "urtorrent-bencode",
     "urtorrent-metainfo",
@@ -26,6 +27,8 @@ const LIB_CRATES: &[&str] = &[
     "urtorrent-tracker",
     "urtorrent-picker",
     "urtorrent-profile",
+    "urtorrent-dht",
+    "urtorrent-utp",
     "urtorrent-uring",
     "urtorrent-storage",
     "urtorrent-session",
@@ -290,14 +293,15 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: cargo xtask <command>
 
-  check              fmt, clippy -D warnings, unit + property tests, doc build, dependency policy
+  check [--quick]    fmt, clippy -D warnings, unit + property tests, doc build, dependency policy
   doctor             kernel, io_uring, seccomp/sysctl, memlock, sudo/netns, Docker, oracle binaries
   it [scenario ...]  integration scenarios (netns lab)      [--shape v4|v6|dual] [--keep]
-  diff [scenario ..] differential run + discriminator       [--shape ...]
-  capture [scen ...] regenerate golden captures from the pinned oracle
+  diff [scenario ..] differential run + discriminator       [--shape ...] [--keep]
+  capture [scen ...] regenerate golden captures from the pinned oracle   [--shape ...]
+  bench [scen ...]   RSS / CPU benchmarks against the oracle (release build)
   fuzz <target> [secs]
   syscalls           assert no non-uring data-path syscalls during a transfer
-  soak [mode] [--size N] [--piece N] [--torrents N]
+  soak [mode] [--size N] [--piece N] [--torrents N] [--utp] [--zero-copy] [--inline-disk]
                      perf / leak exercise (release build): many torrents, big loopback transfer"
     );
     ExitCode::from(2)
@@ -349,7 +353,10 @@ fn existing_lib_crates() -> Vec<&'static str> {
     LIB_CRATES
         .iter()
         .copied()
-        .filter(|c| root().join("crates").join(c).join("Cargo.toml").exists())
+        .filter(|c| {
+            let dir = c.strip_prefix("urtorrent-").unwrap_or(c);
+            root().join("crates").join(dir).join("Cargo.toml").exists()
+        })
         .collect()
 }
 

@@ -6,7 +6,8 @@
 //! supported integration path, AGENTS.md 5.6), writes a JSON status snapshot
 //! to `--status` a few times a second, and takes commands from `--control`
 //! (a file the harness writes: `shutdown`, `pause`, `resume`, `reannounce`,
-//! `save-resume`). No signals are needed for a graceful stop.
+//! `save-resume`, `recheck`, `release`, `scrape`, `prio <csv>`, `move <path>`,
+//! `add <torrent>`). No signals are needed for a graceful stop.
 
 #![allow(
     clippy::unwrap_used,

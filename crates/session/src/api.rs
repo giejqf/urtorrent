@@ -260,9 +260,8 @@ impl ActiveLimits {
     }
 }
 
-/// The session's settings as they stand (`Session::settings`). The first
-/// block is fixed for the session's lifetime (build a new session to change
-/// it); the rest changes at runtime through the `Session::set_*` methods.
+/// The session's settings as they stand (`Session::settings`). Every field
+/// changes at runtime through the `Session::set_*` methods.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SessionSettings {
@@ -908,12 +907,12 @@ pub enum Event {
         /// waits at least 5 minutes whatever it says (libtorrent's
         /// `min_announce_interval`, docs/quirks.md Q4).
         interval: Duration,
-        /// The tracker's `min interval`, if it gave one (HTTP trackers
-        /// only): how soon a forced reannounce may follow.
+        /// The tracker's `min interval`, if it gave one (UDP trackers
+        /// imply 60 s): how soon a forced reannounce may follow.
         min_interval: Option<Duration>,
         /// From the start of the announce to its reply: name resolution,
         /// connecting (TLS included) and the tracker's answer, or for UDP
-        /// the connect and announce exchanges with their retransmits. The
+        /// the connect and announce exchanges. The
         /// wait for one of the session's concurrent announce slots is not
         /// counted.
         response_time: Duration,

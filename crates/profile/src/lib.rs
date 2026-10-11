@@ -18,8 +18,7 @@
 //! - [`Profile::qbt_5_2_3_lt2_0_14`]: the conformance target, whose values are
 //!   transcribed from the golden captures in `testkit/golden` (the oracle's
 //!   captured behaviour is the spec; nothing here comes from memory). Fields
-//!   the current captures cannot pin down are marked `UNVERIFIED` in comments
-//!   and are on the M4 list.
+//!   the current captures cannot pin down are marked `UNVERIFIED` in comments.
 //!
 //! This crate is pure data plus the two generators that need randomness
 //! (peer-id tail, announce key); both take an injected [`Rng`] so the
@@ -441,8 +440,8 @@ const QBT_ANNOUNCE_HEADERS: &[AnnounceHeader] = &[
 
 /// LTEP `m` map as captured (`capture_peer_plain`, extended handshake):
 /// `{lt_donthave: 7, share_mode: 8, upload_only: 3, ut_holepunch: 4,
-/// ut_metadata: 2, ut_pex: 1}`. `ut_holepunch` cannot work without uTP; it is
-/// advertised for L2 exactness and answered as a disabled feature
+/// ut_metadata: 2, ut_pex: 1}`. `ut_holepunch`, `share_mode` and
+/// `lt_donthave` are advertised for L2 exactness; their messages are dropped
 /// (`docs/quirks.md` Q2).
 const QBT_LTEP_M: &[LtepExtension] = &[
     LtepExtension {
@@ -572,7 +571,7 @@ impl Profile {
                 metadata_size: true,
             },
             peer: PeerShape {
-                // LTEP + fast; no DHT bit: we do not implement DHT.
+                // LTEP + fast; `wire` adds the DHT bit while a DHT node runs.
                 reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
                 allowed_fast_addr: AllowedFastAddr::Bep6Masked,
                 first_messages: FIRST_MESSAGES,
@@ -641,7 +640,8 @@ impl Profile {
                 // (`oracle-initiator` capture) and is absent on the incoming
                 // one (`oracle-responder` capture). On outgoing v6
                 // connections it is absent until an external address is
-                // known (docs/quirks.md Q6); `wire` applies that rule.
+                // known (docs/quirks.md Q6); the session decides per
+                // connection from its external-address voter.
                 p_on_outgoing: true,
                 p_on_incoming: false,
                 // `upload_only: 1` in the seeding capture only.
@@ -662,7 +662,7 @@ impl Profile {
             mse: MseShape {
                 // `capture_peer_allow_mse`: provide 3 -> select 2.
                 prefer_rc4: true,
-                // `capture_peer_forced`: pads 292, 488, 77, 484 (random(512)).
+                // `capture_peer_forced`: pads within 0..=512 (random(512)).
                 pad_max: 512,
             },
             dht: DhtShape {

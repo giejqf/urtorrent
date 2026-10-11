@@ -38,10 +38,11 @@ that trackers and peers see nothing unusual.
    epoll/kqueue/IOCP reactor must not appear anywhere in the library's dependency tree
    (enforced by `cargo-deny`). `tokio` is the **public API surface only** (5.6): it is
    allowed in `session`/`urtorrent` with `default-features = false` and only the `sync`
-   feature; the `rt`, `net`, `fs`, `io-util`, `time` and `process` features are banned in
-   the library graph, so tokio can never own a socket, a file or a timer in this
-   library. Off the critical path (DNS, reading config, enumerating resume files at
-   startup) plain blocking std calls on a helper thread are fine. See 5.3.
+   feature; its runtime and I/O features (`rt`, `rt-multi-thread`, `net`, `fs`, `io-util`,
+   `io-std`, `time`, `process`, `signal`) are banned in the library graph, so tokio can
+   never own a socket, a file or a timer in this library. Off the critical path (DNS,
+   reading config, enumerating resume files at startup) plain blocking std calls on a
+   helper thread are fine. See 5.3.
 5. **Do not weaken, skip or delete a failing test to get green.** Fix the code or escalate.
 
 ## 2. Feasibility notes (so nobody is surprised later)
@@ -149,9 +150,15 @@ crates/
   session/     the engine: wires everything together; public API lives here
   urtorrent/   facade crate re-exporting the stable public API
 testkit/       oracle + tracker + peer orchestration, capture, normalise, diff
-xtask/         dev commands
+               (netns lab, tap actors, golden captures, oracle.lock)
+xtask/         dev commands (section 9)
+fuzz/          cargo-fuzz targets, one per untrusted-input parser (7.1)
+docs/          README.md index; config.md, perf.md, quirks.md, resume.md, testing.md,
+               roadmap.md, getting-started.md
 docs/adr/      architecture decision records
 ```
+
+Package names are `urtorrent-<dir>` (the facade is plain `urtorrent`); see section 9.
 
 ### 5.2 Sans-IO is the core design rule
 
@@ -184,17 +191,20 @@ Only `uring`, `storage` and `session` may perform I/O.
     (`setsockopt`, `bind`, `listen`), directory creation.
 - **Enforcement, not convention:**
   1. `compile_error!` on non-Linux targets in `uring`.
-  2. `cargo-deny` bans `mio`, `polling`, `async-io` and any crate with an
-     epoll/kqueue/IOCP backend from the library dependency graph. `tokio` is permitted
-     with `default-features = false, features = ["sync"]` only; a `cargo tree -e features`
-     check in `xtask check` fails if `tokio/rt`, `tokio/net`, `tokio/fs`, `tokio/time` or
-     `tokio/io-util` is enabled anywhere under the library crates.
+  2. `cargo-deny` (`deny.toml`) bans `mio`, `polling`, `async-io`, `async-std`, `smol`,
+     `calloop` and any other crate with an epoll/kqueue/IOCP backend from the library
+     dependency graph. `tokio` is permitted with
+     `default-features = false, features = ["sync"]` only; a `cargo tree -e features`
+     audit in `xtask check` fails if any banned tokio feature from rule 4 is enabled, or
+     a reactor crate appears, anywhere under the library crates.
   3. If `io_uring_setup` fails or a required opcode is missing, session creation returns a
      hard error. There is no "degraded mode" and no feature flag to add one.
-  4. `cargo xtask syscalls` runs a transfer under a seccomp filter (or strace) and fails
-     if the library threads issue `epoll_*`, `poll`, `ppoll`, `select`, or
-     `read/write/pread/pwrite/send*/recv*` on sockets or torrent files. Helper-thread DNS
-     is whitelisted by thread name.
+  4. `cargo xtask syscalls` runs the `uring` syscall probe and a real two-engine
+     transfer under strace and fails if the engine threads issue `epoll_*`, `select`,
+     `pselect6`, any off-ring socket op (`connect`/`accept*`/`send*`/`recv*`), or
+     `read/write/pread/pwrite/readv/writev/poll/ppoll` on sockets or torrent files.
+     Threads are judged by name (`urt-net`, `urt-disk`, `urt-hash-*`); the `urt-dns`
+     helper may block.
 - **Buffer ownership.** Any buffer handed to the kernel is owned by the reactor until its
   CQE arrives. Dropping a future must never free a buffer with an in-flight SQE: cancel
   with `ASYNC_CANCEL` and let the reactor reclaim it. No API takes `&mut [u8]` for an
@@ -204,15 +214,18 @@ Only `uring`, `storage` and `session` may perform I/O.
   ADR 0006: one ring per network thread, required, no single-shot fallback for peers),
   `recvmsg` multishot for the UDP sockets (done, ADR 0008: one provided buffer ring per
   UDP socket, serving the UDP tracker, DHT and uTP; sends go through an ordered per-socket
-  queue), `send_zc` for piece payloads where it measures faster (implemented behind
-  `SessionBuilder::zero_copy_send`, off by default: no gain on loopback).
+  queue), zero-copy `sendmsg` (`SENDMSG_ZC`) for piece payloads where it measures faster
+  (implemented behind `SessionBuilder::zero_copy_send`, off by default: within noise on
+  loopback, `docs/perf.md`).
 - TLS for HTTPS trackers and web seeds: **rustls** (pure Rust, maintainer decision), used
   through its buffer-in/buffer-out API so ciphertext moves over `uring`. No OpenSSL, no
   native-tls. Note rustls's default crypto providers (the *ring* crypto crate, aws-lc-rs)
   contain C/assembly; if "pure Rust" must hold for crypto primitives too, use the
-  RustCrypto-based provider and accept that it is less mature. Record the choice in an ADR.
+  RustCrypto-based provider and accept that it is less mature. Recorded in ADR 0003: the
+  default provider (aws-lc-rs); "pure Rust" covers the I/O and protocol stack.
 - CPU work (SHA-1/SHA-256 hashing, RC4 on bulk data if it shows up in profiles) goes to a
-  small dedicated thread pool. That is compute, not I/O, and is allowed.
+  small dedicated thread pool (`urt-hash-N`, `SessionBuilder::hash_threads`). That is
+  compute, not I/O, and is allowed.
 - Threading model: one network ring thread (`urt-net`) and one disk ring thread
   (`urt-disk`, torrent file I/O and the hash pool's completions; `storage::DiskRing`,
   ADR 0004). `SessionBuilder::disk_thread(false)` runs disk I/O on the network ring for
@@ -338,9 +351,10 @@ finds a new L1/L2 tell, first add it to the discriminator (red), then fix it (gr
 1. **Unit** - sans-IO crates: golden vectors, table tests, simulated time.
 2. **Property** - `proptest`: bencode round-trips, piece/file span maths, picker
    invariants, choker fairness, rate-limiter bounds.
-3. **Fuzz** - `cargo-fuzz` targets for every parser that eats untrusted bytes: bencode,
-   metainfo, peer wire, LTEP, PEX, tracker responses (HTTP + UDP), HTTP response framing, MSE,
-   LSD, resume data. Corpus seeded from oracle captures.
+3. **Fuzz** - `cargo-fuzz` targets (`fuzz/`) for every parser that eats untrusted bytes:
+   bencode, metainfo, magnet, peer wire, LTEP, PEX, `ut_metadata`, tracker responses
+   (HTTP + UDP), HTTP response framing, MSE, LSD, DHT KRPC, uTP, resume data. Corpus
+   seeded from oracle captures.
 4. **Replay** - feed recorded oracle sessions into our state machines; assert no errors
    and equivalent responses.
 5. **Integration** - real processes (7.2).
@@ -350,22 +364,28 @@ finds a new L1/L2 tell, first add it to the discriminator (red), then fix it (gr
 
 ### 7.2 Integration environment
 
-All actors run in an isolated environment (Docker Compose on an `internal: true` network
-with both an IPv4 and an IPv6 subnet, or `ip netns` + veth for bare-metal CI).
+All actors run in an isolated environment with both an IPv4 and an IPv6 subnet. The
+primary environment is the `testkit` **netns lab** (ADR 0002): one Linux bridge, one
+network namespace + veth per actor, a `FORWARD ... DROP` rule so nothing leaves the lab;
+it needs passwordless `sudo`, and CI runs it. Docker Compose on an `internal: true` network is the accepted alternative for
+hosts without sudo; scenarios are written against the `Lab`/`Actor` abstraction so a
+compose backend can be added, but none exists yet.
 
-- **Trackers:** `opentracker` (HTTP+UDP, v4/v6), a second independent implementation
-  (`chihaya` or `torrust-tracker`), one configured PT-style (passkey in announce URL,
-  private torrents, client whitelist enabled with the oracle's identity on the list), and
-  **`tap-tracker`**: our own test-only tracker that logs raw request bytes (post-TLS)
-  before answering. HTTPS via a test CA.
+- **Trackers:** `opentracker` (HTTP+UDP, v4/v6) and **`tap-tracker`**: our own test-only
+  tracker that logs raw request bytes (post-TLS) before answering, with HTTPS via a test
+  CA it generates. The PT-style tracker is `tap-tracker` configured with a passkey in the
+  announce path and a client (peer-id prefix) whitelist with the oracle's identity on the
+  list, serving private torrents. A second independent implementation (`chihaya` or
+  `torrust-tracker`) is still wanted and not yet in `testkit`.
 - **Peers:** `qbittorrent-nox` oracle (both libtorrent lines), `transmission-daemon` as an
   independent implementation, and **`tap-peer`**: scriptable test-only peer that records
   every byte it receives and can misbehave on purpose (bad hashes, stalls, garbage, slow
-  loris, protocol violations).
-- **Torrent fixtures:** generated by test tooling (`mktorrent` or a small script in
-  `testkit`) - creation is not a library feature. Cover: single/multi-file, piece sizes
-  16 KiB-16 MiB, last-piece edge cases, zero-length files, padding files, unicode and
-  hostile paths, private flag, multi-tier trackers, thousands of files.
+  loris, protocol violations). `tap-dht` and `tap-webseed` do the same for DHT nodes and
+  web seeds.
+- **Torrent fixtures:** generated by `testkit`'s own deterministic generator
+  (`testkit/src/fixtures.rs`) - creation is not a library feature. Cover: single/multi-file,
+  piece sizes 16 KiB-16 MiB, last-piece edge cases, zero-length files, padding files,
+  unicode and hostile paths, private flag, multi-tier trackers, thousands of files.
 - io_uring in containers: recent Docker default seccomp profiles block the `io_uring_*`
   syscalls, and hosts may set `kernel.io_uring_disabled`. The container running *our*
   code needs a custom seccomp profile; `xtask doctor` must detect and explain both.
@@ -382,7 +402,10 @@ with both an IPv4 and an IPv6 subnet, or `ip netns` + veth for bare-metal CI).
    settings for the primary captures (closest to what 0.1.0 implements), plus one default-
    settings capture to document the capability-gap quirks.
 
-Golden captures are committed (small) or content-addressed in CI cache (pcaps).
+Golden captures (tap logs as `*.jsonl`, plus compact summaries such as `utp-shape.json`)
+are committed under `testkit/golden/`. Pcaps are not: they stay in the git-ignored run
+directory (`testkit/runs/`), and scenarios that judge packets (`private_no_pex_lsd`,
+`utp_shape`) decode them during the run.
 
 ### 7.4 Scenario matrix (each x {v4, v6, dual} where meaningful)
 
@@ -418,13 +441,18 @@ Each milestone ends with its integration scenarios green in CI.
   dual-stack edge cases and copy budgets (done), 0.7.0 configuration coverage: the
   active-torrent queue and the remaining library-side limits (done, `docs/config.md`
   draws the library / frontend line), 0.8.0 daemon readiness (done: what an HTTP API
-  daemon needs from the library), 0.9.0 live listen / DHT / profile changes (done), then
-  the daemon itself (a separate crate/repo),
-  `ut_holepunch`, port mapping.
+  daemon needs from the library), 0.9.0 live listen / DHT / profile changes (done),
+  0.10.0 hostile peers (done), 0.11.x resume blobs, then overlapping-operation races and
+  `xtask bench` against the oracle (done), 0.12.0 daemon gaps: error recovery, metadata
+  hold, list-view fields (done), 0.13.x daemon extras (done), 0.14.x daemon gaps 2 and
+  the first crates.io publication (done; 0.14.2 is current). Next: the daemon itself (a
+  separate crate/repo), `ut_holepunch`, port mapping. `docs/roadmap.md` and
+  `CHANGELOG.md` have the details.
 
 ## 9. Working conventions
 
-- Rust stable, edition 2024; MSRV pinned in `rust-toolchain.toml`. `#![forbid(unsafe_code)]`
+- Rust stable, edition 2024; the toolchain is pinned in `rust-toolchain.toml` and the MSRV
+  is the workspace `rust-version` in `Cargo.toml`. `#![forbid(unsafe_code)]`
   in every crate except `uring`. `#![deny(missing_docs)]`
   on public API.
 - Errors: `thiserror` enums in libraries, no `anyhow` outside `testkit`/`xtask`. No
@@ -438,16 +466,25 @@ Each milestone ends with its integration scenarios green in CI.
   graph, an unmaintained crate included, fails it. Replace the crate; an `ignore` entry in
   `deny.toml` needs a reason and a link.
 - Commands (create in M0, keep working forever):
-  - `cargo xtask check` - fmt, clippy `-D warnings`, unit + property tests, doc build
-  - `cargo xtask doctor` - kernel version, uring probe, seccomp/sysctl, memlock, Docker
-  - `cargo xtask it [scenario]` - integration tests
-  - `cargo xtask diff [scenario]` - differential run + discriminator
-  - `cargo xtask capture` - regenerate golden captures from the pinned oracle
-  - `cargo xtask fuzz <target> [secs]`
+  - `cargo xtask check [--quick]` - fmt, clippy `-D warnings`, unit + property tests, doc
+    build, dependency policy (cargo-deny bans / licences / sources / advisories, tokio
+    feature audit), `cargo semver-checks` against the latest release tag; `--quick` skips
+    tests, docs and semver
+  - `cargo xtask doctor` - kernel version, uring probe, seccomp/sysctl, memlock,
+    sudo/netns, Docker, oracle binaries
+  - `cargo xtask it [scenario ...] [--shape v4|v6|dual] [--keep]` - integration tests
+    (netns lab)
+  - `cargo xtask diff [scenario ...] [--shape ...]` - differential run + discriminator
+  - `cargo xtask capture [scenario ...] [--shape ...]` - regenerate golden captures from
+    the pinned oracle
+  - `cargo xtask bench [scenario ...]` - RSS / CPU benchmarks against the oracle (release
+    build; `docs/perf.md`)
+  - `cargo xtask fuzz <target> [secs]` - cargo-fuzz on nightly, 60 s by default
   - `cargo xtask syscalls` - assert no non-uring data-path syscalls (uring probe + a real
     two-engine transfer under strace, engine threads only)
-  - `cargo xtask soak [transfer|many|all] [--size N] [--torrents N] [--utp]` - perf / leak exercise
-    (release build; baselines in `docs/perf.md`)
+  - `cargo xtask soak [transfer|many|all] [--size N] [--piece N] [--torrents N] [--utp]
+    [--zero-copy] [--inline-disk]` - perf / leak exercise (release build; baselines in
+    `docs/perf.md`)
 - Definition of done for any change: `xtask check` green; relevant `it`/`diff` scenarios
   green; new parser => new fuzz target; new wire-visible behaviour => profile entry +
   differential coverage; design-level decisions => ADR.

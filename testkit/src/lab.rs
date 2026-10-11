@@ -3,9 +3,10 @@
 
 //! The isolated network lab: a host bridge carrying a private IPv4 and IPv6
 //! subnet, and one network namespace per actor attached to it with a veth pair.
-//! Actors have no default route, so nothing in the lab can reach the public
-//! internet (AGENTS.md rule 3). The harness itself runs in the host namespace
-//! and reaches actors through the bridge address.
+//! Actors get a default route through the harness (Transmission needs one),
+//! but the host drops everything forwarded from the bridge, so nothing in the
+//! lab can reach the public internet (AGENTS.md rule 3). The harness itself
+//! runs in the host namespace and reaches actors through the bridge address.
 //!
 //! Requires passwordless `sudo` for `ip` and `nsenter`; `xtask doctor` checks.
 

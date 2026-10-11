@@ -1,7 +1,7 @@
 # ADR 0002: Integration environment is a netns lab; Docker is the alternative
 
-- Status: accepted (2026-09-19)
-- Relates to: AGENTS.md 7.2
+- Status: accepted (2026-09-19, M0)
+- Relates to: AGENTS.md rule 3, 7.2; ADR 0007
 
 ## Context
 
@@ -38,12 +38,25 @@ The primary environment is a **netns lab** driven by `testkit`:
 - One network namespace per client actor, attached with a veth pair, with a
   v4 address, a v6 address, or both. No default route: actors can only reach
   the lab (rule 3). IPv6 is disabled with sysctl in v4-only namespaces.
+  *Amended (0.1.0):* every actor now gets a default route via the harness's
+  bridge address (Transmission 4 opens no peer connections without a route
+  to a public address), and isolation is enforced instead by a
+  `FORWARD -i urt<id> -j DROP` rule (iptables and ip6tables) plus
+  `forwarding=0` on the bridge, so nothing leaves the lab even on a host
+  with `ip_forward=1` (`testkit/src/lab.rs`, `firewall_allow`).
 - Processes enter a namespace through `sudo -n nsenter --net=... -S uid -G gid`
   and run as the unprivileged user, so files they write are ours and they can
   be signalled directly (`kill -9` scenarios).
-- `iptables`/`ip6tables` INPUT accept rules are added for the bridge and
-  removed on teardown; `testkit lab clean` removes anything stale.
+- `iptables`/`ip6tables` rules for the bridge (INPUT accept, FORWARD drop)
+  are added and removed on teardown; `testkit lab clean` removes anything
+  stale.
 - Packet capture uses `tcpdump` on the bridge (informational; never a gate).
+  *Amended (0.1.0, 0.4.0):* some scenarios now assert on the pcap and fail
+  without tcpdump: `private_no_pex_lsd` (0.1.0: no LSD datagram about the
+  private torrent, rule 2) and the uTP scenarios (0.4.0: `capture_utp`,
+  `utp_leech_from_oracle`, `utp_seed_to_oracle`, `utp_shape` decode the uTP
+  headers from it). `lsd_discovery` checks the LSD datagrams when tcpdump
+  is present.
 
 Docker Compose remains a supported alternative for environments without sudo
 (`xtask doctor` explains the seccomp requirement); the scenarios are written
@@ -55,4 +68,7 @@ without touching them.
 - `xtask it` requires passwordless sudo and iproute2; `xtask doctor` checks.
 - Tests never depend on DNS. Where a scenario needs hostnames (dual-stack
   announce semantics), `ip netns exec` with `/etc/netns/<ns>/hosts` will be
-  used, keeping the host's `/etc/hosts` untouched.
+  used, keeping the host's `/etc/hosts` untouched. *Amended (0.1.0):* not
+  done that way: the lab adds `tracker.urt<id>.lab` (resolving to the
+  harness's v4 and v6 bridge addresses) to the host's `/etc/hosts` and
+  removes it on teardown; `testkit lab clean` removes stale entries.

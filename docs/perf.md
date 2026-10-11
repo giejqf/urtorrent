@@ -1,9 +1,15 @@
-# Performance and soak notes
+# Performance notes
 
-Numbers from `cargo xtask soak` on the development VM (2 vCPU, 3 GiB RAM,
-one SATA-class disk), release build, both engines in one process on
-loopback, 2026-09-20. They are a baseline for regressions, not a benchmark
-of the protocol.
+Dated baselines from `cargo xtask soak` and `cargo xtask bench`, newest
+last. Each entry records the build and machine it was measured on and is
+kept as a reference for regressions, not as a description of the current
+defaults: the knobs named here (`disk_thread`, `hash_threads`, `recv_ring`,
+`zero_copy_send`, `max_open_files`, ...) have their current defaults in the
+`SessionBuilder` rustdoc. Unless noted, runs are release builds on the
+development VM (2 vCPU, 3 GiB RAM, one SATA-class disk), both engines in
+one process on loopback.
+
+## Soak baseline (2026-09-20, 0.1.0)
 
 | Exercise | Result |
 |---|---|
@@ -11,11 +17,11 @@ of the protocol.
 | `soak transfer --size 2G` (1 MiB pieces) | 179 MiB/s; peak RSS 14 MiB |
 | `soak many --torrents 500` | 500 torrents added to two engines in ~1 s; all seeding/leeching within seconds; ~2 fds per torrent while loaded (one file handle per engine), back to baseline after `remove_torrent`; RSS ~50 MiB |
 
-What the soak checks (and fails on): completion, exact `downloaded`, no
-corrupt pieces, sampled content, fd count back to baseline after shutdown, no
-fds held after every torrent is removed.
+The soak fails on an incomplete transfer, an inexact `downloaded`, corrupt
+pieces, sampled content that does not match, fds not back to baseline
+after shutdown, or fds still held once every torrent is removed.
 
-### Disk ring A/B (2026-09-20, after 0.1.0)
+## Disk ring A/B (2026-09-20, after 0.1.0)
 
 Interleaved `soak transfer --size 2G` runs on the same VM, `sync` between
 runs: v0.1.0 single ring 112 / 136 MiB/s; separate `urt-disk` thread
@@ -26,7 +32,7 @@ bottleneck (both engines, both disk rings and four SHA-1 workers share two
 cores). A first version with one global barrier per verify cost ~35%: a
 verify must only wait for earlier writes to *its* piece (ADR 0004 §4).
 
-### Scale pass (2026-09-20)
+## Scale pass (2026-09-20)
 
 `soak many` at 5 000 and 10 000 torrents (two engines, every torrent
 downloaded by B from A):
@@ -47,10 +53,10 @@ lookup (one SHA-1 per torrent at add time instead of one per torrent per
 incoming encrypted connection), a session connection counter instead of a
 walk, and concurrency gates for checking (1), announces (32) and resume
 saves (4). The remaining per-torrent footprint is dominated by receive
-buffers while peers are connected (64 KiB per connection); provided buffer
-rings (step 3) remove that.
+buffers while peers are connected (64 KiB per connection); the provided
+buffer rings of the next entry removed that.
 
-### Data path: buffer rings, batched receive, vectored sends (2026-09-20)
+## Data path: buffer rings, batched receive, vectored sends (2026-09-20)
 
 `soak transfer --size 2G` (1 MiB pieces), interleaved with the previous
 binary, `cpu` = user + system of the whole process (both engines):
@@ -67,7 +73,7 @@ before; per connection the receive memory went from 64 KiB to nothing while
 idle. `xtask syscalls` still shows no off-ring data syscalls. ADR 0006 has
 the design.
 
-### Picker index and extent affinity (2026-09-20)
+## Picker index and extent affinity (2026-09-20)
 
 `soak transfer --size 2G` with 16 KiB pieces (131 072 pieces, one block
 each), interleaved with the previous binary:
@@ -76,7 +82,7 @@ each), interleaved with the previous binary:
 |---|---|---|
 | before | 6 MiB/s (331 s) | every pick scanned all 131k pieces |
 | indexed picker | 21 MiB/s (98 s) | bursts of 50 MiB/s then stalls at 0: dirty pages pinned at the 20% limit with `Writeback` stuck at ~1 MB, because random 16 KiB writes across a 2 GiB sparse file leave the kernel random I/O to write back |
-| + extent affinity | 58 MiB/s (35 s) | no stalls; CPU-bound now (30 s CPU for 131k pieces: per-piece verify/have/event overhead, step 3 territory) |
+| + extent affinity | 58 MiB/s (35 s) | no stalls; CPU-bound now (30 s CPU for 131k pieces: per-piece verify / have / event overhead) |
 
 1 MiB pieces: 119 → 126 → 160 MiB/s across the same three builds (the last
 is within the ±20% noise plus better write locality). Rarest-first cost model
@@ -85,7 +91,7 @@ is libtorrent's: a pick costs the candidates ahead of the peer's pieces in
 skipped outright; a seed joining moves every wanted piece one bucket (200k
 pieces in ~7 ms release).
 
-### Hash-as-you-write (2026-09-20)
+## Hash-as-you-write (2026-09-20)
 
 Pieces are hashed as their blocks are written (a per-piece SHA-1 cursor over
 the contiguous prefix; blocks ahead of the cursor sit in a ≤1 MiB stash or
@@ -99,17 +105,7 @@ sys CPU 7.7 → 8.5 s (more, smaller hash jobs), wall time within noise
 `Storage::hash_readback_bytes` is 0 for an in-order download. The saving
 grows with piece size (a 16 MiB piece is a 16 MiB copy avoided per piece).
 
-Known limits:
-
-- On a two-core host the extra thread buys nothing measurable; it matters
-  where disk latency would stall peer sockets. `SessionBuilder::disk_thread`
-  chooses.
-- SHA-1 runs on `hash_threads` (default 2) workers; hashing throughput scales
-  with that setting.
-- Web seed requests are capped at 4 MiB each (libtorrent asks for up to
-  16 MiB); an accepted L3 difference.
-
-### uTP (2026-09-20, 0.4.0)
+## uTP (2026-09-20, 0.4.0)
 
 `soak transfer --size 1G` (1 MiB pieces, both engines in one process, release
 build); the default policy dials TCP, `--utp` runs uTP-only engines:
@@ -133,7 +129,7 @@ which the oracle answered with selective acks and retransmits. Zero-copy
 sends and larger batches are the obvious next steps if uTP throughput
 ever matters. `xtask syscalls` covers both transports.
 
-### Copy budgets (2026-09-21, 0.6.0)
+## Copy budgets (2026-09-21, 0.6.0)
 
 Every user-space copy of payload on the data path is counted
 (`SessionStats::copied_bytes`) and the budgets below are gated by
@@ -214,3 +210,15 @@ Two bugs came out of writing this benchmark, both fixed in 0.11.2:
 - A peer that hung up before the handshake (a seeder still checking its
   files) was not retried for a full minute. libtorrent's `fast_reconnect`
   gives such an address one immediate retry; so do we now.
+
+## Known limits
+
+- On a two-core host the `urt-disk` thread buys nothing measurable; it
+  matters where disk latency would stall peer sockets.
+  `SessionBuilder::disk_thread` chooses (default on).
+- SHA-1 runs on `hash_threads` workers (default 2); hashing throughput
+  scales with that setting.
+- Web seed requests are capped at 4 MiB each (libtorrent asks for up to
+  16 MiB), an accepted L3 difference.
+- uTP measured at about a quarter of TCP's rate on loopback (the uTP
+  entry), which is why TCP is the default transport.

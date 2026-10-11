@@ -1,6 +1,7 @@
 # ADR 0006: Peer data path — provided buffer rings, chunked sends, transport enum
 
-Date: 2026-09-20. Status: accepted.
+- Status: accepted (2026-09-20, 0.2.0)
+- Relates to: AGENTS.md 4, 5.3; ADR 0004, ADR 0008
 
 ## Context
 
@@ -73,7 +74,10 @@ through an abstraction uTP can implement later.
    `send_all_chunks[_zc]`, `peer_addr`, `set_nodelay`; `PeerInfo.transport`
    reports the variant. uTP becomes a second variant (its datagrams can use
    the same buffer-ring mechanism on the UDP socket) without touching the
-   peer state machine.
+   peer state machine. *Amended (0.4.0):* done (ADR 0008): the enum is
+   `Transport::{Tcp(TcpStream), Utp(Rc<UtpStream>)}` with `connect_utp`
+   beside `connect_tcp`, `receiver` yields `Chunk::{Ring, Owned}`, and
+   `PeerInfo.transport` is a `PeerTransport`.
 
 5. **Ring flags.** Rings are created with `IORING_SETUP_SINGLE_ISSUER |
    IORING_SETUP_DEFER_TASKRUN` (one thread per ring is the design), falling
@@ -118,7 +122,8 @@ downloaded byte. Now:
   (datagram to receive queue, write queue to packet, packet to outgoing
   queue), the uTP glue's partial sends, summed into
   `SessionStats::copied_bytes`. `crates/session/tests/copies.rs` gates the
-  budgets (TCP download 1, upload 0, uTP 2 each way; `docs/perf.md`).
+  budgets (TCP download 1, upload 0, uTP 2 each way, at most 3 for a
+  rate-limited uTP upload; `docs/perf.md`).
 
 Not done, on purpose: a block that is a borrowed frame could be written
 straight from the ring buffer if the buffer were held until the write

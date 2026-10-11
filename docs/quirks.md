@@ -2,25 +2,26 @@
 
 Places where the oracle (qBittorrent 5.2.3 / libtorrent 2.0.14) and a BEP
 disagree, or where our capability gaps show. Under the `qbt_5_2_3_lt2_0_14`
-profile the oracle wins (AGENTS.md 9). Each entry names the golden capture
-that proves it.
+profile the oracle wins (AGENTS.md 9). Each entry names its evidence:
+`Capture:` a golden capture or lab scenario, `Observation:` something seen
+in the lab but not kept as a golden, `Source:` the libtorrent code where no
+lab capture can show the behaviour. Code and the CHANGELOG refer to entries
+by number; numbers are never reused.
 
 ## Q1. DHT reserved bit is set even with DHT disabled
 
 Capture: `testkit/golden/capture_peer_plain/*/tap-peer-plain-oracle-initiator.jsonl`
-(oracle configured with `Session\DHTEnabled=false`) shows reserved bytes
-`00 00 00 00 00 10 00 05` = LTEP + fast + **DHT**. The same bytes appear with
-DHT enabled (`capture_defaults`). libtorrent sets the DHT bit from the
-`enable_dht`-independent "DHT support compiled in" state.
+(oracle with `Session\DHTEnabled=false`): reserved bytes
+`00 00 00 00 00 10 00 05` = LTEP + fast + **DHT**. `capture_defaults` (DHT
+on) shows the same bytes. libtorrent sets the bit because DHT support is
+compiled in, whatever `enable_dht` says. The oracle never sends `PORT` to a
+peer whose reserved bits lack DHT (`capture_defaults`: no `port` message).
 
-Consequence: the qbt profile advertises the DHT bit unconditionally for
-L1/L2 exactness (the `native` profile only while a DHT node runs). Until
-0.3.0 we never sent `PORT`; since 0.3.0 `PORT` follows the oracle's rules
-(Q20): sent only while a DHT node runs, so with the DHT disabled the bit is
-advertised and `PORT` is not sent, exactly like the oracle with
-`DHTEnabled=false`. The oracle does not send `PORT` to a peer whose reserved
-bits lack DHT (`capture_defaults`: no `port` message received by tap-peer), so
-a peer that does not advertise DHT is never misled.
+We do the same. The qbt profile always sets the bit
+(`profile::PeerShape::reserved`); `native` sets it only while a DHT node
+runs (`wire::ConnectionParams::dht_port`). `PORT` is sent only while a DHT
+node runs (Q20), so with the DHT off we advertise the bit and send no
+`PORT`, like the oracle with `DHTEnabled=false`.
 
 ## Q2. LTEP `m` advertises `ut_holepunch`, `share_mode`, `lt_donthave`
 
@@ -29,220 +30,250 @@ Capture: `capture_peer_plain` extended handshake:
 plus `complete_ago`, `metadata_size`, `p`, `reqq: 2000`, `v`, `yourip`, and
 `upload_only: 1` when seeding.
 
-0.1.0 has no uTP, so `ut_holepunch` cannot work. Under the qbt profile the
-`m` map is advertised verbatim (L2); incoming `ut_holepunch` messages are
-answered the way the oracle answers with uTP disabled (to be captured in M5:
-`capture_holepunch`). `share_mode` and `lt_donthave` are implemented
-(trivial). The `native` profile advertises only what it implements.
+The qbt profile advertises this `m` map verbatim (L2). We implement none of
+`ut_holepunch` (BEP 55), `share_mode` or `lt_donthave`: incoming messages
+under those ids are dropped without a reply (`session::engine::peer`,
+`WireEvent::Extended`), so a peer loses at most one message. How the oracle
+answers a `ut_holepunch` request has not been captured. We do record a
+peer's `ut_holepunch` support for the PEX `0x08` flag (Q15). The `native`
+profile advertises only what it implements (`ut_pex`, `ut_metadata`,
+`upload_only`).
 
 ## Q3. "Allow encryption" connects out in plaintext to unknown peers
 
 Capture: `capture_peer_encrypted` (oracle `Session\Encryption=0`, qBt "Allow
-encryption") - the oracle's outgoing connection to tap-peer is a plaintext
+encryption"): the oracle's outgoing connection to tap-peer is a plaintext
 handshake, no MSE attempt. libtorrent (`bt_peer_connection::on_connected`,
-`pe_enabled`) toggles a per-peer `pe_support` flag: the first attempt is
+`pe_enabled`) keeps a per-peer `pe_support` flag: the first attempt is
 plaintext; if it fails before the handshake completes, the next attempt to
-that peer is encrypted (and vice versa). The session mirrors this with
-`Torrent::mse_retry`. `Force` (`capture_peer_forced`): MSE always,
-`crypto_provide = 2`, pads `random(512)`, the BitTorrent handshake travels as
-IA (`len(IA) = 68`). `capture_peer_allow_mse`: for `provide = 3` the oracle
-selects RC4 -> qBittorrent runs with `prefer_rc4 = true`
-(`profile::MseShape`).
+that peer is encrypted (and vice versa). We mirror this with
+`Torrent::mse_retry`.
+
+`capture_peer_forced` (forced): MSE always, `crypto_provide = 2`, pads
+`random(512)`, the BitTorrent handshake travels as IA (`len(IA) = 68`).
+`capture_peer_allow_mse`: for `provide = 3` the oracle selects RC4, so
+qBittorrent runs with `prefer_rc4 = true` (`profile::MseShape`).
 
 ## Q4. Tracker `interval` is clamped to libtorrent's `min_announce_interval`
 
-Observation while building `capture_tracker_http`: with the tap-tracker
-answering `interval: 30`, the oracle did not re-announce within 45 s; libtorrent
-never announces more often than `min_announce_interval` (5 min default).
-Behavioural (L3): we adopt the same default constant and honour
-`min interval` semantics; exact timing is not a gate.
+Observation (while building `capture_tracker_http`): with the tap-tracker
+answering `interval: 30`, the oracle did not re-announce within 45 s.
+libtorrent never announces more often than `min_announce_interval` (5 min
+default). Behavioural (L3): we use the same floor
+(`tracker::announcer::MIN_ANNOUNCE_INTERVAL`, 300 s) and honour
+`min interval`; exact timing is not a gate.
 
 ## Q5. Incoming peers are refused briefly after a torrent starts
 
 Observation: right after a torrent is added and checked (WebAPI already
-reports `stalledUP`), incoming connections are closed without a handshake for
-up to ~1 s. Harness consequence only: tap-peer retries. Not a fidelity item.
+reports `stalledUP`), the oracle closes incoming connections without a
+handshake for up to ~1 s. Harness consequence only (tap-peer retries); not
+a fidelity item.
 
 ## Q6. LTEP `p` is omitted on outgoing v6 connections until an external address is known
 
 Capture: `capture_peer_plain/v4/tap-peer-plain-oracle-initiator.jsonl` has
-`p: 6881` in the oracle's extended handshake; the same scenario in
-`capture_peer_plain/v6/...-oracle-initiator.jsonl` has **no `p`**, with or
+`p: 6881` in the oracle's extended handshake; the v6 run
+(`capture_peer_plain/v6/...-oracle-initiator.jsonl`) has **no `p`**, with or
 without a default route in the namespace.
 
 Mechanism (libtorrent 2.0.14 `bt_peer_connection::write_extensions` →
-`session_impl::listen_port(ssl, local_addr)`): the port is sent only when a
-listen socket's *external address* (an `ip_voter` fed by tracker `external
-ip` replies and peers' `yourip`) equals the connection's local address, or is
-unspecified **of the same family**. A voter with no votes yields a v4
-unspecified address, so v4 connections match right away while v6 ones match
-only once a global v6 address has been voted in; the lab's ULA prefix never
-qualifies (`is_local` rejects fc00::/7), so `p` never appears there.
+`session_impl::listen_port(ssl, local_addr)`): the port is sent only when
+the listen socket's *external address* equals the connection's local
+address, or is unspecified **of the same family**. The external address
+comes from an `ip_voter` fed by tracker `external ip` replies and peers'
+`yourip`. A voter with no votes yields an unspecified v4 address, so v4
+connections match at once and v6 ones only once a global v6 address has
+been voted in. The lab's ULA prefix never qualifies (`is_local` rejects
+fc00::/7), so `p` never appears there.
 
-Consequence: `wire::ConnectionParams::advertise_port` carries the decision;
-the session sets it to "connection is IPv4" until external-address voting
-exists (candidate for M6 alongside PEX). Pinned in
+We do the same: `session::engine::external_ip::IpVoter` (a port of
+`ip_voter`, one per address family, fed by trackers, LTEP `yourip` and DHT
+`ip` replies) decides through `advertise_port_for`, and the result goes
+into `wire::ConnectionParams::advertise_port`. Pinned in
 `crates/wire/tests/replay.rs`.
 
 ## Q7. Allowed-fast set is seeded with the full peer address, not the BEP 6 /24
 
-Capture: `capture_peer_plain/v4/tap-peer-plain-oracle-responder.jsonl` (oracle
-seeding to tap-peer at 10.77.142.3, 16 pieces) shows `allowed_fast` for
-`[7, 12, 5, 3, 11]`; the v6 capture (tap-peer at fd77:8e::3) shows
-`[6, 9, 13, 11, 1]`. BEP 6 says to hash `(ip & 0xffffff00) || info_hash`, which
+Capture: `capture_peer_plain/v4/tap-peer-plain-oracle-responder.jsonl`
+(oracle seeding to tap-peer at 10.77.142.3, 16 pieces) shows `allowed_fast`
+for `[7, 12, 5, 3, 11]`; the v6 capture (tap-peer at fd77:8e::3) shows
+`[6, 9, 13, 11, 1]`. BEP 6 hashes `(ip & 0xffffff00) || info_hash`, which
 gives `[9, 13, 0, 6, 11]` for the v4 case. Hashing the **unmasked** 4 / 16
-address bytes reproduces both captures exactly (libtorrent
+address bytes reproduces both captures (libtorrent
 `bt_peer_connection::send_allowed_set` uses `address::to_bytes()`).
 
-Consequence: `profile::PeerShape::allowed_fast_addr` — `LibtorrentFull` for the
-qbt profile (L2), `Bep6Masked` for `native`. Interop is unaffected either way
-(the receiver only records the indices it is told). Pinned in
+We use `profile::PeerShape::allowed_fast_addr`: `LibtorrentFull` for the
+qbt profile (L2), `Bep6Masked` for `native`. Interop is unaffected either
+way (the receiver only records the indices it is told). Pinned in
 `crates/wire/tests/replay.rs`.
 
 ## Q8. `supportcrypto=1` is only announced while encryption is enabled
 
-Observation (`diff_identity` with the oracle at `Session\Encryption=2`,
-"disable"): the announce carries no `supportcrypto` parameter at all; at the
-default setting ("allow", the golden captures) it is `supportcrypto=1`.
-libtorrent emits `supportcrypto=1` when encryption is allowed and
-`requirecrypto=1` when it is forced (position UNVERIFIED until the M5 forced
-capture). Consequence: the parameter is a function of the MSE mode, not a
-constant of the profile; `profile` will model it when MSE lands (M5). Until
-then the qbt profile announces `supportcrypto=1`, the oracle's default.
+Capture: `capture_peer_encrypted`, `capture_peer_allow_mse` and
+`capture_peer_forced` (tap-tracker logs): every announce carries
+`supportcrypto=1`, in "allow" and in "force" mode alike, and none carries
+`requirecrypto`. Observation (`diff_identity` with the oracle at
+`Session\Encryption=2`, "disable"): no `supportcrypto` parameter at all.
+
+So the parameter depends on the encryption mode, not on the profile alone.
+`session::engine::tracker_task::build_request` sets
+`AnnounceRequest::crypto_supported` unless the mode is
+`EncryptionMode::Disabled`, and `AnnounceParam::SupportCrypto` emits
+`supportcrypto=1` when that and the profile's
+`HttpAnnounceShape::supportcrypto` both hold. We never send
+`requirecrypto`.
 
 ## Q9. One announce per listen socket
 
-Capture: `testkit/golden/capture_tracker_dual` (a hostname tracker resolving
-to both families, dual-stack oracle): every announce is sent twice, once from
-the IPv4 listen socket and once from the IPv6 one, with the same `peer_id`,
-`key` and parameters, and each socket runs its own `started` -> `completed` ->
-`stopped` sequence. For an IP-literal tracker only the matching family's
-socket announces (the dual-stack golden of `capture_tracker_http` shows a
-single v4 sequence and no errors). BEP 3 has no such notion; libtorrent's
-`announce_endpoint` per listen socket does. `tracker::Announcer` keeps one
-state per endpoint and the session routes each endpoint's announce through
-its family; mismatching IP-literal endpoints are disabled silently.
+Capture: `capture_tracker_dual` (a hostname tracker resolving to both
+families, dual-stack oracle; not kept under `testkit/golden`): every
+announce is sent twice, once from the IPv4 listen socket and once from the
+IPv6 one, with the same `peer_id`, `key` and parameters, and each socket
+runs its own `started` -> `completed` -> `stopped` sequence. For an
+IP-literal tracker only the matching family's socket announces
+(`testkit/golden/capture_tracker_http/dual` shows a single v4 sequence and
+no errors). BEP 3 has no such notion; libtorrent's per-listen-socket
+`announce_endpoint` does.
 
-`ipv4=` / `ipv6=` announce parameters are sent by libtorrent only for
-**private** torrents and only for globally routable listen addresses
-(torrent.cpp, `announce_with_tracker`); the lab's addresses are private, so
-this is not yet capturable here (open item for a public-address test).
+We do the same: `tracker::Announcer` keeps one state per endpoint, the
+session routes each endpoint's announce through its family, and an
+IP-literal tracker of the other family is disabled silently
+(`Announcer::disable_endpoint`).
+
+The BEP 7 `ipv4=` / `ipv6=` parameters are covered in Q22.
 
 ## Q10. UDP tracker: one attempt per request, BEP 41 URL data
 
-Capture: `capture_tracker_udp`. The oracle retransmits nothing within a
-request: a `connect` that gets no reply fails after the receive timeout and
-the tracker enters the ordinary announce backoff (attempts at +39 s and
-+65 s in the capture), instead of BEP 15's 15·2ⁿ retransmits. Every announce
-carries option 2 (URL data) with the URL's path and query (`\x02\x09/announce`),
-`ip = 0`, `num_want` = the profile's `numwant` (0 on `stopped`), and the same
-`key` as the HTTP announces. Connection ids are reused for 60 s. The UDP
-source port is the listen port. `tracker::udp` reproduces all of it; the
-`udp_tracker` scenario shows no UDP-side tells vs the oracle.
+Capture: `capture_tracker_udp` (not kept under `testkit/golden`). The oracle
+retransmits nothing within a request: a `connect` that gets no reply fails
+after the receive timeout and the tracker enters the ordinary announce
+backoff (attempts at +39 s and +65 s in the capture), instead of BEP 15's
+15·2ⁿ retransmits. Every announce carries option 2 (URL data) with the
+URL's path and query (`\x02\x09/announce`), `ip = 0`, `num_want` = the
+profile's `numwant` (0 on `stopped`), and the same `key` as the HTTP
+announces. Connection ids are reused for 60 s. The UDP source port is the
+listen port.
+
+`tracker::udp` reproduces all of it (`RECEIVE_TIMEOUT` 15 s, one attempt;
+`CONNECTION_ID_TTL` 60 s). The `udp_tracker` scenario finds no UDP-side
+tells against the oracle.
 
 ## Q11. Private torrents drop `ut_pex`, `ut_metadata` and `metadata_size`
 
-Capture: `capture_peer_private` (oracle on a `private=1` torrent, both roles).
-The LTEP handshake's `m` is `{lt_donthave: 7, share_mode: 8, upload_only: 3,
-ut_holepunch: 4}` and carries no `metadata_size`; everything else (`reqq`,
-`v`, `yourip`, `p` on outgoing, `upload_only: 1` when seeding, `complete_ago`)
-is unchanged. libtorrent never creates the `ut_pex` / `ut_metadata` plugins
-for a private torrent (`create_ut_pex_plugin`, `create_ut_metadata_plugin`),
-so the ids are simply absent. Consequence: `profile::LtepShape::m_private`
-and the `private` flag on `wire::ConnectionParams`; a `ut_pex` message under
-a stale id is an unknown extension and is dropped. Pinned byte-exact in
-`crates/wire/tests/replay.rs`; the no-traffic guarantee (rule 2) is checked on
-the wire by the `private_no_pex_lsd` scenario (pcap + tap-peer).
+Capture: `capture_peer_private` (oracle on a `private=1` torrent, both
+roles). The LTEP handshake's `m` is `{lt_donthave: 7, share_mode: 8,
+upload_only: 3, ut_holepunch: 4}` with no `metadata_size`; everything else
+(`reqq`, `v`, `yourip`, `p` on outgoing, `upload_only: 1` when seeding,
+`complete_ago`) is unchanged. libtorrent never creates the `ut_pex` /
+`ut_metadata` plugins for a private torrent (`create_ut_pex_plugin`,
+`create_ut_metadata_plugin`), so the ids are simply absent.
 
-The magnet case is captured too (`capture_magnet_private`): before the
-metadata is known the oracle advertises `ut_metadata` and `ut_pex` (it cannot
-know yet), and every connection made after the metadata revealed
-`private=1` gets the private `m` above. We do the same: `ut_metadata` /
-`ut_pex` until the metadata arrives, the private map from then on, and PEX
-stops the moment we know (`torrent::on_metadata`). Note that BEP 27 does not
-disable BEP 10 itself: the extension handshake, `upload_only`,
-`lt_donthave` and `ut_holepunch` stay; only peer discovery goes.
+We use `profile::LtepShape::m_private` and the `private` flag on
+`wire::ConnectionParams`; a `ut_pex` message under a stale id is an unknown
+extension and is dropped. Pinned byte-exact in
+`crates/wire/tests/replay.rs`; the no-traffic guarantee (rule 2) is checked
+on the wire by the `private_no_pex_lsd` scenario (pcap + tap-peer).
 
-Two BEP 27 clauses libtorrent does not implement, and neither do we (the
-oracle wins): the MUST to disconnect every peer when switching trackers,
-and the MUST to connect *only* to tracker-returned peers — peers the user
-adds by hand (`Session::add_peer`, a magnet's `x.pe`) are dialled for
-private torrents too, as libtorrent's `connect_peer` does. Everything
-automatic (DHT, PEX, LSD) stays off.
+Magnets (`capture_magnet_private`): before the metadata is known the oracle
+advertises `ut_metadata` and `ut_pex` (it cannot know yet); every
+connection made after the metadata revealed `private=1` gets the private
+`m`. We do the same, and PEX stops the moment we know
+(`torrent::on_metadata`). BEP 27 does not disable BEP 10 itself: the
+extension handshake, `upload_only`, `lt_donthave` and `ut_holepunch` stay;
+only peer discovery goes.
+
+Two BEP 27 MUSTs that libtorrent does not implement, and neither do we (the
+oracle wins): disconnecting every peer when switching trackers, and
+connecting *only* to tracker-returned peers. Peers the user adds by hand
+(`Session::add_peer`, a magnet's `x.pe`) are dialled for private torrents
+too, as libtorrent's `connect_peer` does. Everything automatic (DHT, PEX,
+LSD) stays off.
 
 ## Q12. `left=16384` before the metadata is known
 
-Capture: `capture_magnet/v4/tap-tracker-magnet.jsonl` — the oracle's first
-announce for a magnet link carries `left=16384` (`downloaded=0`); once the
+Capture: `capture_magnet/v4/tap-tracker-magnet.jsonl`: the oracle's first
+announce for a magnet carries `left=16384` (`downloaded=0`); once the
 metadata is known the real size follows. libtorrent uses 16 KiB when
-`bytes_left()` is unknown (`torrent.cpp`, `announce_with_tracker`). BEP 3 has
-no way to say "unknown", and `left` here is not a claim about data we hold
-(rule 1); we announce the same value in the same situation.
+`bytes_left()` is unknown (`torrent.cpp`, `announce_with_tracker`). BEP 3
+has no way to say "unknown", and this `left` is not a claim about data we
+hold (rule 1). We announce the same value in the same situation.
 
 ## Q13. qBittorrent stops and re-adds a magnet torrent when its metadata arrives
 
-Capture: `capture_magnet`. Two milliseconds after receiving the metadata the
-oracle closes its peer connection, announces `stopped` (`left=1048576` now
-that it knows), then announces `started` again about a second later and
-reconnects with a fresh connection that carries `metadata_size`, `have_none`
-and `interested`. This is qBittorrent re-creating the torrent from the
-received metadata, not libtorrent (`set_metadata` keeps connections). It is
-an L3 behaviour we do **not** copy: we keep the connection, send our
+Capture: `capture_magnet`. Milliseconds after receiving the metadata the
+oracle closes its peer connection and announces `stopped` (now with the
+real `left=1048576`); about a second later it announces `started` again and
+reconnects with a fresh connection that carries `metadata_size`,
+`have_none` and `interested`. This is qBittorrent re-creating the torrent
+from the received metadata, not libtorrent (`set_metadata` keeps
+connections).
+
+An L3 behaviour we do **not** copy: we keep the connection, send our
 have-state (`bitfield` / `have_none`) and a BEP 21 `upload_only` message on
 it, as libtorrent's `on_metadata` does, and keep the single `started`.
 
-Also from this capture: **without metadata libtorrent sends no have-state at
-all** (no `have_none`, no `bitfield`) after the handshake; the LTEP handshake
-omits `metadata_size`; the first `ut_metadata` request is for piece 0 and has
-no `total_size`. `wire::Connection` with `piece_count: None` matches
-(`qbt_magnet_mode_matches_capture`).
+Also from this capture: **without metadata libtorrent sends no have-state
+at all** (no `have_none`, no `bitfield`) after the handshake; the LTEP
+handshake omits `metadata_size`; the first `ut_metadata` request is for
+piece 0 and has no `total_size`. `wire::Connection` with
+`piece_count: None` matches (`qbt_magnet_mode_matches_capture`).
 
 ## Q14. The allowed-fast set waits for `interested`; a preemptive `unchoke` comes first
 
 Capture: `capture_peer_plain/v4/tap-peer-plain-oracle-responder.jsonl` (and
-`capture_peer_private`): the oracle seeding to a tap leecher sends `extended`,
-`have_all`, then `unchoke`, and only after the tap's `interested` the five
-`allowed_fast` messages. libtorrent unchokes a fresh peer right away when it
-has pieces and a slot is free (`maybe_unchoke_this_peer`) and defers
-`send_allowed_set` to the first `interested`, skipping pieces the peer already
-has (and granting every piece the peer lacks when the torrent has no more
-pieces than the set size). Our profile data used to list allowed-fast as a
-first message; the first-messages sequence is now `[extended, have-state]`
-for both profiles, the allowed set goes out on `interested`, and the engine
-unchokes preemptively when it has pieces.
+`capture_peer_private`): the oracle seeding to a tap leecher sends
+`extended`, `have_all`, `unchoke`, and only after the tap's `interested`
+the five `allowed_fast` messages. libtorrent unchokes a fresh peer right
+away when it has pieces and a slot is free (`maybe_unchoke_this_peer`) and
+defers `send_allowed_set` to the first `interested`, skipping pieces the
+peer already has (and granting every piece the peer lacks when the torrent
+has no more pieces than the set size). Confirmed from `write_bitfield`
+too: with the fast extension off and no pieces, libtorrent sends no
+`bitfield` at all.
 
-Also confirmed from `write_bitfield`: with the fast extension off and no
-pieces, libtorrent sends no `bitfield` at all.
+We do the same: the first-messages sequence is `[extended, have-state]`
+for both profiles (`profile::FirstMessage`), the allowed set goes out on
+`interested`, and the engine unchokes a fresh peer at once when it has
+pieces (`engine::maybe_unchoke_now`).
 
 ## Q15. PEX cadence and eligibility (BEP 11 as libtorrent does it)
 
 Capture: `capture_pex` (oracle seeding to two silent tap leechers that
-advertise `p`). The first `ut_pex` to a peer is sent on the first one-second
-tick at which the torrent has more than one peer (4.7 s after start in the
-capture, when the second tap had connected); it lists every exchangeable
-connection *including the recipient*, with all six keys present (`added`,
-`added.f`, `added6`, `added6.f`, `dropped`, `dropped6`; empty strings when
-empty). Later messages carry the torrent-wide delta rebuilt once a minute,
-and are skipped when the delta is empty. Exchangeable: connections past the
-handshake that libtorrent dialled, or incoming ones that sent a listen port
-(`p`). Flags: `0x02` seed, `0x01` encrypted connection, `0x08` advertised
-`ut_holepunch`; `0x04` (uTP) and `0x10` are never set by 2.0.14 (it masks
-`0x10` on receipt). Receiving more than six messages a minute or one over
-500 KiB is a disconnect. The engine's `pex` module reproduces this; the
-`pex_discovery` scenario shows no tells against the golden.
+advertise `p`). The first `ut_pex` to a peer goes out on the first
+one-second tick at which the torrent has more than one peer (4.7 s after
+start in the capture, when the second tap had connected). It lists every
+exchangeable connection *including the recipient*, with all six keys
+present (`added`, `added.f`, `added6`, `added6.f`, `dropped`, `dropped6`;
+empty strings when empty). Later messages carry the torrent-wide delta,
+rebuilt once a minute, and are skipped when the delta is empty.
+
+- Exchangeable: connections past the handshake that libtorrent dialled, or
+  incoming ones that sent a listen port (`p`).
+- Flags: `0x01` encrypted connection, `0x02` seed, `0x04` uTP connection
+  (Q21; the capture is TCP only), `0x08` advertised `ut_holepunch`. `0x10`
+  is never set (2.0.14 masks it on receipt).
+- Receiving more than six messages a minute, or one over 500 KiB, is a
+  disconnect.
+
+The engine's `pex` module reproduces this (`INTERVAL` 60 s,
+`MAX_PER_MINUTE` 6, `MAX_MESSAGE` 500 KiB); the `pex_discovery` scenario
+finds no tells against the golden.
 
 ## Q16. LSD: one announce per listen socket, three datagrams each
 
 Capture: `lsd_discovery` pcaps. Each `lsd_announce` is three datagrams (at
-once, +2 s, +4 s), and the oracle runs one LSD instance *per listen socket*
-(three sockets on the lab actor: three datagrams at the same instant with
-different `cookie`s). The datagram text is exactly libtorrent's
-`render_lsd_packet` (`Infohash` lowercase hex, `cookie` `%x`, a blank line
-plus a stray `\r\n` at the end). We send one announce per address family
-with a session-wide cookie; the datagram itself is byte-identical after
-normalising port, hash and cookie. Re-announce cadence is
-`local_service_announce_interval` (5 min) divided among the torrents,
-round-robin. Announces from our own cookie are ignored.
+once, 2 s later, then 4 s after that), and the oracle runs one LSD instance
+*per listen socket* (three sockets on the lab actor: three datagrams at the
+same instant with different `cookie`s). The datagram text is exactly
+libtorrent's `render_lsd_packet` (`Infohash` lowercase hex, `cookie` `%x`, a
+blank line plus a stray `\r\n` at the end).
+
+We send one announce per address family with a session-wide cookie
+(`session::engine::lsd`); the datagram itself is byte-identical after
+normalising port, hash and cookie (`tracker::lsd::render`). Re-announce
+cadence is `local_service_announce_interval` (5 min) spread over the
+torrents round-robin. Announces carrying our own cookie are ignored.
 
 ## Q17. Web seed requests
 
@@ -250,58 +281,63 @@ Capture: `web_seed_only`. The oracle fetches with `GET <path> HTTP/1.1`,
 headers in the order `Host`, `User-Agent`, `Connection: keep-alive`,
 `Range: bytes=a-b`, no `Accept-Encoding`, and asks for whole runs of pieces
 in one request (the whole 2 MiB file in the capture; libtorrent caps at
-16 MiB). We match the request line and header order/values and request
-contiguous runs capped at 4 MiB over a kept-alive connection (an accepted L3
-difference in request count).
+16 MiB).
+
+We match the request line and header order and values, and request
+contiguous runs capped at 4 MiB (`webseed::MAX_REQUEST`) over a kept-alive
+connection: an accepted L3 difference in request count.
 
 ## Q18. `completed` is announced only by a full seed
 
-libtorrent (`torrent::finished` → `if (is_seed()) completed()`) announces
-`event=completed` only when every piece is present; a selective download that
-finished its wanted files sends no `completed` and keeps announcing the real
-`left` (the skipped bytes). BEP 3 says `completed` is sent "when the download
-completes", which is ambiguous for selective downloads. We follow libtorrent:
-it is the truthful reading (rule 1) and what trackers expect from qBittorrent.
-Checked in the `file_priorities` scenario (no `completed` after the selective
-finish, one after the full download).
+Source: libtorrent `torrent::finished` (`if (is_seed()) completed()`)
+announces `event=completed` only when every piece is present. A selective
+download that finished its wanted files sends no `completed` and keeps
+announcing the real `left` (the skipped bytes). BEP 3 says `completed` is
+sent "when the download completes", which is ambiguous for selective
+downloads.
+
+We follow libtorrent (`torrent::maybe_finished`): it is the truthful
+reading (rule 1) and what trackers expect from qBittorrent. Checked in the
+`file_priorities` scenario (no `completed` after the selective finish, one
+after the full download).
 
 ## Q19. A fresh peer id for every peer connection; the announce id is another
 
 Captures: `capture_pex` (one torrent, two tap peers: the oracle's two
 handshakes carry two different peer ids), `capture_magnet` (two consecutive
-connections to the same tap: two ids), `capture_peer_plain` (the handshake id
-is not the id announced to the tracker for that torrent). libtorrent 2.0
-passes `aux::generate_peer_id(settings)` to every `peer_connection`
+connections to the same tap: two ids), `capture_peer_plain` (the handshake
+id is not the id announced to the tracker). libtorrent 2.0 passes
+`aux::generate_peer_id(settings)` to every `peer_connection`
 (`session_impl::incoming_connection`, `torrent::connect_to_peer`), while
 trackers see the torrent's own `m_peer_id`. Two consequences we mirror:
 
-- `profile::PeerIdShape::handshake = PerConnection` for the qbt profile: the
-  handshake id is generated per connection (L1: a tap seeing two connections
-  with one id, or a tracker + tap seeing the same id twice, would tell us
-  apart). The `native` profile keeps one id everywhere.
+- The qbt profile generates the handshake id per connection
+  (`profile::PeerIdShape::handshake = HandshakePeerId::PerConnection`). This
+  is L1: a tap seeing two connections with one id, or a tracker and a tap
+  seeing the same id, would tell us apart. The `native` profile keeps one
+  id everywhere.
 - Duplicate-connection arbitration cannot rely on peer ids between two
   libtorrents (they never repeat), so libtorrent decides **by IP**
-  (`peer_list::new_connection`): equal directions drop the newcomer,
+  (`peer_list::new_connection`): equal directions drop the newcomer;
   otherwise the side with the lower *listen* port keeps its outgoing
-  connection, equal ports toss a coin. The peer-id rule
-  (`bt_peer_connection::on_receive`: the greater id initiates) still exists
-  for clients with stable ids. The engine implements both; a connection
-  dropped as a duplicate does not back the address off (the coin can fall
-  the wrong way on both sides at once, and the next tick simply dials again).
-  This replaced our earlier "lower peer id initiates" rule, which disagreed
-  with the oracle and stalled `kill9_resume` once LSD made simultaneous
-  connects common.
+  connection; equal ports toss a coin. The peer-id rule
+  (`bt_peer_connection::on_receive`: the greater id initiates) still applies
+  to clients with stable ids. The engine implements both. A connection
+  dropped as a duplicate does not back the address off: the coin can fall
+  the wrong way on both sides at once, and the next tick simply dials
+  again. (A "lower peer id initiates" rule disagreed with the oracle and
+  stalled `kill9_resume` once LSD made simultaneous connects common.)
 
 Pinned in `crates/wire/tests/replay.rs`; the discriminator compares
 "handshake id equals announce id" between the oracle and us.
 
 ## Q20. DHT (BEP 5) wire shape: libtorrent's extras
 
-Capture: `testkit/golden/capture_dht/{v4,v6}/tap-dht-*.jsonl` (oracle with DHT
-on and uTP off, bootstrapped from a tap DHT node, probed with every query
-kind). Confirmed in libtorrent 2.0.14 `rpc_manager.cpp`, `node.cpp`,
+Capture: `testkit/golden/capture_dht/{v4,v6}/tap-dht-*.jsonl` (oracle with
+DHT on and uTP off, bootstrapped from a tap DHT node, probed with every
+query kind). Confirmed in libtorrent 2.0.14 `rpc_manager.cpp`, `node.cpp`,
 `refresh.cpp`, `get_peers.cpp`. Everything here is mirrored by `crates/dht`
-and checked byte-for-byte or by shape in `dht_shape` (`xtask diff`):
+and checked byte for byte or by shape in `dht_shape` (`xtask diff`):
 
 - **`v` on every message** is `"LT"` + `0x02` + `0x0e` (`4c 54 02 0e`):
   `LT` + major byte + `(minor << 4 | tiny)` for 2.0.14. It is *not* derived
@@ -310,21 +346,21 @@ and checked byte-for-byte or by shape in `dht_shape` (`xtask diff`):
 - **Responses carry `ip`** (6 / 18 byte compact endpoint of the requester,
   BEP 42) and **`r.p`** (the requester's port as an integer) on every reply.
 - **Errors keep `r`**: once the top level parsed, an error reply is `{e,
-  ip, r: {id, p}, t, v, y: "e"}` — the `r` dictionary built before the query
-  was rejected stays in. Error texts come from `verify_message`: `missing
-  'target' key`, `invalid value for 'info_hash'`, plus `invalid token`,
-  `invalid port`, `unknown message`. Code 203 for all of them.
+  ip, r: {id, p}, t, v, y: "e"}`: the `r` dictionary built before the
+  query was rejected stays in. Error texts come from `verify_message`
+  (`missing 'target' key`, `invalid value for 'info_hash'`), plus `invalid
+  token`, `invalid port`, `unknown message`. Code 203 for all of them.
 - **Unknown methods with a `target` or `info_hash` argument are answered
   with nodes**, not an error; only an unknown method without one gets
   `unknown message`.
 - **Bootstrap** is a `get_peers` traversal for the node's own id with a
-  random secret tail, and queries to the *router* nodes carry `a.bs: 1`
+  random secret tail; queries to the *router* nodes carry `a.bs: 1`
   (non-router nodes reached during the same traversal do not).
 - **A seed's lookup asks for `noseed: 1`** and its `announce_peer` says
   `seed: 1`; a leecher's lookup has neither and announces `seed: 0`. With
   uTP disabled the announce has no `implied_port` and `port` is the TCP
-  listen port. After finishing a download the torrent is re-announced as a
-  seed within seconds.
+  listen port (with uTP on, see Q21). After finishing a download the
+  torrent is re-announced as a seed within seconds.
 - **Refresh**: every 5 s one routing-table node is probed with `get_peers`
   for a random id in its bucket's range (`ping` when the bucket is full);
   routers never enter the routing table and never receive refreshes.
@@ -348,14 +384,14 @@ engine and checked by shape in `utp_shape` (`xtask diff`):
 
 - **The oracle dials every new peer over uTP first.**
   `torrent_peer::supports_utp` starts true ("assume peers support utp"); a
-  peer is dialled over TCP only after a uTP attempt to it failed (then
-  immediately, `fast_reconnect`), or when uTP is disabled. A PEX `added`
-  flag `0x04` re-enables uTP for an address. **Accepted difference (L3,
-  maintainer decision 2026-09-20):** we dial TCP first by default because it
-  performs better, and go to uTP for an address only after its TCP dial
+  peer is dialled over TCP only after a uTP attempt to it failed (then at
+  once, `fast_reconnect`), or when uTP is disabled. A PEX `added` flag
+  `0x04` re-enables uTP for an address. **Accepted difference (L3,
+  maintainer decision 2026-09-20):** we dial TCP first by default because
+  it performs better, and try uTP for an address only after its TCP dial
   failed or was closed before the handshake; `TransportPolicy::PreferUtp`
-  reproduces the oracle's order when wanted. Our own PEX entries carry the
-  flag for peers connected over uTP, as the oracle's do.
+  reproduces the oracle's order. Our PEX entries carry `0x04` for peers
+  connected over uTP, as the oracle's do.
 - **SYN**: type/version `0x41`, no extension, `connection_id` = the id we
   will *receive* on (the peer replies with it and sends data with id + 1),
   `wnd_size` 0, `ack_nr` 0, `timestamp_difference` 0, 20 bytes. It is never
@@ -380,25 +416,26 @@ engine and checked by shape in `utp_shape` (`xtask diff`):
   ack sent after the reason was set. Two seeds parting send reason 6
   (`upload_to_upload`); a peer closing on end-of-stream sends none.
 - **Data delivered in the same receive round as the FIN is dropped.**
-  libtorrent copies the payload into the outstanding read and then reports
+  libtorrent copies the payload into the outstanding read, then reports
   the read with `eof` when the FIN completes the stream in the same round;
   `peer_connection::on_receive_data` discards the bytes on any error. The
   visible effect: a leecher's last `have` followed at once by its FIN is
   not acted upon by the seeder, whose FIN then carries no close reason
-  (when the two land in different rounds the `have` completes the peer's
+  (when the two land in different rounds, the `have` completes the peer's
   bitfield and the seeder closes with reason 6). Timing-dependent in the
   oracle; we reproduce the rule (`utp::Socket::end_round`), and `utp_shape`
   compares the FIN shape in the role where the client closes on its own.
 - **Unknown connections get no ST_RESET**; stray non-SYN packets and SYNs
   with uTP disabled are ignored silently.
-- **`implied_port`** appears in DHT announces only with uTP enabled
-  (Q20 noted its absence with uTP off); with uTP on the oracle announces
-  `implied_port: 1`. Our DHT announce follows the same rule.
+- **`implied_port`** appears in DHT announces only with uTP enabled (Q20
+  shows its absence with uTP off); with uTP on the oracle announces
+  `implied_port: 1`. Our DHT announce follows the same rule (whenever
+  incoming uTP is on).
 
 Accepted differences: the number of floor-sized packets between two probe
 steps and the ack cadence depend on how fast the application drains its
-buffers (L3 timing); a burst's exact pacing differs (we submit 32 datagrams
-per ring round trip, libtorrent one per `sendto`).
+buffers (L3 timing); a burst's exact pacing differs (we submit up to 32
+datagrams per ring round trip, libtorrent one per `sendto`).
 
 ## Q22. BEP 7 `ipv4=` / `ipv6=` announce hints: private torrents, explicit public listen addresses only
 
@@ -410,7 +447,8 @@ addresses are all RFC 1918 or ULA. The rule, mirrored in
 `session::engine::tracker_task::build_request` and rendered by
 `AnnounceParam::{Ipv4Hints, Ipv6Hints}`:
 
-- only for **private** torrents (`priv()`), and never in anonymous mode;
+- only for **private** torrents (`priv()`); libtorrent also skips them in
+  anonymous mode, which we do not have;
 - one `&ipv4=<dotted>` per IPv4 listen address and one `&ipv6=<text>`
   (percent-escaped, so `%3a`) per IPv6 listen address, in that order;
 - placed after `&redundant=` and `&trackerid=`, i.e. at the very end of the
@@ -430,7 +468,7 @@ says MUST/SHOULD close and libtorrent does not, the oracle wins:
 
 - **A piece that was never requested** is counted as redundant and the
   connection kept (BEP 6: MUST close). Blocks for requests *we cancelled*
-  are accepted as data: BEP 6 promises exactly one response per request
+  are accepted as data: BEP 6 promises exactly one response per request,
   and a cancelled request's response may well be the piece.
 - **A reject for a request we never made** is ignored (BEP 6: SHOULD
   close); one for a cancelled request is its expected single response.
@@ -441,10 +479,10 @@ says MUST/SHOULD close and libtorrent does not, the oracle wins:
   peer's allowed-fast set, which stay queued and are served (BEP 6 SHOULD
   NOT reject them; libtorrent `send_choke`).
 - **Requests while choked** are rejected; a peer that keeps asking is
-  dropped (libtorrent gives it two seconds after the choke, we count 300
-  rejects: the state machine has no clock), and one that pulls more than
-  three pieces' worth of blocks from one allowed-fast piece while choked
-  is dropped too (`too_many_requests_when_choked`).
+  dropped (libtorrent allows two seconds after the choke; the clockless
+  `wire` state machine allows 300 rejects, `MAX_CHOKED_REQUESTS`). A peer
+  that pulls more than three pieces' worth of blocks from one allowed-fast
+  piece while choked is dropped too (`too_many_requests_when_choked`).
 - **Suggest piece** is honoured as a preference (libtorrent keeps the last
   16 suggestions per peer and requests them first); we never *send*
   suggestions, like the oracle at its default `suggest_mode`.
@@ -453,17 +491,19 @@ says MUST/SHOULD close and libtorrent does not, the oracle wins:
 
 Source: libtorrent 2.0.14 `torrent.cpp` (`announce_with_tracker`):
 `downloaded = total_payload_download - failed_bytes - redundant_bytes`
-(`report_true_downloaded` is off by default), so the figure never exceeds the
-torrent size, "which upsets some trackers". `corrupt=` and `redundant=`
-carry the excluded bytes. `TorrentStatus::downloaded` stays the gross count
-of payload received; `build_request` subtracts.
+(`report_true_downloaded` is off by default), so the figure never exceeds
+the torrent size, "which upsets some trackers". `corrupt=` and `redundant=`
+carry the excluded bytes.
 
-Every byte counted as `redundant` is counted in `downloaded` first, so
-`downloaded - corrupt - redundant` is the torrent's own progress. That
-covers blocks that arrived twice, blocks we never requested (libtorrent's
-`incoming_piece` does `received_bytes` *and* `add_redundant_bytes`), and
-blocks a recheck discards because the piece they belonged to turned out
-not to be on disk (libtorrent's `waste_reason::piece_closing` class).
+`TorrentStatus::downloaded` stays the gross count of payload received;
+`build_request` subtracts. Every byte counted as `redundant` is counted in
+`downloaded` first, so `downloaded - corrupt - redundant` is the torrent's
+own progress. That covers blocks that arrived twice, blocks we never
+requested (libtorrent's `incoming_piece` does `received_bytes` *and*
+`add_redundant_bytes`), and blocks a recheck discards because their piece
+turned out not to be on disk (libtorrent's `waste_reason::piece_closing`
+class).
+
 ## Q25. Dual-stack duplicates and connections to ourselves
 
 Source: libtorrent 2.0.14 `bt_peer_connection.cpp` (`on_receive_handshake`),
@@ -474,34 +514,35 @@ PEX hands us our own listen address.
 
 - **Addresses are normalised on ingress.** A v4-mapped IPv6 address
   (`::ffff:a.b.c.d`) from a tracker's `peers6`, a PEX `added6`, the DHT or a
-  magnet's `x.pe` is the IPv4 peer it names and is dialled as such (or not at
-  all when IPv4 is off). libtorrent keeps the mapped form and dials it
+  magnet's `x.pe` is the IPv4 peer it names and is dialled as such (or not
+  at all when IPv4 is off). libtorrent keeps the mapped form and dials it
   through its v6 socket; the peer sees the same v4 connection either way.
-- **Candidates of a family we do not listen on are dropped** (`listen_v4` /
-  `listen_v6` `None`), not dialled from an unbound socket.
-- **The same peer over both families, dialled by the same side.** libtorrent's
-  duplicate rule keys on which of the two handshakes completed first ("the
-  greater peer id initiates" decides whether the newcomer or the existing
-  connection goes). When one side dialled both, the two ends can see the
-  handshakes complete in opposite orders, each closes a different
-  connection and both are lost until the next reconnect. We keep the IPv6
-  connection in that case (same direction, different family): the family is
-  the same on both ends, so the outcome is. With the oracle this never
-  arises: it puts a fresh peer id on every connection (Q19), so the rule
-  fires only against clients with one id per session, and the accepted
-  outcome there is one connection per family. Opposite directions keep
-  libtorrent's rule unchanged (`incoming_and_outgoing_over_different_families
-  _keep_one_connection`).
+- **Candidates of a family we do not listen on are dropped**
+  (`SessionBuilder::listen_v4` / `listen_v6` set to `None`), not dialled
+  from an unbound socket.
+- **The same peer over both families, dialled by the same side.**
+  libtorrent's peer-id duplicate rule ("the greater peer id initiates")
+  keys on which of the two handshakes completed first. When one side
+  dialled both, the two ends can see the handshakes complete in opposite
+  orders, each closes a different connection, and both are lost until the
+  next reconnect. We keep the IPv6 connection in that case (same
+  direction, different family): the family is the same on both ends, so
+  the outcome is too. With the oracle this never arises: it puts a fresh
+  peer id on every connection (Q19), so the rule fires only against
+  clients with one id per session, and the accepted outcome there is one
+  connection per family. Opposite directions keep libtorrent's rule
+  (`crates/session/tests/dualstack.rs`,
+  `incoming_and_outgoing_over_different_families_keep_one_connection`).
 - **Connections to ourselves** are recognised the way libtorrent does: an
   incoming handshake carrying a peer id we put on an outgoing connection of
   the same torrent (`outgoing_pids`; the wire layer's "same id on both
   ends" check cannot see it under the qbt profile's per-connection ids), or
   an incoming connection whose local endpoint is the remote of one of our
-  outgoing ones (then both go). The address is then known to be ours and is
-  never dialled on our listen port again, for any torrent, like libtorrent's
-  ban of the peer entry. A tracker or PEX peer handing back our other
-  family's address while we listen on the unspecified address is the common
-  trigger.
+  outgoing ones (then both go). The address is then known to be ours and
+  is never dialled on our listen port again, for any torrent, like
+  libtorrent's ban of the peer entry. The common trigger is a tracker or
+  PEX peer handing back our other family's address while we listen on the
+  unspecified address.
 
 ## Q26. The active-torrent queue
 
@@ -511,29 +552,30 @@ Source: libtorrent 2.0.14 `session_impl.cpp`
 `active_limit`, `dont_count_slow_torrents`, `inactive_down_rate` /
 `inactive_up_rate` (2 KiB/s), `auto_manage_startup` (60 s),
 `auto_manage_interval` (30 s). qBittorrent's "torrent queueing" is this
-mechanism with its own defaults (3 / 3 / 5) and "pause" implemented as
-"unset auto-managed, then pause"; "resume" as "set auto-managed"; "force
-resume" as "unset auto-managed, resume".
+mechanism with its own defaults (3 / 3 / 5); "pause" is "unset
+auto-managed, then pause", "resume" is "set auto-managed", "force resume"
+is "unset auto-managed, resume".
 
-What matches: the three limits and their meaning, auto-managed torrents
-started in queue order and stopped beyond the limits, force-started
-torrents running regardless but charged, the slow-torrent exemption (a
-running torrent below 2 KiB/s both ways for 60 s holds no slot; on by
-default), pause / resume / force-resume semantics, `queue_position` and
-`auto_managed` persisted in resume data.
+What matches (`ActiveLimits`, `session::engine::queue`): the three limits
+and their meaning; auto-managed torrents started in queue order and
+stopped beyond the limits; force-started torrents running regardless but
+counted; the slow-torrent exemption (a running torrent below 2 KiB/s both
+ways for 60 s holds no slot; on by default); pause / resume / force-resume
+semantics; `queue_position` and `auto_managed` persisted in resume data.
 
 What differs (L3, deliberate):
 
 - **Seeds are ordered by queue position, not `seed_rank`.** libtorrent
   ranks finished torrents by a score (recently started, below share limits,
   scrape data, time seeded) and gives them no queue position. Here every
-  torrent has a position and the caller's order applies to seeds too, which
-  is predictable and lets a frontend implement any seed policy by moving
-  torrents.
-- **Re-evaluated once a second** (and at once on every limit change,
-  move, resume or state change) instead of every 30 s.
-- **The default is unlimited** (nothing queued until a limit is set);
-  libtorrent's defaults are 3 / 5 / 15 with new torrents auto-managed.
+  torrent has a position and the caller's order applies to seeds too,
+  which is predictable and lets a frontend implement any seed policy by
+  moving torrents.
+- **Re-evaluated once a second** (and at once on every limit change, move,
+  resume or state change) instead of every 30 s.
+- **The default is unlimited** (`ActiveLimits::UNLIMITED`: nothing queued
+  until a limit is set); libtorrent's defaults are 3 / 5 / 15 with new
+  torrents auto-managed.
 - **A torrent stopped by the queue redials its peers under libtorrent's
   `min_reconnect_time`** (60 s counted from when the connection was made,
   like any other disconnect; a connection older than that is redialled at
@@ -543,52 +585,53 @@ What differs (L3, deliberate):
 
 Source: libtorrent 2.0.14 `session_impl.cpp` (`reopen_listen_sockets`,
 `reopen_network_sockets`, `apply_settings`), `torrent.cpp`
-(`enable_all_trackers`, per-listen-socket announce entries).
+(`enable_all_trackers`, per-listen-socket announce entries). Our side:
+`Session::set_listen`, `Session::set_profile`.
 
 - **Trackers hear the change as `stopped` then `started`.** libtorrent keeps
   one announce entry per listen socket; a socket that goes away has its
-  entries dropped (no `stopped` is sent for them), and the new socket's
-  entries announce `started`. We send `stopped` under the old port (or the
-  old identity, for `set_profile`) before the new `started`, so a tracker
-  never keeps a ghost entry: a behavioural difference in favour of the
-  tracker, and the one place the oracle's behaviour would leave a stale
-  peer entry.
+  entries dropped without a `stopped`, and the new socket's entries
+  announce `started`. We send `stopped` under the old port (or the old
+  identity, for `set_profile`) before the new `started`, so a tracker never
+  keeps a ghost entry. This favours the tracker; it is the one place where
+  the oracle's behaviour would leave a stale peer entry.
 - **uTP connections drop, TCP connections stay**, as in libtorrent (uTP
   sockets are bound to the replaced UDP socket).
 - **The DHT node keeps its tables across a listen change**; libtorrent
   restarts the node with the same id and routing table on a socket change.
 - **`set_profile` changes what new connections say**; connections already
   handshaked keep their negotiated identity. libtorrent has no equivalent
-  (its fingerprint is fixed at construction); a session with two identities
-  in flight is a state the oracle never shows a tracker or a peer, which is
-  why `set_profile` re-announces every torrent under one identity at once.
+  (its fingerprint is fixed at construction). A session with two
+  identities in flight is a state the oracle never shows a tracker or a
+  peer, which is why `set_profile` re-announces every torrent under one
+  identity at once.
 
 ## Q28. Missing content and disk errors
 
 Source: capture `capture_missing_files` (golden
 `testkit/golden/capture_missing_files/v4/missing-files.json`), libtorrent
-2.0.14 `torrent.cpp` (`handle_disk_error`, `clear_error`), qBittorrent 5.2.3's
-torrent states.
+2.0.14 `torrent.cpp` (`handle_disk_error`, `clear_error`), qBittorrent
+5.2.3's torrent states.
 
 - **Resume data vouching for files that are gone is rejected, not trusted
-  and not silently replaced.** The oracle's fast resume check fails
+  and not silently replaced.** The oracle's fast-resume check fails
   ("mismatching file size"), the torrent shows `missingFiles`, nothing is
   announced and no file is created. We stop with
-  `ErrorKind::ContentMissing`, announce nothing, create nothing (a drive that
-  is not mounted must not have a fresh copy written into its mount point),
-  and keep the resume data as loaded. "Start" on the oracle checks the
-  resume data again (`checkingResumeData` → `missingFiles` while the files
-  are still gone); `Session::resume` does the same. "Recheck" on the oracle
-  clears the error, finds nothing and downloads from scratch;
+  `ErrorKind::ContentMissing`, announce nothing, create nothing (a drive
+  that is not mounted must not get a fresh copy written into its mount
+  point), and keep the resume data as loaded. "Start" on the oracle checks
+  the resume data again (`checkingResumeData` → `missingFiles` while the
+  files are still gone); `Session::resume` does the same. "Recheck" on the
+  oracle clears the error, finds nothing and downloads from scratch;
   `Session::force_recheck` does the same.
-- **A read or write that fails stops the torrent** (`ErrorKind::Io`),
-  libtorrent's `handle_disk_error`. Upload reads included: before 0.12.0 a
-  failed upload read only rejected the request, so a seed whose drive
-  vanished rejected requests forever with no error to show. Pieces in
-  progress when a write failed are downloaded again on `resume` (their
-  bytes count as redundant); libtorrent's `write_failed` resets the blocks
-  the same way. Verifies in flight are dropped (`epoch`): read back after a
-  failed write, a piece would fail and blame its peers for the disk.
+- **A read or write that fails stops the torrent** (`ErrorKind::Io`), as
+  libtorrent's `handle_disk_error` does. Upload reads count too, so a seed
+  whose drive vanished shows an error instead of rejecting requests
+  forever. Pieces in progress when a write failed are downloaded again on
+  `resume` (their bytes count as redundant); libtorrent's `write_failed`
+  resets the blocks the same way. Verifies in flight are dropped (`epoch`):
+  read back after a failed write, a piece would fail and blame its peers
+  for the disk.
 - **Errors are cleared by resume and recheck, not only by removal.**
   libtorrent's `clear_error` resumes; a torrent that failed while checking
   checks again. Metadata that cannot be used (`ErrorKind::Metadata`) is the
@@ -598,16 +641,17 @@ torrent states.
 
 Source: capture `capture_magnet_hold` (golden
 `testkit/golden/capture_magnet_hold/v4/magnet-hold.json`), checked against
-us by `magnet_hold` (`xtask diff`).
+us by `magnet_hold` (`xtask diff`). Our side:
+`AddTorrent::hold_after_metadata`, `TorrentState::Held`.
 
 - **A held magnet stops the way qBittorrent's "stop condition: metadata
-  received" does.** The oracle fetches the metadata, then stops the torrent:
-  `stopped` to the tracker (after the `started` that carried libtorrent's
-  placeholder `left=16384`), the connection to the peer that supplied the
-  metadata dropped, no `interested`, no request, no file on disk. The
-  daemon asked for held torrents to keep their peers; the oracle's
-  behaviour is the spec for what trackers and peers see, so peers are
-  dropped and found again on release.
+  received" does.** The oracle fetches the metadata, then stops the
+  torrent: `stopped` to the tracker (after the `started` that carried
+  libtorrent's placeholder `left=16384`, Q12), the connection to the peer
+  that supplied the metadata dropped, no `interested`, no request, no file
+  on disk. We do the same, so peers are dropped and found again on release
+  (a request to keep a held torrent's peers lost to the oracle's
+  behaviour).
 - **Starting it is a plain start.** The oracle announces `started` with the
   real `left`, then `completed`; `Session::resume` on a held torrent does
   the same after creating the files and checking them. `Session::release`
@@ -625,13 +669,13 @@ us by `partial_seed_shape` (`xtask diff`); libtorrent 2.0.14
 
 - **The LTEP handshake says `upload_only: 1` once the selection is done**,
   not only when every piece is there: the oracle, having downloaded two of
-  three files, sent `upload_only: 1` with a bitfield of its 20 pieces. Before
-  0.13.3 we left the key out until the whole torrent was complete (an L2
-  difference a peer could see).
+  three files, sent `upload_only: 1` with a bitfield of its 20 pieces. We
+  do the same (`wire::ConnectionParams::upload_only`).
 - **Selecting more sends `upload_only` 0** (BEP 21's one-byte extension
   message) to peers that advertise the extension, as the oracle does.
-- The bitfield carries exactly the pieces held, the straddling ones included
-  (their skipped-file bytes read back from the parts file when served).
+- The bitfield carries exactly the pieces held, the straddling ones
+  included (their skipped-file bytes read back from the parts file when
+  served).
 
 ## Q31. Reannouncing to one tracker
 
@@ -640,7 +684,7 @@ moves only that tracker's `next_announce`) and
 `torrent::announce_with_tracker` (with qBittorrent's
 `announce_to_all_tiers = true`, `announce_to_all_trackers = false`, a tier
 whose working tracker has been announced to, or is not due, skips the rest
-of the tier). Accepted L3 difference: API-triggered, nothing on the wire
+of the tier). Accepted L3 difference: API-triggered; nothing on the wire
 differs in shape.
 
 - **`Session::force_reannounce_tracker` announces to the tracker it names,

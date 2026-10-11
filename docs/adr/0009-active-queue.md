@@ -1,6 +1,7 @@
 # ADR 0009: The active-torrent queue lives in the library
 
-Date: 2026-09-21 (0.7.0)
+- Status: accepted (2026-09-21, 0.7.0)
+- Relates to: AGENTS.md 10 (configuration boundary); docs/config.md; docs/quirks.md Q26
 
 ## Context
 

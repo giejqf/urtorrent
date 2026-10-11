@@ -1,6 +1,6 @@
 # ADR 0004: Engine threading and cross-thread wakeups
 
-- Status: accepted (2026-09-20)
+- Status: accepted (2026-09-20, M2)
 - Relates to: AGENTS.md 5.3, 5.6; ADR 0001
 
 ## Context
@@ -19,13 +19,18 @@ another thread would be unsound, and the runtime's park step is
    the TCP accept loops and, per torrent, cooperating tasks: a tracker task,
    a one-second tick, and one task (plus a writer sub-task) per peer
    connection. Tasks share state through `Rc<RefCell<..>>`; no borrow is held
-   across an `await`.
+   across an `await`. *Amended (0.2.0):* the per-torrent tick is no longer a
+   task: a session-wide tick queue (`Ctx::schedule_tick`, phase-spread by
+   torrent id) is run by the 100 ms ticker of (6). Each peer also has an
+   uploader sub-task (M3).
 2. **A single eventfd (`uring::Notifier`) is the only way in.** Other threads
    push into a `Mutex` queue and `write(2)` the eventfd; the ring thread keeps
    one `IORING_OP_READ` on it in flight, and on completion drains the API
    command channel (`tokio::sync::mpsc`, `try_recv`), `HashPool::drain()` and
    `Dns::drain()`, which complete ring-local futures and wake their wakers *on
-   the ring thread*. Local tasks that need the command loop use the same
+   the ring thread*. (Since (4) the engine drains `DiskRing::drain()` instead;
+   the hash pool completes on the disk ring, or inside that call when disk
+   I/O runs inline.) Local tasks that need the command loop use the same
    eventfd (a `write(2)` on the same thread), so the loop never drops its
    notifier future mid-flight and no wakeup can be lost.
 3. **Hashing overlaps I/O.** `HashPool::verify_async` / `update_async` hand
@@ -58,7 +63,6 @@ another thread would be unsound, and the runtime's park step is
    and timers cannot hang a shutting-down engine; buffers stay owned by the
    reactor until their CQE lands (leaked, never freed, if the kernel never
    answers).
-
 6. **Choking and rate limiting live in a 100 ms session ticker.** The
    choker is a pure function over peer snapshots (`engine/choker.rs`) run
    every 15 s with a session-wide slot budget; token-bucket limiters
@@ -77,4 +81,12 @@ another thread would be unsound, and the runtime's park step is
   graph, and none of those features pulls in `mio`.
 - The one-connection-per-IP rule is decided symmetrically: of two connections
   between the same pair, the one initiated by the side with the lower peer id
-  survives, so both ends close the same one.
+  survives, so both ends close the same one. *Amended (0.1.0):* replaced by
+  libtorrent's rules (`crates/session/src/engine/peer.rs`, after the
+  handshake). The same peer id on two connections: the side with the
+  greater id may initiate (since 0.6.0, the same peer over both families,
+  dialled by the same side, keeps IPv6; `docs/quirks.md` Q25). The same IP on two
+  connections: in the same direction the newcomer goes; otherwise the side
+  with the lower *listen* port keeps its outgoing connection, and equal
+  ports toss a coin. Under the qbt profile every connection has a fresh
+  peer id (Q19), so the by-IP rule is the one that normally fires.

@@ -3,7 +3,7 @@
 
 //! urtorrent: a BitTorrent library for Linux with every data-path operation on
 //! io_uring, first-class IPv4 + IPv6, and wire behaviour that matches a pinned
-//! qBittorrent build (see `AGENTS.md`).
+//! qBittorrent build. Guides: <https://github.com/giejqf/urtorrent/tree/main/docs>.
 //!
 //! This crate is the stable facade: it re-exports the public API of the
 //! engine (`session`) and the types callers need from `metainfo` and

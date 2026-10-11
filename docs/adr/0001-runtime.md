@@ -1,7 +1,7 @@
 # ADR 0001: io_uring runtime
 
-- Status: accepted (2026-09-19)
-- Relates to: AGENTS.md 5.3
+- Status: accepted (2026-09-19, M0)
+- Relates to: AGENTS.md 5.3, 5.6; ADR 0004
 
 ## Context
 
@@ -24,9 +24,9 @@ thread pool or any other reactor. Three options were considered:
 3. **Own reactor on the `io-uring` crate** (tokio-rs/io-uring: thin, safe-ish
    bindings over the raw interface). Full control over multishot accept /
    recv, provided buffer rings, registered files and buffers, `send_zc`,
-   linked timeouts, `IORING_REGISTER_PROBE`, and `submit_with_args` timeouts.
-   No fallback exists because none is written. Cost: we own the executor,
-   the buffer pool and all the `unsafe`.
+   linked timeouts, `IORING_REGISTER_PROBE` and `submit_with_args`
+   timeouts. No fallback exists because none is written. Cost: we own the
+   executor, the buffer pool and all the `unsafe`.
 
 ## Decision
 
@@ -35,11 +35,13 @@ single-threaded executor per ring thread (one network ring, separate disk
 ring(s)), owned pooled buffers, and completion-driven futures. The `uring`
 crate is the only crate in the workspace allowed to contain `unsafe`.
 
-Enforcement (5.3): `compile_error!` on non-Linux, `cargo-deny` bans on
-`mio`/`polling`/`async-io`/`async-std`, a tokio feature audit in
-`xtask check`, a hard error from session creation if `io_uring_setup` fails or
-a required opcode is missing (probe), and `xtask syscalls` (strace) asserting
-no `epoll_*`/`poll`/`select`/socket `read`/`write` from library threads.
+Enforcement (5.3): `compile_error!` on non-Linux; `cargo-deny` bans on
+`mio`, `polling`, `async-io`, `async-std`, `smol` and `calloop` (`deny.toml`);
+a tokio feature audit in `xtask check`; a hard error from session creation if
+`io_uring_setup` fails or a baseline opcode is missing
+(`uring::probe`, `Features::missing_baseline`); and `xtask syscalls`
+(strace) asserting no `epoll_*`/`poll`/`select`/socket `read`/`write` from
+library threads.
 
 ## Consequences
 
