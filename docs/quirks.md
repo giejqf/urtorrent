@@ -126,8 +126,8 @@ So the parameter depends on the encryption mode, not on the profile alone.
 
 ## Q9. One announce per listen socket
 
-Capture: `capture_tracker_dual` (a hostname tracker resolving to both
-families, dual-stack oracle; not kept under `testkit/golden`): every
+Observation: `capture_tracker_dual` (a hostname tracker resolving to both
+families, dual-stack oracle): every
 announce is sent twice, once from the IPv4 listen socket and once from the
 IPv6 one, with the same `peer_id`, `key` and parameters, and each socket
 runs its own `started` -> `completed` -> `stopped` sequence. For an
@@ -145,7 +145,7 @@ The BEP 7 `ipv4=` / `ipv6=` parameters are covered in Q22.
 
 ## Q10. UDP tracker: one attempt per request, BEP 41 URL data
 
-Capture: `capture_tracker_udp` (not kept under `testkit/golden`). The oracle
+Observation: `capture_tracker_udp`. The oracle
 retransmits nothing within a request: a `connect` that gets no reply fails
 after the receive timeout and the tracker enters the ordinary announce
 backoff (attempts at +39 s and +65 s in the capture), instead of BEP 15's

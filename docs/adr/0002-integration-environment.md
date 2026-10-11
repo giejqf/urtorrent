@@ -1,4 +1,4 @@
-# ADR 0002: Integration environment is a netns lab; Docker is the alternative
+# ADR 0002: Integration environment is a netns lab
 
 - Status: accepted (2026-09-19, M0)
 - Relates to: AGENTS.md rule 3, 7.2; ADR 0007
@@ -57,11 +57,6 @@ The primary environment is a **netns lab** driven by `testkit`:
   `utp_leech_from_oracle`, `utp_seed_to_oracle`, `utp_shape` decode the uTP
   headers from it). `lsd_discovery` checks the LSD datagrams when tcpdump
   is present.
-
-Docker Compose remains a supported alternative for environments without sudo
-(`xtask doctor` explains the seccomp requirement); the scenarios are written
-against the `Lab`/`Actor` abstraction so a compose backend can be added
-without touching them.
 
 ## Consequences
 

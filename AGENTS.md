@@ -30,8 +30,7 @@ that trackers and peers see nothing unusual.
 2. **Private torrents (BEP 27) are sacred.** `private=1` means zero DHT, PEX and LSD traffic
    for that torrent, enforced by a test that inspects packets, not by code review.
 3. **Tests never touch the public internet.** No public trackers, no public DHT bootstrap
-   nodes, no real swarms. Everything runs in isolated network namespaces / internal Docker
-   networks.
+   nodes, no real swarms. Everything runs in isolated network namespaces.
 4. **The critical path is io_uring, with no possible fallback.** Critical path = peer
    sockets (accept/connect/send/recv), torrent file I/O (read/write/fsync/fallocate) and
    the timers that drive them. `mio`, `polling`, `async-io` and every other
@@ -292,7 +291,7 @@ Maintainer decision: the library integrates with **tokio**. The shape:
 
 Identity is **data, not code**: `profile/` holds declarative profiles. Two ship:
 `native` (our own honest peer-id prefix and user agent) and `qbt_5_2_3_lt2_0_14` (the
-conformance target; the 1.2.20 variant follows). Callers choose; nothing else in the
+conformance target). Callers choose; nothing else in the
 codebase may hardcode an identity string or an ordering that a profile owns.
 
 The qbt profile is **best effort with explicit priorities** (maintainer decision):
@@ -353,8 +352,7 @@ finds a new L1/L2 tell, first add it to the discriminator (red), then fix it (gr
    invariants, choker fairness, rate-limiter bounds.
 3. **Fuzz** - `cargo-fuzz` targets (`fuzz/`) for every parser that eats untrusted bytes:
    bencode, metainfo, magnet, peer wire, LTEP, PEX, `ut_metadata`, tracker responses
-   (HTTP + UDP), HTTP response framing, MSE, LSD, DHT KRPC, uTP, resume data. Corpus
-   seeded from oracle captures.
+   (HTTP + UDP), HTTP response framing, MSE, LSD, DHT KRPC, uTP, resume data.
 4. **Replay** - feed recorded oracle sessions into our state machines; assert no errors
    and equivalent responses.
 5. **Integration** - real processes (7.2).
@@ -367,17 +365,14 @@ finds a new L1/L2 tell, first add it to the discriminator (red), then fix it (gr
 All actors run in an isolated environment with both an IPv4 and an IPv6 subnet. The
 primary environment is the `testkit` **netns lab** (ADR 0002): one Linux bridge, one
 network namespace + veth per actor, a `FORWARD ... DROP` rule so nothing leaves the lab;
-it needs passwordless `sudo`, and CI runs it. Docker Compose on an `internal: true` network is the accepted alternative for
-hosts without sudo; scenarios are written against the `Lab`/`Actor` abstraction so a
-compose backend can be added, but none exists yet.
+it needs passwordless `sudo`, and CI runs it.
 
 - **Trackers:** `opentracker` (HTTP+UDP, v4/v6) and **`tap-tracker`**: our own test-only
   tracker that logs raw request bytes (post-TLS) before answering, with HTTPS via a test
   CA it generates. The PT-style tracker is `tap-tracker` configured with a passkey in the
   announce path and a client (peer-id prefix) whitelist with the oracle's identity on the
-  list, serving private torrents. A second independent implementation (`chihaya` or
-  `torrust-tracker`) is still wanted and not yet in `testkit`.
-- **Peers:** `qbittorrent-nox` oracle (both libtorrent lines), `transmission-daemon` as an
+  list, serving private torrents.
+- **Peers:** `qbittorrent-nox` oracle (libtorrent 2.0.14), `transmission-daemon` as an
   independent implementation, and **`tap-peer`**: scriptable test-only peer that records
   every byte it receives and can misbehave on purpose (bad hashes, stalls, garbage, slow
   loris, protocol violations). `tap-dht` and `tap-webseed` do the same for DHT nodes and
