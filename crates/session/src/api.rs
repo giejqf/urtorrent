@@ -528,9 +528,10 @@ pub struct TorrentStatus {
     pub corrupt: u64,
     /// Bytes received redundantly.
     pub redundant: u64,
-    /// Bytes per second, smoothed.
+    /// Bytes per second, smoothed. 0 while the torrent is not running
+    /// (paused, queued, held, errored).
     pub download_rate: u64,
-    /// Bytes per second, smoothed.
+    /// Bytes per second, smoothed. 0 while the torrent is not running.
     pub upload_rate: u64,
     /// Connected peers.
     pub peers: usize,

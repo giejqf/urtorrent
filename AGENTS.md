@@ -441,7 +441,7 @@ Each milestone ends with its integration scenarios green in CI.
   0.10.0 hostile peers (done), 0.11.x resume blobs, then overlapping-operation races and
   `xtask bench` against the oracle (done), 0.12.0 daemon gaps: error recovery, metadata
   hold, list-view fields (done), 0.13.x daemon extras (done), 0.14.x daemon gaps 2 and
-  the first crates.io publication (done; 0.14.2 is current). Next: the daemon itself (a
+  the first crates.io publication (done; 0.14.3 is current). Next: the daemon itself (a
   separate crate/repo), `ut_holepunch`, port mapping, BEP 44 DHT items. `docs/roadmap.md` and
   `CHANGELOG.md` have the details.
 

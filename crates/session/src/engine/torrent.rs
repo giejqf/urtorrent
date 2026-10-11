@@ -85,6 +85,18 @@ pub struct Stats {
     last_uploaded: u64,
 }
 
+impl Stats {
+    /// The rates start from nothing at the counters as they stand: a
+    /// torrent stops at 0 B/s, and the totals it starts with (resume data,
+    /// a pause) are not one second's transfer.
+    fn restart_rates(&mut self) {
+        self.download_rate = 0;
+        self.upload_rate = 0;
+        self.last_downloaded = self.downloaded;
+        self.last_uploaded = self.uploaded;
+    }
+}
+
 /// [`Torrent::tracker_summary`].
 #[derive(Default)]
 struct TrackerSummary {
@@ -2012,6 +2024,7 @@ fn finish_check(
         if let Some((d, u)) = carried {
             t.stats.downloaded = d;
             t.stats.uploaded = u;
+            t.stats.restart_rates();
         }
         t.checking = false;
         t.finished_emitted = t.is_complete();
@@ -2131,6 +2144,8 @@ fn start_tasks(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>) {
         t.paused = false;
         t.tasks_running = true;
         t.announcer.start();
+        t.stats.restart_rates();
+        t.slow_since = None;
         let now = Instant::now();
         t.active_since = Some(now);
         t.sync_seeding_clock(now);
@@ -2210,6 +2225,7 @@ pub async fn stop(ctx: &Rc<Ctx>, torrent: &Rc<RefCell<Torrent>>, save: bool) {
     let (closing, jobs, peers) = {
         let mut t = torrent.borrow_mut();
         t.tasks_running = false;
+        t.stats.restart_rates();
         t.fold_times(Instant::now());
         let jobs = t.announcer.stop();
         let peers: Vec<Rc<PeerHandle>> = t.peers.values().cloned().collect();

@@ -7,8 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-10-11
+
+### Fixed
+
+- **A stopped torrent kept its last rates.** `TorrentStatus`'s
+  `download_rate` / `upload_rate` (and the session's sums) are a moving
+  average updated by the torrent's once-a-second tick, which ends when the
+  torrent stops; a torrent paused, queued, held or errored mid-transfer kept
+  showing its last rate. They are 0 from the moment it stops. Reported by
+  the daemon (its `docs/gaps.md`).
+- **A torrent restored from resume data reported its totals as a rate.**
+  The first tick counted everything the resume data carried as one
+  second's transfer (a quarter of it as the rate, decaying) and set
+  `last_download` / `last_upload` to that moment. The rates now start from
+  the counters as they stand. `gaps.rs`
+  (`a_stopped_torrent_moves_no_data_and_a_restored_one_starts_from_rest`)
+  checks both and failed on each before the fix.
+
 ### Changed
 
+- The `native` profile's identity strings are `-UR0E30-` /
+  `urtorrent/0.14.3`.
 - Documentation pass: the README is short, with generated badges
   (`docs/badges/generate.sh`, shields.io's badge-maker); the release table
   moved to `docs/roadmap.md`, usage to `docs/getting-started.md`, the

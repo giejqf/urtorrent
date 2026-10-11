@@ -9,7 +9,7 @@
 //! priorities, banned address ranges. 0.13.5: the queue's slow flag, a
 //! queue position set in one call. 0.14.0: tracker replies with their
 //! intervals and response time, one tracker reannounced alone, how far a
-//! check has got.
+//! check has got. 0.14.3: a stopped torrent's rates are 0.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -1331,5 +1331,57 @@ fn a_check_reports_how_far_it_has_got() {
     recheck.join().unwrap().unwrap();
     assert_progressed(&seen, pieces);
     block_on(s.shutdown()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_stopped_torrent_moves_no_data_and_a_restored_one_starts_from_rest() {
+    // The daemon shows a torrent's rates, an ETA from them, and whether it
+    // is active: a pause must read 0 B/s, not the last second before it.
+    let dir = tmp("rates");
+    let (bytes, data) = make_torrent("r.bin", 4 << 20, 64 * 1024, "http://127.0.0.1:1/x");
+    let a_dir = dir.join("a");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("r.bin"), &data).unwrap();
+    let a = block_on(builder(1).upload_limit(256 * 1024).build()).unwrap();
+    let a_id = block_on(a.add_torrent(AddTorrent::metainfo(bytes, &a_dir))).unwrap();
+    wait_state(&a, a_id, TorrentState::Seeding, 10);
+    let url = spawn_tracker(addr_of(1, &a), Arc::new(Mutex::new(Vec::new())));
+    let (bytes, _) = make_torrent("r.bin", 4 << 20, 64 * 1024, &url);
+    let b_dir = dir.join("b");
+    let b = block_on(builder(2).build()).unwrap();
+    let id = block_on(b.add_torrent(AddTorrent::metainfo(bytes.clone(), &b_dir))).unwrap();
+    wait_for("data flowing", 20, || {
+        let st = status(&b, id);
+        st.download_rate > 0 && st.downloaded >= 512 * 1024
+    });
+    block_on(b.pause(id)).unwrap();
+    let st = status(&b, id);
+    assert_eq!(st.state, TorrentState::Paused);
+    assert_eq!((st.download_rate, st.upload_rate), (0, 0), "{st:?}");
+    assert!(st.downloaded > 0 && !st.slow);
+    let row = block_on(b.statuses()).unwrap();
+    assert_eq!((row[0].download_rate, row[0].upload_rate), (0, 0));
+    let s = block_on(b.stats()).unwrap();
+    assert_eq!((s.download_rate, s.upload_rate), (0, 0));
+
+    // Started again from resume data, with no peer to download from: the
+    // totals it carries are not one second's transfer.
+    let blob = block_on(b.resume_data(id)).unwrap();
+    let downloaded = st.downloaded;
+    block_on(b.shutdown()).unwrap();
+    block_on(a.shutdown()).unwrap();
+    let b = block_on(builder(2).build()).unwrap();
+    let id =
+        block_on(b.add_torrent(AddTorrent::metainfo(bytes, &b_dir).resume_data(blob))).unwrap();
+    wait_state(&b, id, TorrentState::Downloading, 10);
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        let st = status(&b, id);
+        assert_eq!(st.downloaded, downloaded);
+        assert_eq!(st.download_rate, 0, "{st:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    block_on(b.shutdown()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

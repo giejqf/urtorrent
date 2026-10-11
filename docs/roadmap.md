@@ -27,7 +27,7 @@ Each milestone ended with its integration scenarios green in CI
 | **0.11.x** Resume blobs, races | `resume_data` / `AddTorrent::resume_data` ([resume.md](resume.md)), overlapping-operation gates (`races.rs`), `xtask bench` against the oracle ([perf.md](perf.md)), RustSec advisories enforced |
 | **0.12.0** Daemon gaps | errored torrents recover (`ErrorKind`), `hold_after_metadata` / `release`, list-view status fields, `PeerBanned` |
 | **0.13.x** Daemon extras | tracker rows per listen endpoint, `FileCompleted`, piece priorities, banned address ranges, partial seeds `upload_only`, `set_queue_position` |
-| **0.14.x** Daemon gaps | tracker `interval` / `min interval` and response time, `force_reannounce_tracker`, check progress; published on crates.io |
+| **0.14.x** Daemon gaps | tracker `interval` / `min interval` and response time, `force_reannounce_tracker`, check progress; published on crates.io; 0.14.3: a stopped torrent reads 0 B/s |
 
 ## Next
 
