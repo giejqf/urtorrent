@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Guide for coding agents working on this repository. Read it fully before touching code.
-Working name: **`urtorrent`** (placeholder; rename freely).
+Published as **`urtorrent`** (internal crates as `urtorrent-<dir>`).
 
 ## 1. What this project is
 
@@ -48,8 +48,8 @@ that trackers and peers see nothing unusual.
 
 - The protocol core (bencode, metainfo, peer wire, HTTP/UDP tracker, storage, choker, piece
   picker) is well-trodden ground. Low risk.
-- uTP and DHT, the two largest optional work items, are deferred past 0.1.0. That removes
-  most of the schedule risk.
+- uTP and DHT, the two largest optional work items, were deferred past 0.1.0 (they
+  shipped in 0.3.0 and 0.4.0). That removed most of the schedule risk.
 - **io_uring in Rust** is the biggest *engineering-discipline* risk: completion-based I/O
   fights the borrow checker (buffers must outlive cancelled futures). Section 5 has rules.
 - **The qBittorrent profile is best effort**, with priorities set by the maintainer:
@@ -66,7 +66,7 @@ The reference implementation ("oracle") is a **pinned** headless qBittorrent:
 | Item | Pin (as of 2026-09) | Notes |
 |---|---|---|
 | qBittorrent | `qbittorrent-nox` **5.2.3** | latest stable at project start |
-| libtorrent | **2.0.14** primary, **1.2.20** secondary | qBt ships both lines; they differ on the wire (e.g. v2 support) |
+| libtorrent | **2.0.14** | the build qBittorrent 5.2.3 ships by default |
 | Binary source | `userdocs/qbittorrent-nox-static` release, checksum-pinned | static, reproducible, no distro drift |
 
 Rules:
@@ -174,9 +174,7 @@ Only `uring`, `storage` and `session` may perform I/O.
   Rationale: we need precise control over multishot ops, provided buffer rings, registered
   files/buffers, zero-copy send and linked timeouts, and the "everything is io_uring"
   requirement means no runtime may quietly fall back to epoll or a blocking thread pool.
-  (compio and monoio were considered; record the final choice in `docs/adr/0001-runtime.md`.
-  If an existing runtime is adopted instead, it must be configured so fallback is a hard
-  error.)
+  (compio and monoio were considered and rejected: ADR 0001.)
 - **Kernel baseline: 6.1 LTS.** Probe features at startup with `IORING_REGISTER_PROBE` and
   fail with a clear error listing what is missing. Newer opcodes (e.g. bind/listen,
   ftruncate, uring setsockopt) are optional fast paths behind probes.
@@ -222,7 +220,7 @@ Only `uring`, `storage` and `session` may perform I/O.
   contain C/assembly; if "pure Rust" must hold for crypto primitives too, use the
   RustCrypto-based provider and accept that it is less mature. Recorded in ADR 0003: the
   default provider (aws-lc-rs); "pure Rust" covers the I/O and protocol stack.
-- CPU work (SHA-1/SHA-256 hashing, RC4 on bulk data if it shows up in profiles) goes to a
+- CPU work (SHA-1 hashing, RC4 on bulk data if it shows up in profiles) goes to a
   small dedicated thread pool (`urt-hash-N`, `SessionBuilder::hash_threads`). That is
   compute, not I/O, and is allowed.
 - Threading model: one network ring thread (`urt-net`) and one disk ring thread
@@ -257,16 +255,17 @@ Only `uring`, `storage` and `session` may perform I/O.
   endpoint). Capture it; do not guess.
 - `peers6`, PEX `added6`, UDP tracker over v6, LSD over v6. Filter link-local / unspecified / multicast / own addresses from every peer
   source.
-- Every integration scenario runs in three network shapes: v4-only, v6-only, dual-stack.
+- Scenarios run in the v4-only, v6-only and dual-stack shapes wherever the behaviour depends
+  on the address family (each scenario declares its shapes; `testkit list` shows them).
 
 ### 5.6 Public API: tokio-native, engine-owned threads
 
 Maintainer decision: the library integrates with **tokio**. The shape:
 
 - `Session::builder().build().await` spawns the engine's own OS threads (network ring,
-  disk ring(s), hash pool) and returns a `Session` handle that is `Clone + Send + Sync`.
-  Dropping the last handle, or calling `shutdown().await`, sends `stopped` to trackers,
-  flushes resume data and joins the threads.
+  disk ring, hash pool) and returns a `Session` handle that is `Clone + Send + Sync`.
+  `shutdown().await` sends `stopped` to trackers, flushes resume data and joins the
+  threads; dropping the last handle starts the same shutdown without waiting for it.
 - Every public operation is an `async fn` (`add_torrent`, `pause`, `set_file_priorities`,
   `save_resume_data`, ...). Internally each is a message on a `tokio::sync::mpsc` channel
   to the engine plus a `tokio::sync::oneshot` reply. Those primitives are
@@ -331,7 +330,7 @@ statistical timing mimicry.
 - **Capability gaps.** The oracle supports DHT and uTP; 0.1.0 did not (both do since
   0.4.0; the policy stays for whatever the next gap is). Default policy:
   advertise the same handshake reserved bits and LTEP `m` entries as the oracle so L1/L2
-  stay exact, and handle the consequences gracefully (ignore `PORT` messages; answer
+  stay exact, and handle the consequences gracefully (in 0.1.0 that meant ignoring `PORT` messages; answer
   unsupported extension messages the way the oracle answers a disabled feature). Where
   that would mislead a peer into wasted work beyond a dropped message, prefer what the
   oracle sends *with that feature disabled in its settings* - capture that configuration
@@ -357,13 +356,14 @@ finds a new L1/L2 tell, first add it to the discriminator (red), then fix it (gr
    and equivalent responses.
 5. **Integration** - real processes (7.2).
 6. **Differential** - same scenario, oracle vs us, normalised diff (7.3).
-7. **Soak/perf** - multi-hour seeding of thousands of torrents, 100 GiB sparse transfer at
-   line rate on loopback, fd/memory leak checks.
+7. **Soak/perf** - `xtask soak` (multi-GiB loopback transfers, up to 10 000 torrents per
+   session, fd/memory leak checks) and `xtask bench` against the oracle; baselines in
+   `docs/perf.md`.
 
 ### 7.2 Integration environment
 
 All actors run in an isolated environment with both an IPv4 and an IPv6 subnet. The
-primary environment is the `testkit` **netns lab** (ADR 0002): one Linux bridge, one
+environment is the `testkit` **netns lab** (ADR 0002): one Linux bridge, one
 network namespace + veth per actor, a `FORWARD ... DROP` rule so nothing leaves the lab;
 it needs passwordless `sudo`, and CI runs it.
 
@@ -394,7 +394,8 @@ it needs passwordless `sudo`, and CI runs it.
    adding to it needs justification in the PR.
 4. Diff L1/L2 byte-exact and run the discriminator. L3 differences are reported as
    informational output only. The oracle runs with DHT and uTP **disabled** in its
-   settings for the primary captures (closest to what 0.1.0 implements), plus one default-
+   settings for the primary captures (the baseline every L2 golden is diffed against; the DHT
+   and uTP have their own captures, `capture_dht` / `capture_utp`), plus one default-
    settings capture to document the capability-gap quirks.
 
 Golden captures (tap logs as `*.jsonl`, plus compact summaries such as `utp-shape.json`)
@@ -404,7 +405,7 @@ directory (`testkit/runs/`), and scenarios that judge packets (`private_no_pex_l
 
 ### 7.4 Scenario matrix (each x {v4, v6, dual} where meaningful)
 
-Leech from oracle seeder - seed to oracle leecher - seed to Transmission - mixed swarm -
+Leech from oracle seeder - seed to oracle leecher - seed to Transmission -
 HTTP / HTTPS / UDP tracker - tracker down, tier failover, backoff - PT-style tracker with
 passkey + whitelist accepts us - private torrent emits no DHT/PEX/LSD - encryption
 forced/enabled/disabled on each side - oracle with uTP enabled falls back to TCP when ours
@@ -441,7 +442,7 @@ Each milestone ends with its integration scenarios green in CI.
   `xtask bench` against the oracle (done), 0.12.0 daemon gaps: error recovery, metadata
   hold, list-view fields (done), 0.13.x daemon extras (done), 0.14.x daemon gaps 2 and
   the first crates.io publication (done; 0.14.2 is current). Next: the daemon itself (a
-  separate crate/repo), `ut_holepunch`, port mapping. `docs/roadmap.md` and
+  separate crate/repo), `ut_holepunch`, port mapping, BEP 44 DHT items. `docs/roadmap.md` and
   `CHANGELOG.md` have the details.
 
 ## 9. Working conventions
@@ -456,7 +457,7 @@ Each milestone ends with its integration scenarios green in CI.
 - Logging via `tracing`; no `println!`. Peer-visible bytes are loggable at `trace` for
   diffing.
 - Dependencies: keep the tree small; every new dependency is justified in the PR. Crypto
-  primitives (SHA-1, SHA-256, RC4, DH bignum) come from audited crates, not hand-rolled.
+  primitives (SHA-1, RC4, DH bignum) come from audited crates, not hand-rolled.
   `xtask check` runs `cargo deny check advisories`: a RustSec advisory against the library
   graph, an unmaintained crate included, fails it. Replace the crate; an `ignore` entry in
   `deny.toml` needs a reason and a link.
@@ -466,13 +467,13 @@ Each milestone ends with its integration scenarios green in CI.
     feature audit), `cargo semver-checks` against the latest release tag; `--quick` skips
     tests, docs and semver
   - `cargo xtask doctor` - kernel version, uring probe, seccomp/sysctl, memlock,
-    sudo/netns, Docker, oracle binaries
+    sudo/netns, Docker, oracle binary
   - `cargo xtask it [scenario ...] [--shape v4|v6|dual] [--keep]` - integration tests
     (netns lab)
-  - `cargo xtask diff [scenario ...] [--shape ...]` - differential run + discriminator
+  - `cargo xtask diff [scenario ...] [--shape ...] [--keep]` - differential run + discriminator
   - `cargo xtask capture [scenario ...] [--shape ...]` - regenerate golden captures from
     the pinned oracle
-  - `cargo xtask bench [scenario ...]` - RSS / CPU benchmarks against the oracle (release
+  - `cargo xtask bench [scenario ...] [--shape ...]` - RSS / CPU benchmarks against the oracle (release
     build; `docs/perf.md`)
   - `cargo xtask fuzz <target> [secs]` - cargo-fuzz on nightly, 60 s by default
   - `cargo xtask syscalls` - assert no non-uring data-path syscalls (uring probe + a real
@@ -524,7 +525,7 @@ Each milestone ends with its integration scenarios green in CI.
 - **Versioning: SemVer, first release 0.1.0.** See section 9 for the policy.
 - **Public API integrates with tokio** (5.6); the engine still runs on its own uring
   threads and tokio never owns I/O inside the library.
-- Defaults accepted: oracle line 5.2.3 / libtorrent 2.0.14 only for now; kernel baseline
+- Defaults accepted: oracle qBittorrent 5.2.3 / libtorrent 2.0.14; kernel baseline
   6.1 LTS; rustls with its default crypto provider; `native` is the default profile.
 - **BEP 52 (v2/hybrid) is not on the roadmap** (2026-09-21, "not widely adopted").
 - **Configuration boundary** (2026-09-21): limits the engine enforces (connections, slots,

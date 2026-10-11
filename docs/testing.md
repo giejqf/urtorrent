@@ -8,7 +8,7 @@ integration tests run in.
 | Command | What it does |
 |---|---|
 | `cargo xtask check [--quick]` | `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace`, `cargo doc` with warnings denied, the dependency policy (`cargo deny` bans / licences / sources / advisories, and the tokio feature and reactor audit), and `cargo semver-checks` against the latest `v*` tag. `--quick` keeps only fmt, clippy and the dependency policy. `cargo-deny` and `cargo-semver-checks` are skipped with a note when not installed |
-| `cargo xtask doctor` | checks kernel version, io_uring availability (sysctl and probe), memlock, passwordless sudo, the lab tools, the Transmission AppArmor override, Docker's seccomp profile, the cached oracle binaries and the optional cargo tools |
+| `cargo xtask doctor` | checks kernel version, io_uring availability (sysctl and probe), memlock, passwordless sudo, the lab tools, the Transmission AppArmor override, Docker's seccomp profile, the cached oracle binary and the optional cargo tools |
 | `cargo xtask it [--shape v4\|v6\|dual] [--keep] [scenario ...]` | integration scenarios (tag `It`) in the netns lab; every shape the scenario declares unless `--shape` picks one |
 | `cargo xtask diff [--shape ...] [--keep] [scenario ...]` | differential scenarios (tag `Diff`): oracle and us through the same taps, then the discriminator |
 | `cargo xtask capture [--shape ...] [scenario ...]` | capture scenarios (tag `Capture`) against the pinned oracle; a passing run is promoted to `testkit/golden` |
@@ -22,7 +22,7 @@ integration tests run in.
 binary also has `list` (every scenario with its shapes and tags), `run
 <scenario>` (any tag, no promotion), `lab clean` (remove stale bridges,
 namespaces and `/etc/hosts` entries) and `oracle ensure` (download the
-oracle binaries now).
+oracle binary now).
 
 `soak` runs `testkit/src/bin/urt-soak.rs`. `transfer` moves one torrent of
 `--size` bytes (default 2G; pieces 1 MiB, or 4 MiB from 4 GiB up, unless
@@ -44,10 +44,12 @@ turns off `disk_thread`. Scratch data goes to `target/soak`.
 - **`transmission-daemon`** from apt, for the scenarios that use it
   (`seed_to_transmission`, `diff_identity`). Ubuntu's AppArmor profile
   needs a local override for `testkit/runs`; `doctor` prints it.
-- **`tcpdump`** for pcaps; `private_no_pex_lsd` needs it, other scenarios
-  skip their pcap without it.
-- **`curl`**: the pinned oracle binaries (`testkit/oracle.lock`, checksum
-  verified) are downloaded on first use into `~/.cache/urtorrent/oracle`
+- **`tcpdump`** for pcaps. `private_no_pex_lsd` and the uTP scenarios
+  (`capture_utp`, `utp_leech_from_oracle`, `utp_seed_to_oracle`,
+  `utp_shape`) need it; `lsd_discovery` skips its datagram check without
+  it; other scenarios skip their pcap.
+- **`curl`**: the pinned oracle binary (`testkit/oracle.lock`, checksum
+  verified) is downloaded on first use into `~/.cache/urtorrent/oracle`
   (`URT_ORACLE_CACHE` overrides the location).
 
 `cargo xtask doctor` checks all of these.
@@ -193,7 +195,8 @@ compares request lines and header order.
 Rule 2 (private torrents) is checked on the wire by `private_no_pex_lsd`:
 a pcap of the bridge must hold no LSD datagram from our address, and a
 silent tap connected to us must receive no `ut_pex` message and see an `m`
-map without `ut_pex` / `ut_metadata` (Q11).
+map without `ut_pex` / `ut_metadata` (Q11), and the tap-dht router must see
+no KRPC about the torrent while our DHT node runs.
 
 Run artifacts land in `testkit/runs/<stamp>-<scenario>-<shape>/`
 (gitignored): actor stdout / stderr, oracle profiles and logs, tap logs
@@ -237,6 +240,11 @@ wire shape only:
 - trackers and peers: peer-id prefix, `User-Agent`, header and parameter
   order, escape style, `key` format, `numwant` and flags, reserved bits,
   LTEP `m` / keys / `reqq` / `v`, the first-messages sequence;
+- UDP tracker: the first actions, `num_want` (also on `stopped`), `ip = 0`
+  and the options;
+- MSE: `crypto_provide` / `select`, the IA length, the method, pad lengths
+  in range;
+- PEX: the key set, flag consistency, whether the recipient is listed;
 - DHT: the `v` tag, transaction id length, the bootstrap / lookup /
   announce argument sets, replies to the probe list, the `port` position;
 - uTP: the SYN, SYN-ACK and first-data shapes, the initial window, the

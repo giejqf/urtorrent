@@ -294,7 +294,7 @@ fn usage() -> ExitCode {
         "usage: cargo xtask <command>
 
   check [--quick]    fmt, clippy -D warnings, unit + property tests, doc build, dependency policy
-  doctor             kernel, io_uring, seccomp/sysctl, memlock, sudo/netns, Docker, oracle binaries
+  doctor             kernel, io_uring, seccomp/sysctl, memlock, sudo/netns, Docker, oracle binary
   it [scenario ...]  integration scenarios (netns lab)      [--shape v4|v6|dual] [--keep]
   diff [scenario ..] differential run + discriminator       [--shape ...] [--keep]
   capture [scen ...] regenerate golden captures from the pinned oracle   [--shape ...]
@@ -792,11 +792,11 @@ fn doctor() -> Result<()> {
     } else {
         r.warn(
             "docker",
-            "not installed (optional; the netns lab is the primary environment)",
+            "not installed (optional; only for running the library in a container)",
         );
     }
 
-    // Oracle binaries
+    // Oracle binary
     let lock = root().join("testkit/oracle.lock");
     if lock.exists() {
         let txt = std::fs::read_to_string(&lock).unwrap_or_default();

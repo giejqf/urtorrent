@@ -64,7 +64,7 @@ jobs:
           # the v6 and dual shapes also need `opentracker-ipv6`.
           sudo apt-get install -y -q opentracker opentracker-ipv6 transmission-daemon transmission-cli tcpdump strace jq
           sudo systemctl disable --now opentracker opentracker-ipv6 || true
-      - name: Cache oracle binaries
+      - name: Cache the oracle binary
         uses: actions/cache@v4
         with:
           path: ~/.cache/urtorrent/oracle

@@ -1043,7 +1043,8 @@ pub struct SessionBuilder {
 }
 
 impl SessionBuilder {
-    /// TCP listen port for both address families (0 = ephemeral).
+    /// TCP listen port for both address families (0 = ephemeral; default
+    /// 6881).
     pub fn listen_port(mut self, port: u16) -> Self {
         self.cfg.listen_port = port;
         self
@@ -1055,7 +1056,8 @@ impl SessionBuilder {
     /// outgoing in the family: peer connections, UDP and HTTP(S) tracker
     /// announces, web-seed downloads, the DHT. When it goes away (a VPN
     /// interface going down) those fail; nothing falls back to the default
-    /// route. [`Session::set_listen`] moves all of it.
+    /// route. [`Session::set_listen`] moves all of it. Default `0.0.0.0`
+    /// (every address).
     pub fn listen_v4(mut self, addr: Option<Ipv4Addr>) -> Self {
         self.cfg.listen_v4 = addr;
         self
@@ -1064,7 +1066,8 @@ impl SessionBuilder {
     /// IPv6 listen address (`None` disables IPv6: no listen socket, no
     /// announce for the family, and IPv6 peers learned from any source are
     /// not dialled). A specific address is the source of everything
-    /// outgoing in the family, as for [`SessionBuilder::listen_v4`].
+    /// outgoing in the family, as for [`SessionBuilder::listen_v4`]. Default
+    /// `::` (every address).
     pub fn listen_v6(mut self, addr: Option<Ipv6Addr>) -> Self {
         self.cfg.listen_v6 = addr;
         self
@@ -1089,25 +1092,27 @@ impl SessionBuilder {
         self
     }
 
-    /// Hash pool threads.
+    /// Hash pool threads (default 2).
     pub fn hash_threads(mut self, n: usize) -> Self {
         self.cfg.hash_threads = n.max(1);
         self
     }
 
-    /// Session upload limit in bytes per second (0 = unlimited).
+    /// Session upload limit in bytes per second (0 = unlimited, the
+    /// default).
     pub fn upload_limit(mut self, bytes_per_sec: u64) -> Self {
         self.cfg.upload_rate = bytes_per_sec;
         self
     }
 
-    /// Session download limit in bytes per second (0 = unlimited).
+    /// Session download limit in bytes per second (0 = unlimited, the
+    /// default).
     pub fn download_limit(mut self, bytes_per_sec: u64) -> Self {
         self.cfg.download_rate = bytes_per_sec;
         self
     }
 
-    /// Session-wide number of unchoke slots.
+    /// Session-wide number of unchoke slots (default 8).
     pub fn unchoke_slots(mut self, n: usize) -> Self {
         self.cfg.unchoke_slots = n;
         self
@@ -1158,7 +1163,7 @@ impl SessionBuilder {
     }
 
     /// Run the DHT node read-only (BEP 43): it answers no queries and marks
-    /// its own `ro`.
+    /// its own `ro`. Default off.
     pub fn dht_read_only(mut self, on: bool) -> Self {
         self.cfg.dht_read_only = on;
         self

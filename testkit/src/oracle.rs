@@ -15,47 +15,19 @@ use sha2::{Digest, Sha256};
 use crate::lab::{Actor, Proc, wait_tcp};
 use crate::webapi::WebApi;
 
-/// Which libtorrent line the oracle build links.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum LtLine {
-    Lt2,
-    Lt1,
-}
-
-impl LtLine {
-    pub fn name(self) -> &'static str {
-        match self {
-            LtLine::Lt2 => "lt2",
-            LtLine::Lt1 => "lt1",
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct LockFile {
-    oracle: LockOracle,
+    oracle: OracleLock,
 }
 
-#[derive(Debug, Deserialize)]
-struct LockOracle {
-    qbittorrent: String,
-    binary: Vec<LockBinary>,
-}
-
+/// The parsed lock file: one checksum-pinned qBittorrent build.
 #[derive(Debug, Clone, Deserialize)]
-pub struct LockBinary {
+pub struct OracleLock {
+    pub qbittorrent: String,
     pub libtorrent: String,
-    pub primary: bool,
     pub tag: String,
     pub url: String,
     pub sha256: String,
-}
-
-/// The parsed lock file.
-#[derive(Debug, Clone)]
-pub struct OracleLock {
-    pub qbittorrent: String,
-    pub binaries: Vec<LockBinary>,
 }
 
 pub fn lock_path() -> PathBuf {
@@ -67,25 +39,11 @@ impl OracleLock {
         let p = lock_path();
         let s = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
         let lf: LockFile = toml::from_str(&s).context("parsing oracle.lock")?;
-        Ok(OracleLock {
-            qbittorrent: lf.oracle.qbittorrent,
-            binaries: lf.oracle.binary,
-        })
-    }
-
-    pub fn binary(&self, line: LtLine) -> Result<&LockBinary> {
-        let want_major = match line {
-            LtLine::Lt2 => "2.",
-            LtLine::Lt1 => "1.",
-        };
-        self.binaries
-            .iter()
-            .find(|b| b.libtorrent.starts_with(want_major))
-            .with_context(|| format!("no {line:?} binary in oracle.lock"))
+        Ok(lf.oracle)
     }
 }
 
-/// Where oracle binaries are cached.
+/// Where the oracle binary is cached.
 pub fn cache_dir() -> PathBuf {
     if let Ok(p) = std::env::var("URT_ORACLE_CACHE") {
         return PathBuf::from(p);
@@ -101,10 +59,9 @@ fn sha256_file(p: &Path) -> Result<String> {
     Ok(crate::bencode::hex(&h.finalize()))
 }
 
-/// Ensure the pinned binary for `line` is present and verified; return its path.
-pub fn ensure_binary(line: LtLine) -> Result<PathBuf> {
-    let lock = OracleLock::load()?;
-    let b = lock.binary(line)?;
+/// Ensure the pinned binary is present and verified; return its path.
+pub fn ensure_binary() -> Result<PathBuf> {
+    let b = OracleLock::load()?;
     let dir = cache_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!(
@@ -165,7 +122,6 @@ pub enum BtProtocol {
 /// from AGENTS.md 7.3: DHT and uTP off, everything else at qBittorrent defaults.
 #[derive(Clone, Debug)]
 pub struct OracleConfig {
-    pub line: LtLine,
     pub listen_port: u16,
     pub webui_port: u16,
     pub dht: bool,
@@ -191,7 +147,6 @@ pub struct OracleConfig {
 impl OracleConfig {
     pub fn primary() -> OracleConfig {
         OracleConfig {
-            line: LtLine::Lt2,
             listen_port: 6881,
             webui_port: 8080,
             dht: false,
@@ -222,10 +177,6 @@ impl OracleConfig {
         }
     }
 
-    pub fn line(mut self, line: LtLine) -> Self {
-        self.line = line;
-        self
-    }
     pub fn encryption(mut self, e: Encryption) -> Self {
         self.encryption = e;
         self
@@ -347,7 +298,7 @@ impl Oracle {
     /// Launch the oracle inside `actor`. `whitelist` are the subnets allowed to
     /// use the WebAPI without a password (the lab subnets).
     pub fn launch(actor: &Actor, config: OracleConfig, whitelist: &[String]) -> Result<Oracle> {
-        let bin = ensure_binary(config.line)?;
+        let bin = ensure_binary()?;
         let profile_dir = actor.log_dir.join("profile");
         let save_path = actor.log_dir.join("data");
         std::fs::create_dir_all(profile_dir.join("qBittorrent/config"))?;
@@ -393,7 +344,6 @@ impl Oracle {
 
     fn verify_pin(&self) -> Result<()> {
         let lock = OracleLock::load()?;
-        let want = lock.binary(self.config.line)?;
         let v = self.api.version()?;
         if v.trim_start_matches('v') != lock.qbittorrent {
             bail!(
@@ -403,10 +353,10 @@ impl Oracle {
         }
         let bi = self.api.build_info()?;
         let lt = bi.get("libtorrent").and_then(|v| v.as_str()).unwrap_or("");
-        if !lt.starts_with(&want.libtorrent) {
+        if !lt.starts_with(&lock.libtorrent) {
             bail!(
                 "oracle reports libtorrent {lt}, lock pins {}",
-                want.libtorrent
+                lock.libtorrent
             );
         }
         Ok(())
@@ -474,7 +424,7 @@ impl Oracle {
 
     /// Restart after a crash or shutdown with the same profile (resume data).
     pub fn restart(&mut self, whitelist: &[String]) -> Result<()> {
-        let bin = ensure_binary(self.config.line)?;
+        let bin = ensure_binary()?;
         let mut cmd = self.actor.command_with_env(&bin, &self.config.env);
         cmd.arg(format!("--profile={}", self.profile_dir.display()))
             .arg(format!("--webui-port={}", self.config.webui_port));

@@ -21,11 +21,12 @@ fn usage() -> ExitCode {
         "usage:
   testkit list
   testkit it [--shape v4|v6|dual] [--keep] [scenario ...]       run integration scenarios
-  testkit capture [--shape ...] [scenario ...]                  run capture scenarios and promote goldens
-  testkit diff [--shape ...] [scenario ...]                     differential runs + discriminator
+  testkit capture [--shape ...] [--keep] [scenario ...]         run capture scenarios and promote goldens
+  testkit diff [--shape ...] [--keep] [scenario ...]            differential runs + discriminator
+  testkit bench [--shape ...] [--keep] [scenario ...]           RSS / CPU benchmarks against the oracle
   testkit run <scenario> [--shape ...] [--keep]                 run one scenario (any tag), no promotion
   testkit lab clean                                             remove stale lab bridges/namespaces
-  testkit oracle ensure                                         download + verify pinned oracle binaries"
+  testkit oracle ensure                                         download + verify the pinned oracle binary"
     );
     ExitCode::from(2)
 }
@@ -62,13 +63,10 @@ fn main() -> ExitCode {
             _ => return usage(),
         },
         "oracle" => match rest.first().map(String::as_str) {
-            Some("ensure") => (|| {
-                for line in [testkit::oracle::LtLine::Lt2, testkit::oracle::LtLine::Lt1] {
-                    let p = testkit::oracle::ensure_binary(line)?;
-                    println!("{}: {}", line.name(), p.display());
-                }
-                Ok(true)
-            })(),
+            Some("ensure") => testkit::oracle::ensure_binary().map(|p| {
+                println!("{}", p.display());
+                true
+            }),
             _ => return usage(),
         },
         _ => return usage(),

@@ -8,8 +8,10 @@
 Integration and differential tests need several actors (pinned qBittorrent
 oracle instances, opentracker, transmission, our client, tap-tracker,
 tap-peer) with distinct IPv4 and IPv6 addresses, in v4-only / v6-only /
-dual-stack shapes, isolated from the public internet. AGENTS.md allows either
-Docker Compose on an internal network or `ip netns` + veth.
+dual-stack shapes, isolated from the public internet. AGENTS.md allowed either
+Docker Compose on an internal network or `ip netns` + veth. *Amended
+(2026-10-11):* the Docker Compose alternative was dropped; the netns lab is
+the only environment.
 
 Findings while building M0 on the CI-like VM:
 
@@ -24,7 +26,7 @@ Findings while building M0 on the CI-like VM:
 
 ## Decision
 
-The primary environment is a **netns lab** driven by `testkit`:
+The environment is a **netns lab** driven by `testkit`:
 
 - One Linux bridge per lab (`urt<id>`) on the host, carrying
   `10.<id>.0.0/16` and `fd77:<id>::/32` (amended 2026-09-20; the lab used to

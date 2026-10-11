@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   developer commands to `docs/testing.md`, and `docs/README.md` indexes the
   rest. The docs and ADRs were checked against the code and corrected where
   they had drifted.
+- testkit: `oracle.lock` pins one oracle build (qBittorrent 5.2.3 /
+  libtorrent 2.0.14). The libtorrent 1.2.20 build, which no scenario ran,
+  is gone with `LtLine`; `testkit oracle ensure` fetches the one binary.
+- xtask: the tokio / reactor audit now checks every library crate directly
+  (it looked for `crates/urtorrent-<x>/` and found only the facade), `dht`
+  and `utp` included.
 
 ## [0.14.2] - 2026-09-27
 
